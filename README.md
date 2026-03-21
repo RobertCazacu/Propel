@@ -191,6 +191,29 @@ The AI prompt automatically includes the correct language context per marketplac
 | Allegro | Polish |
 | Trendyol / Decathlon / Pepita / FashionDays | neutral |
 
+### AI Request/Response Logging
+
+Every AI call is saved to `data/ai_logs/YYYY-MM-DD.json` (auto-deleted after 24h).
+
+Each entry contains:
+
+| Field | Description |
+|---|---|
+| `timestamp` | ISO timestamp with milliseconds |
+| `type` | `category_batch` or `char_enrichment` |
+| `provider` / `model` | Active provider and model name |
+| `marketplace` | Marketplace being processed |
+| `duration_ms` | Response time in milliseconds |
+| `request.offer_id(s)` | Offer ID(s) involved |
+| `request.prompt` | Full prompt sent to the AI |
+| `request.products` / `request.missing_characteristics` | Full input data |
+| `response.raw` | Raw text response from the AI |
+| `response.parsed` | Parsed JSON from the response |
+| `results` | Final accepted values per offer |
+| `stats.accepted` / `stats.rejected` | Count of accepted/rejected values |
+
+Log files location: `data/ai_logs/` (gitignored — local only).
+
 ### Token optimizations
 
 | Optimization | Saving |
@@ -319,6 +342,15 @@ python -c "import pandas as pd; df=pd.read_parquet('data/eMAG_Romania/values.par
 ---
 
 ## Changelog
+
+### v4 — 2026-03-22
+
+- **AI Request/Response Logger** — every AI call saved to `data/ai_logs/YYYY-MM-DD.json` with 24h retention; captures full prompt, raw response, parsed result, duration_ms, offer_id, provider, model, accepted/rejected counts
+- `core/ai_logger.py` — new module: `log_category_batch()`, `log_char_enrichment()`, `AICallTimer`, `list_ai_log_files()`, `read_ai_log()`; auto-cleanup on every write
+- `ai_enricher.py` — integrated timing (`time.perf_counter`) and logging calls after each `get_router().complete()`
+- `processor.py` — `process_product()` accepts `offer_id` parameter, passed through to `enrich_with_ai` → logger
+- `pages/process.py` — passes `offer_id` to `process_product()`
+- `.gitignore` — added `data/ai_logs/`
 
 ### v3 — 2026-03-21
 

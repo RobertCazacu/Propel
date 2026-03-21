@@ -10,9 +10,11 @@ Strategii de optimizare:
 import json
 import re
 import hashlib
+import time
 from pathlib import Path
 from core.app_logger import get_logger
 from core.llm_router import get_router
+from core.ai_logger import log_category_batch, log_char_enrichment
 
 log = get_logger("marketplace.ai")
 
@@ -118,13 +120,18 @@ def _process_batch(batch: list[dict], category_list: list[str],
     batch_results = {}
     max_tok = min(4096, max(512, len(batch) * 60))
     log.info("AI batch categorii: %d produse, max_tokens=%d", len(batch), max_tok)
+    raw = ""
+    suggested = {}
+    accepted = 0
+    rejected = 0
+    t_start = time.perf_counter()
     try:
-        raw = get_router().complete(prompt, max_tok)
+        router = get_router()
+        raw = router.complete(prompt, max_tok)
+        duration_ms = round((time.perf_counter() - t_start) * 1000)
         log.debug("AI batch raw response (first 300 chars): %s", raw[:300])
         suggested = _parse_json(raw)
 
-        accepted = 0
-        rejected = 0
         for i, prod in enumerate(batch, 1):
             pid = prod["id"]
             cat = suggested.get(str(i))
@@ -157,9 +164,31 @@ def _process_batch(batch: list[dict], category_list: list[str],
                 rejected += 1
         log.info("AI batch categorii: %d acceptate, %d respinse/null", accepted, rejected)
     except Exception as exc:
+        duration_ms = round((time.perf_counter() - t_start) * 1000)
         log.error("Exceptie AI batch categorii: %s", exc, exc_info=True)
         for prod in batch:
             batch_results[prod["id"]] = None
+
+    # ── AI request/response log ────────────────────────────────────────────────
+    try:
+        router = get_router()
+        log_category_batch(
+            marketplace=marketplace,
+            provider=router.provider_name,
+            model=str(getattr(router._provider, "_model", "unknown")),
+            products=batch,
+            category_list=category_list,
+            prompt=prompt,
+            raw_response=raw,
+            parsed=suggested,
+            results=batch_results,
+            duration_ms=duration_ms,
+            accepted=accepted,
+            rejected=rejected,
+            max_tokens=max_tok,
+        )
+    except Exception:
+        pass
 
     return batch_results
 
@@ -333,18 +362,22 @@ def enrich_with_ai(
                   freeform_chars, title[:60])
 
     log.info("AI char enrichment pentru %r — missing: %s", title[:60], list(missing_options.keys()))
+    max_tok = 300
+    raw = ""
+    suggested = {}
+    validated = {}
+    t_start = time.perf_counter()
     try:
         prompt = _build_prompt(title, description, category, existing, missing_options, marketplace)
-        raw = get_router().complete(prompt, 300)
+        raw = get_router().complete(prompt, max_tok)
+        duration_ms = round((time.perf_counter() - t_start) * 1000)
         log.debug("AI char raw response: %s", raw[:300])
         suggested = _parse_json(raw)
 
-        validated = {}
         for ch_name, ch_val in suggested.items():
             valid_set = valid_values_for_cat.get(ch_name, set())
             val_str = str(ch_val).strip()
             if not valid_set:
-                # Freeform — accept orice valoare non-goala
                 if val_str:
                     validated[ch_name] = ch_val
                     log.debug("AI char freeform acceptat [%s] = %r", ch_name, ch_val)
@@ -361,11 +394,33 @@ def enrich_with_ai(
             cache["char_map"][h] = validated
             _save_cache(cache)
 
-        return validated
-
     except Exception as exc:
+        duration_ms = round((time.perf_counter() - t_start) * 1000)
         log.error("Exceptie AI char enrichment pentru %r: %s", title[:60], exc, exc_info=True)
-        return {}
+
+    # ── AI request/response log ────────────────────────────────────────────────
+    try:
+        router = get_router()
+        log_char_enrichment(
+            marketplace=marketplace,
+            provider=router.provider_name,
+            model=str(getattr(router._provider, "_model", "unknown")),
+            offer_id=str(existing.get("_offer_id", "")),
+            title=title,
+            category=category,
+            existing_chars={k: v for k, v in existing.items() if not k.startswith("_")},
+            missing_chars=missing_options,
+            prompt=prompt,
+            raw_response=raw,
+            parsed=suggested,
+            validated=validated,
+            duration_ms=duration_ms,
+            max_tokens=max_tok,
+        )
+    except Exception:
+        pass
+
+    return validated
 
 
 def test_connection() -> tuple[bool, str]:

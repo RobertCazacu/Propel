@@ -342,7 +342,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         result["cleared"] = cleared
 
         # ── Auto-fill characteristics ─────────────────────────────────────────
-        new_chars = process_product(title, desc, final_cat, existing, mp, use_ai=use_ai, marketplace=marketplace)
+        new_chars = process_product(title, desc, final_cat, existing, mp, use_ai=use_ai, marketplace=marketplace, offer_id=str(prod.get("id", "")))
         result["new_chars"] = new_chars
 
         # ── Check mandatory still missing ─────────────────────────────────────

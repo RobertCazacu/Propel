@@ -373,6 +373,7 @@ def process_product(
     data: MarketplaceData,
     use_ai: bool = False,
     marketplace: str = "",
+    offer_id: str = "",
 ) -> dict:
     """
     Return dict of {char_name: value} for characteristics that can be
@@ -438,7 +439,7 @@ def process_product(
                         title=title,
                         description=desc_clean,
                         category=cat_name,
-                        existing=combined_existing,
+                        existing={**combined_existing, "_offer_id": offer_id},
                         char_options=char_options,
                         valid_values_for_cat=data._valid_values.get(cat_id, {}),
                         mandatory_chars=mandatory_missing,
