@@ -1,0 +1,35 @@
+# ── Credentials & local config ────────────────────────────────────────────────
+.env
+.env.local
+
+# ── Python cache ───────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ── Runtime data ───────────────────────────────────────────────────────────────
+data/ai_cache.json
+data/dashboard_stats.json
+data/error_codes.json
+data/logs/
+data/custom_marketplaces.json
+
+# ── Temp Office files ──────────────────────────────────────────────────────────
+~$*.xlsx
+~$*.xls
+*.tmp
+
+# ── Old backup folder ──────────────────────────────────────────────────────────
+sfa/
+
+# ── IDE & OS ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.claude/
+*.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Streamlit secrets ──────────────────────────────────────────────────────────
+.streamlit/secrets.toml

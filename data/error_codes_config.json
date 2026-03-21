@@ -1,0 +1,32 @@
+{
+  "Trendyol": {
+    "processable_codes": [
+      "3111"
+    ]
+  },
+  "eMAG HU": {
+    "processable_codes": [
+      "1007",
+      "1009",
+      "1010",
+      "107"
+    ]
+  },
+  "eMAG BG": {
+    "processable_codes": [
+      "1007",
+      "1009",
+      "1010",
+      "107"
+    ]
+  },
+  "FashionDays BG": {
+    "processable_codes": [
+      "1007",
+      "1009",
+      "1010",
+      "107",
+      "3210"
+    ]
+  }
+}
