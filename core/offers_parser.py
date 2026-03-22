@@ -16,6 +16,9 @@ OFFER_COL_ALIASES = {
     "error":       ["eroare ofertă", "eroare oferta", "error", "eroare", "offer_errors", "offer_error"],
     "description": ["descriere", "description", "desc"],
     "category":    ["categorie", "category", "cat", "category_name"],
+    "image_url":   ["image url", "image_url", "url imagine", "url_imagine", "img_url",
+                    "photo_url", "imagine", "imagini", "image", "poza", "foto",
+                    "image src", "image_src"],
 }
 
 
@@ -75,6 +78,7 @@ def extract_products(file) -> list[dict]:
             "error":       row.get(mapping["error"])       if mapping["error"]       else None,
             "description": row.get(mapping["description"]) if mapping["description"] else None,
             "category":    row.get(mapping["category"])    if mapping["category"]    else None,
+            "image_url":   row.get(mapping["image_url"])   if mapping["image_url"]   else None,
         }
 
         # Existing characteristics

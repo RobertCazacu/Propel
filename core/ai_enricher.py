@@ -71,7 +71,6 @@ def get_learned_rules() -> list[dict]:
 # ── Category suggestion — BATCH (un singur apel pentru N produse) ─────────────
 
 MARKETPLACE_CONTEXT = {
-    "allegro":      "Allegro (Polonia). Categoriile si valorile sunt in poloneza.",
     "trendyol":     "Trendyol.",
     "decathlon":    "Decathlon.",
     "pepita":       "Pepita.",
@@ -79,15 +78,58 @@ MARKETPLACE_CONTEXT = {
     "emag_bg":      "eMAG България (Bulgaria). Valorile caracteristicilor trebuie sa fie in limba bulgara.",
     "emag":         "eMAG Romania. Valorile caracteristicilor trebuie sa fie in limba romana.",
     "fashiondays":  "FashionDays.",
+    "allegro":      "Allegro (Polonia). Categoriile si valorile sunt in poloneza.",
 }
 
+# Token aliases — orice token din lista → contextul corespunzator
+# Ordinea listelor conteaza: mai specific primul (bg inainte de emag generic)
+_MP_ALIASES: list[tuple[list[str], str]] = [
+    # ── Bulgarian ──────────────────────────────────────────────────────────────
+    (["bg", "bulg", "bulgaria", "bulgarian", "bgn", "българия", "emag bg", "fashiondays bg"],
+     "eMAG България (Bulgaria). Valorile caracteristicilor trebuie sa fie in limba bulgara."),
+
+    # ── Hungarian ──────────────────────────────────────────────────────────────
+    (["hu", "hun", "hungary", "ungaria", "hungarian", "huf", "magyarország", "emag hu", "fashiondays hu"],
+     "eMAG Magyarország (Ungaria). Valorile caracteristicilor trebuie sa fie in limba maghiara."),
+
+    # ── Polish (Allegro) ───────────────────────────────────────────────────────
+    (["pl", "pol", "polonia", "poland", "polish", "allegro", "pln"],
+     "Allegro (Polonia). Categoriile si valorile sunt in poloneza."),
+
+    # ── FashionDays generic (fara tara → romana) ───────────────────────────────
+    (["fashiondays", "fashion days", "fashion-days"],
+     "FashionDays."),
+
+    # ── Trendyol ──────────────────────────────────────────────────────────────
+    (["trendyol"],
+     "Trendyol."),
+
+    # ── Romanian / eMAG generic ────────────────────────────────────────────────
+    (["ro", "romania", "romanian", "ron", "emag"],
+     "eMAG Romania. Valorile caracteristicilor trebuie sa fie in limba romana."),
+]
+
+
 def _mp_ctx(marketplace: str) -> str:
-    """Returneaza contextul marketplace-ului pentru prompt."""
+    """Returneaza contextul marketplace-ului pentru prompt.
+
+    Matching permisiv: imparte numele in tokeni si verifica daca oricare
+    alias din lista apare in numele marketplace-ului (sau invers).
+    Regulile mai specifice (BG, HU) sunt verificate primele.
+    """
     key = marketplace.lower().strip()
-    # Sort by key length descending — longer (more specific) keys match first
-    for k, v in sorted(MARKETPLACE_CONTEXT.items(), key=lambda x: -len(x[0])):
-        if k in key:
-            return v
+    # Tokenize: split by space, dash, underscore
+    import re as _re
+    tokens = set(_re.split(r"[\s_\-]+", key))
+
+    for aliases, ctx in _MP_ALIASES:
+        for alias in aliases:
+            alias_tokens = set(_re.split(r"[\s_\-]+", alias.lower()))
+            # Match daca TOATE tokenele aliasului se regasesc in key sau
+            # daca aliasul apare ca substring in key
+            if alias_tokens <= tokens or alias.lower() in key:
+                return ctx
+
     return marketplace  # fallback la numele exact
 
 

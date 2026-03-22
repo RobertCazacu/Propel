@@ -14,6 +14,7 @@ data/dashboard_stats.json
 data/error_codes.json
 data/logs/
 data/ai_logs/
+data/image_cache/
 data/custom_marketplaces.json
 
 # ── Temp Office files ──────────────────────────────────────────────────────────

@@ -202,7 +202,7 @@ def _audit_products(products: list, mp) -> dict:
     }
 
 
-def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, marketplace=""):
+def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, marketplace="", image_options=None):
     results = []
     total = len(products)
     processable_codes = get_all_processable_codes(marketplace)
@@ -344,6 +344,53 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         # ── Auto-fill characteristics ─────────────────────────────────────────
         new_chars = process_product(title, desc, final_cat, existing, mp, use_ai=use_ai, marketplace=marketplace, offer_id=str(prod.get("id", "")))
         result["new_chars"] = new_chars
+
+        # ── Image analysis hook (optional, backward-compatible) ───────────────
+        if image_options and (image_options.get("enable_color") or image_options.get("enable_product_hint")):
+            # Take only the first URL (column may contain comma-separated list)
+            raw_urls = str(prod.get("image_url") or "")
+            image_url = raw_urls.split(",")[0].strip()
+            img_log_result = None
+            try:
+                from core.vision import analyze_product_image
+                img_result = analyze_product_image(
+                    image_url=image_url,
+                    category=final_cat,
+                    existing_chars={**existing, **new_chars},
+                    valid_values_for_cat=mp._valid_values.get(cat_id, {}),
+                    mandatory_chars=mp.mandatory_chars(cat_id),
+                    marketplace=marketplace,
+                    offer_id=str(prod.get("id", "")),
+                    enable_color=image_options.get("enable_color", False),
+                    enable_product_hint=image_options.get("enable_product_hint", False),
+                    vision_provider=image_options.get("vision_provider"),
+                    sku=str(prod.get("id", "")),
+                )
+                result["image_analysis"] = img_result.to_dict()
+                img_log_result = img_result.to_dict()
+                all_filled = {**existing, **new_chars}
+                for char_name, val in img_result.suggested_attributes.items():
+                    if not all_filled.get(char_name):
+                        new_chars[char_name] = val
+                result["new_chars"] = new_chars
+            except Exception as e:
+                err_dict = {"skipped_reason": str(e), "download_success": False}
+                result["image_analysis"] = err_dict
+                img_log_result = err_dict
+            finally:
+                if img_log_result is not None:
+                    try:
+                        from core.ai_logger import log_image_analysis
+                        log_image_analysis(
+                            offer_id=str(prod.get("id", "")),
+                            marketplace=marketplace,
+                            image_url=image_url,
+                            enable_color=image_options.get("enable_color", False),
+                            enable_product_hint=image_options.get("enable_product_hint", False),
+                            result=img_log_result,
+                        )
+                    except Exception:
+                        pass
 
         # ── Check mandatory still missing ─────────────────────────────────────
         mandatory = mp.mandatory_chars(cat_id)
@@ -582,12 +629,44 @@ def render():
             if est["cost_usd"] < 0.001:
                 st.info("💡 Cost sub $0.001 — practic gratuit pentru acest număr de oferte.")
 
+    # ── Image analysis options ─────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("🖼️ Analiză imagine (opțional)")
+    col_img1, col_img2 = st.columns(2)
+    with col_img1:
+        enable_color = st.checkbox(
+            "Detectează culoarea din imagine",
+            value=False,
+            help="Analizează imaginea produsului și completează automat caracteristica de culoare dacă lipsește.",
+        )
+    with col_img2:
+        enable_product_hint = st.checkbox(
+            "Folosește imaginea pentru îmbunătățirea categoriei",
+            value=False,
+            help="Folosește un model vision (Ollama llava-phi3) pentru a sugera tipul de produs din imagine.",
+        )
+
+    image_options = None
+    if enable_color or enable_product_hint:
+        vision_provider = None
+        if enable_product_hint:
+            try:
+                from core.vision.visual_provider import build_vision_provider
+                vision_provider = build_vision_provider("ollama")
+            except Exception:
+                vision_provider = None
+        image_options = {
+            "enable_color": enable_color,
+            "enable_product_hint": enable_product_hint,
+            "vision_provider": vision_provider,
+        }
+
     if st.button(f"🚀 Pornește procesarea pentru {selected_mp}", type="primary", use_container_width=True):
         progress = st.progress(0)
         status   = st.empty()
         start    = time.time()
 
-        results = _process_all(products, mp, rules, progress, status, use_ai=use_ai, marketplace=selected_mp)
+        results = _process_all(products, mp, rules, progress, status, use_ai=use_ai, marketplace=selected_mp, image_options=image_options)
 
         elapsed = time.time() - start
         st.session_state["process_results"] = results

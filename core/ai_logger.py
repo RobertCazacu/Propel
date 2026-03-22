@@ -179,6 +179,50 @@ def log_char_enrichment(
         pass
 
 
+def log_image_analysis(
+    *,
+    offer_id: str,
+    marketplace: str,
+    image_url: str,
+    enable_color: bool,
+    enable_product_hint: bool,
+    result: dict,           # ImageAnalysisResult.to_dict()
+):
+    entry = {
+        "timestamp":   datetime.now().isoformat(timespec="milliseconds"),
+        "type":        "image_analysis",
+        "marketplace": marketplace,
+        "offer_id":    offer_id,
+        "request": {
+            "image_url":           image_url,
+            "enable_color":        enable_color,
+            "enable_product_hint": enable_product_hint,
+        },
+        "response": {
+            "download_success":           result.get("download_success"),
+            "download_error":             result.get("download_error", ""),
+            "dominant_color_raw":         result.get("dominant_color_raw", ""),
+            "dominant_color_normalized":  result.get("dominant_color_normalized", ""),
+            "secondary_color_normalized": result.get("secondary_color_normalized", ""),
+            "color_confidence":           result.get("color_confidence", 0.0),
+            "is_multicolor":              result.get("is_multicolor", False),
+            "product_type_hint":          result.get("product_type_hint", ""),
+            "product_type_confidence":    result.get("product_type_confidence", 0.0),
+        },
+        "results": {
+            "suggested_attributes":  result.get("suggested_attributes", {}),
+            "used_for_attribute_fill": result.get("used_for_attribute_fill", False),
+            "needs_review":          result.get("needs_review", False),
+            "review_reason":         result.get("review_reason", ""),
+            "skipped_reason":        result.get("skipped_reason", ""),
+        },
+    }
+    try:
+        _append_entry(entry)
+    except Exception:
+        pass
+
+
 # ── Read helpers (for diagnostic page) ────────────────────────────────────────
 
 def list_ai_log_files() -> list[Path]:

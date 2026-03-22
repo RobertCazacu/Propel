@@ -1,0 +1,16 @@
+{
+  "default": {
+    "color_mandatory_chars": [
+      "Culoare de baza",
+      "Culoare:",
+      "Szín:",
+      "Цвят:"
+    ],
+    "min_color_confidence": 0.60,
+    "prefer_text_color_over_image": true,
+    "fallback_to_review_if_conflict": true,
+    "multicolor_threshold": 0.80,
+    "min_product_confidence": 0.65
+  },
+  "categories": {}
+}

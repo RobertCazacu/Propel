@@ -50,6 +50,14 @@ marketplace_tool/
 │   ├── templates.py                # Excel template generators for reference files
 │   ├── app_logger.py               # Centralized logger
 │   ├── logger.py                   # Processing logs with 7-day auto-cleanup
+│   ├── ai_logger.py                # AI request/response logger (24h retention)
+│   ├── vision/
+│   │   ├── __init__.py             # Exports analyze_product_image, ImageAnalysisResult
+│   │   ├── image_analyzer.py       # Main orchestrator for image-based attribute extraction
+│   │   ├── color_analyzer.py       # Algorithmic color detection (PIL quantize, HSV classification)
+│   │   ├── image_fetcher.py        # Image downloader with local cache (data/image_cache/)
+│   │   ├── visual_provider.py      # Vision model providers (Ollama llava-phi3, Mock)
+│   │   └── visual_rules.py         # JSON rules engine (data/visual_rules.json)
 │   └── providers/
 │       ├── base.py                 # Abstract BaseLLMProvider
 │       ├── anthropic_provider.py   # Anthropic Claude (SDK)
@@ -78,7 +86,10 @@ marketplace_tool/
     ├── FashionDays_BG/
     ├── ai_cache.json               # Persistent AI cache (gitignored)
     ├── dashboard_stats.json        # Cumulative statistics (gitignored)
-    └── logs/                       # Processing logs, 7-day retention (gitignored)
+    ├── visual_rules.json           # Image analysis rules (color thresholds, per-category overrides)
+    ├── logs/                       # Processing logs, 7-day retention (gitignored)
+    ├── ai_logs/                    # AI request/response logs, 24h retention (gitignored)
+    └── image_cache/                # Downloaded product images, persistent (gitignored)
 ```
 
 ---
@@ -200,7 +211,7 @@ Each entry contains:
 | Field | Description |
 |---|---|
 | `timestamp` | ISO timestamp with milliseconds |
-| `type` | `category_batch` or `char_enrichment` |
+| `type` | `category_batch`, `char_enrichment` or `image_analysis` |
 | `provider` / `model` | Active provider and model name |
 | `marketplace` | Marketplace being processed |
 | `duration_ms` | Response time in milliseconds |
@@ -342,6 +353,23 @@ python -c "import pandas as pd; df=pd.read_parquet('data/eMAG_Romania/values.par
 ---
 
 ## Changelog
+
+### v5 — 2026-03-22
+
+- **Image-based color detection** — new `core/vision/` package; analyzes product images algorithmically (Pillow + PIL quantize, no ML required)
+  - `image_fetcher.py` — downloads + caches images by URL hash in `data/image_cache/`
+  - `color_analyzer.py` — corner-based background removal, PIL FASTOCTREE quantize, neutral avoidance, HSV color family classification (Negru, Alb, Gri, Rosu, Albastru, Verde, Mov, Roz, Portocaliu, Galben, Maro, Bej, Turcoaz, Visiniu, Kaki, Bleumarin, Multicolor), white-product shortcut for Photoroom images
+  - `visual_provider.py` — optional Ollama vision model integration (`llava-phi3`) for product type hints
+  - `visual_rules.py` — JSON-based rules engine (`data/visual_rules.json`), per-category overrides
+  - `image_analyzer.py` — main orchestrator; merges image results into `new_chars` without modifying existing text-based flow
+- **Image analysis UI** — two checkboxes in Process Offers: "Detectează culoarea din imagine" and "Folosește imaginea pentru îmbunătățirea categoriei"
+- **Image analysis logging** — `log_image_analysis()` added to `ai_logger.py`; every image analysis (success or failure) logged as `image_analysis` type entry in daily AI log
+- **Fix: marketplace language context** — `_mp_ctx()` rewritten with `_MP_ALIASES` list supporting full permissive matching: `BG`, `bg`, `Bulgaria`, `BGN`, `HU`, `Hungary`, `Ungaria`, `HUF`, `PL`, `Polonia`, `Allegro`, `FashionDays BG/HU`, etc.
+- **Fix: white product detection** — Photoroom images on white background now correctly detected as "Alb" instead of "Rosu" or "Bej"
+- **Fix: comma-separated image URLs** — `Imagini` column may contain multiple URLs; only first URL used for analysis
+- **Fix: `Imagini` column alias** — added `"imagini"` and `"image src"` to `offers_parser.py` image URL aliases
+- **`requirements.txt`** — added `Pillow>=10.0.0`, `requests>=2.28.0`, `numpy>=1.24.0`
+- **`.gitignore`** — added `data/image_cache/`
 
 ### v4 — 2026-03-22
 
