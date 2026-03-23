@@ -1,16 +1,47 @@
 """
 Marketplace data loader.
-Handles Categories, Characteristics and Values Excel files
+Handles Categories, Characteristics and Values Excel/CSV files
 with flexible column detection (tolerant of extra/missing columns).
+Accepts both Streamlit file-like objects and local file paths (str/Path).
 """
 import pandas as pd
 import json
 from pathlib import Path
 from collections import defaultdict
-from typing import Optional
+from typing import Optional, Union
 from core.app_logger import get_logger
 
 log = get_logger("marketplace.loader")
+
+
+def _read_tabular(file_or_path: Union[str, Path, object]) -> pd.DataFrame:
+    """
+    Read a tabular file (Excel or CSV) from either:
+    - a local path (str or Path) — no size limit
+    - a Streamlit file-like object (UploadedFile)
+
+    CSV detection is based on file extension (.csv, .tsv).
+    TSV files are read with tab separator.
+    """
+    if isinstance(file_or_path, (str, Path)):
+        p = Path(file_or_path)
+        if not p.exists():
+            raise FileNotFoundError(f"Fișierul nu există: {p}")
+        ext = p.suffix.lower()
+        if ext == ".csv":
+            return pd.read_csv(p, dtype=str, encoding_errors="replace")
+        if ext == ".tsv":
+            return pd.read_csv(p, sep="\t", dtype=str, encoding_errors="replace")
+        return pd.read_excel(p, sheet_name=0)
+    else:
+        # Streamlit UploadedFile or any file-like object
+        name = getattr(file_or_path, "name", "") or ""
+        ext = Path(name).suffix.lower()
+        if ext == ".csv":
+            return pd.read_csv(file_or_path, dtype=str, encoding_errors="replace")
+        if ext == ".tsv":
+            return pd.read_csv(file_or_path, sep="\t", dtype=str, encoding_errors="replace")
+        return pd.read_excel(file_or_path, sheet_name=0)
 
 
 # ── Column aliases ─────────────────────────────────────────────────────────────
@@ -53,7 +84,7 @@ def _map_cols(df: pd.DataFrame, alias_dict: dict) -> dict:
 
 def load_categories(file) -> pd.DataFrame:
     """Load categories file. Returns DataFrame with standardised columns."""
-    df = pd.read_excel(file, sheet_name=0)
+    df = _read_tabular(file)
     mapping = _map_cols(df, CAT_COL_ALIASES)
     result = pd.DataFrame()
     result["id"]        = df[mapping["id"]]        if mapping["id"]        else None
@@ -65,7 +96,7 @@ def load_categories(file) -> pd.DataFrame:
 
 def load_characteristics(file) -> pd.DataFrame:
     """Load characteristics file."""
-    df = pd.read_excel(file, sheet_name=0)
+    df = _read_tabular(file)
     mapping = _map_cols(df, CHAR_COL_ALIASES)
     result = pd.DataFrame()
     result["id"]          = df[mapping["id"]]          if mapping["id"]          else range(len(df))
@@ -77,7 +108,7 @@ def load_characteristics(file) -> pd.DataFrame:
 
 def load_values(file) -> pd.DataFrame:
     """Load characteristic values file."""
-    df = pd.read_excel(file, sheet_name=0)
+    df = _read_tabular(file)
     mapping = _map_cols(df, VAL_COL_ALIASES)
     result = pd.DataFrame()
     result["category_id"]        = df[mapping["category_id"]]        if mapping["category_id"]        else None

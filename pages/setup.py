@@ -1,4 +1,5 @@
 import streamlit as st
+from pathlib import Path
 from core.state import (
     all_marketplace_names, get_marketplace, set_marketplace,
     add_custom_marketplace, PREDEFINED_MARKETPLACES,
@@ -6,6 +7,30 @@ from core.state import (
 )
 
 from core.loader import MarketplaceData
+
+
+def _do_save(selected: str, cat_src, char_src, val_src):
+    """
+    Logica comună de salvare — identică indiferent de sursa fișierelor
+    (upload Streamlit sau cale locală). cat_src/char_src/val_src pot fi
+    fie UploadedFile, fie str/Path.
+    """
+    with st.spinner("Se procesează fișierele..."):
+        try:
+            mp_new = MarketplaceData(selected)
+            mp_new.load_from_files(cat_src, char_src, val_src)
+            set_marketplace(selected, mp_new)
+            stats = mp_new.stats()
+            st.session_state.pop(f"_reload_{selected}", None)
+            st.success(
+                f"✅ Date salvate pentru **{selected}**: "
+                f"{stats['categories']} categorii, "
+                f"{stats['characteristics']} caracteristici, "
+                f"{stats['values']:,} valori."
+            )
+            st.rerun()
+        except Exception as e:
+            st.error(f"Eroare la procesare: {e}")
 
 
 def render():
@@ -46,86 +71,121 @@ def render():
     if not (mp and mp.is_loaded()) or st.session_state.get(f"_reload_{selected}"):
         st.markdown("### Încarcă fișierele de referință")
         st.info(
-            "📌 **Format așteptat:** Excel (.xlsx) cu coloanele standard. "
-            "Descarcă modelele de mai jos pentru a vedea exact structura necesară.\n\n"
+            "📌 **Formate acceptate:** Excel (`.xlsx`, `.xls`) și CSV (`.csv`, `.tsv`).  \n"
             "Aplicația detectează automat coloanele și ignoră ce nu are nevoie."
         )
 
-        from core.templates import categories_template, characteristics_template, values_template
+        tab_upload, tab_local = st.tabs(["⬆️ Upload fișiere", "📂 Cale locală (fișiere mari)"])
 
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.markdown("#### 📂 Categorii")
-            st.download_button(
-                "⬇️ Descarcă model",
-                data=categories_template(),
-                file_name="model_categories.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_cat_{selected}",
-                use_container_width=True,
-            )
-            st.caption("Câmpuri: `id`, `emag_id`, `name`, `parent_id`")
-            cat_file = st.file_uploader(
-                "emag_categories.xlsx",
-                type=["xlsx", "xls"],
-                key=f"cat_{selected}",
-                help="Fișierul cu categoriile marketplace-ului. Trebuie să aibă cel puțin coloanele: id, name."
-            )
-        with col2:
-            st.markdown("#### 🏷 Caracteristici")
-            st.download_button(
-                "⬇️ Descarcă model",
-                data=characteristics_template(),
-                file_name="model_characteristics.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_char_{selected}",
-                use_container_width=True,
-            )
-            st.caption("Câmpuri: `id`, `category_id`, `name`, `mandatory`")
-            char_file = st.file_uploader(
-                "emag_characteristics.xlsx",
-                type=["xlsx", "xls"],
-                key=f"char_{selected}",
-                help="Fișierul cu caracteristicile per categorie. Trebuie să aibă: id, category_id, name, mandatory."
-            )
-        with col3:
-            st.markdown("#### 📋 Valori permise")
-            st.download_button(
-                "⬇️ Descarcă model",
-                data=values_template(),
-                file_name="model_values.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                key=f"dl_val_{selected}",
-                use_container_width=True,
-            )
-            st.caption("Câmpuri: `category_id`, `characteristic_id`, `characteristic_name`, `value`")
-            val_file = st.file_uploader(
-                "characteristic_values.xlsx",
-                type=["xlsx", "xls"],
-                key=f"val_{selected}",
-                help="Fișierul cu valorile permise. Trebuie să aibă: category_id, characteristic_name, value."
+        # ── Tab 1: Upload (existent, fișiere < 200 MB) ────────────────────────
+        with tab_upload:
+            from core.templates import categories_template, characteristics_template, values_template
+
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                st.markdown("#### 📂 Categorii")
+                st.download_button(
+                    "⬇️ Descarcă model",
+                    data=categories_template(),
+                    file_name="model_categories.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_cat_{selected}",
+                    use_container_width=True,
+                )
+                st.caption("Câmpuri: `id`, `emag_id`, `name`, `parent_id`")
+                cat_file = st.file_uploader(
+                    "emag_categories",
+                    type=["xlsx", "xls", "csv", "tsv"],
+                    key=f"cat_{selected}",
+                    help="Fișierul cu categoriile marketplace-ului."
+                )
+            with col2:
+                st.markdown("#### 🏷 Caracteristici")
+                st.download_button(
+                    "⬇️ Descarcă model",
+                    data=characteristics_template(),
+                    file_name="model_characteristics.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_char_{selected}",
+                    use_container_width=True,
+                )
+                st.caption("Câmpuri: `id`, `category_id`, `name`, `mandatory`")
+                char_file = st.file_uploader(
+                    "emag_characteristics",
+                    type=["xlsx", "xls", "csv", "tsv"],
+                    key=f"char_{selected}",
+                    help="Fișierul cu caracteristicile per categorie."
+                )
+            with col3:
+                st.markdown("#### 📋 Valori permise")
+                st.download_button(
+                    "⬇️ Descarcă model",
+                    data=values_template(),
+                    file_name="model_values.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key=f"dl_val_{selected}",
+                    use_container_width=True,
+                )
+                st.caption("Câmpuri: `category_id`, `characteristic_id`, `characteristic_name`, `value`")
+                val_file = st.file_uploader(
+                    "characteristic_values",
+                    type=["xlsx", "xls", "csv", "tsv"],
+                    key=f"val_{selected}",
+                    help="Fișierul cu valorile permise."
+                )
+
+            if cat_file and char_file and val_file:
+                if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
+                             use_container_width=True, key=f"save_upload_{selected}"):
+                    _do_save(selected, cat_file, char_file, val_file)
+            else:
+                st.warning("⚠️ Încarcă toate cele 3 fișiere pentru a putea salva.")
+
+        # ── Tab 2: Cale locală (fără limită de mărime) ────────────────────────
+        with tab_local:
+            st.markdown(
+                "Introdu căile complete ale fișierelor de pe disk. "
+                "Fișierele **nu se uploadează** — sunt citite direct, fără limită de mărime.  \n"
+                "Acceptă `.xlsx`, `.xls`, `.csv`, `.tsv`."
             )
 
-        if cat_file and char_file and val_file:
-            if st.button(f"💾 Salvează datele pentru {selected}", type="primary", use_container_width=True):
-                with st.spinner("Se procesează fișierele..."):
-                    try:
-                        mp_new = MarketplaceData(selected)
-                        mp_new.load_from_files(cat_file, char_file, val_file)
-                        set_marketplace(selected, mp_new)
-                        stats = mp_new.stats()
-                        st.session_state.pop(f"_reload_{selected}", None)
-                        st.success(
-                            f"✅ Date salvate pentru **{selected}**: "
-                            f"{stats['categories']} categorii, "
-                            f"{stats['characteristics']} caracteristici, "
-                            f"{stats['values']:,} valori."
-                        )
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Eroare la procesare: {e}")
-        else:
-            st.warning("⚠️ Încarcă toate cele 3 fișiere pentru a putea salva.")
+            cat_path  = st.text_input(
+                "Cale fișier Categorii",
+                key=f"lp_cat_{selected}",
+                placeholder=r"C:\date\emag_categories.csv",
+            )
+            char_path = st.text_input(
+                "Cale fișier Caracteristici",
+                key=f"lp_char_{selected}",
+                placeholder=r"C:\date\emag_characteristics.xlsx",
+            )
+            val_path  = st.text_input(
+                "Cale fișier Valori permise",
+                key=f"lp_val_{selected}",
+                placeholder=r"C:\date\characteristic_values.csv",
+            )
+
+            # Validare live a căilor
+            paths_ok = True
+            for label, p in [("Categorii", cat_path), ("Caracteristici", char_path), ("Valori", val_path)]:
+                if p.strip():
+                    if Path(p.strip()).exists():
+                        size_mb = Path(p.strip()).stat().st_size / 1_048_576
+                        st.caption(f"✅ {label}: găsit ({size_mb:.1f} MB)")
+                    else:
+                        st.caption(f"❌ {label}: fișierul nu există la calea specificată")
+                        paths_ok = False
+
+            all_paths_filled = all(p.strip() for p in [cat_path, char_path, val_path])
+
+            if all_paths_filled and paths_ok:
+                if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
+                             use_container_width=True, key=f"save_local_{selected}"):
+                    _do_save(selected, cat_path.strip(), char_path.strip(), val_path.strip())
+            elif all_paths_filled and not paths_ok:
+                st.warning("⚠️ Corectează căile marcate cu ❌ înainte de a salva.")
+            else:
+                st.info("Completează toate cele 3 căi pentru a activa salvarea.")
 
     # ── Preview section ────────────────────────────────────────────────────────
     mp = get_marketplace(selected)
