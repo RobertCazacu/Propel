@@ -6,6 +6,9 @@ import streamlit as st
 import json
 from pathlib import Path
 from core.loader import MarketplaceData
+from core.app_logger import get_logger
+
+log = get_logger("marketplace.state")
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 STATS_FILE = DATA_DIR / "dashboard_stats.json"
@@ -51,6 +54,9 @@ PREDEFINED_MARKETPLACES = [
     "Allegro",
     "FashionDays",
 ]
+
+# Marketplace-uri care folosesc DuckDB ca backend de stocare (pilot controlat)
+DUCKDB_MARKETPLACES = {"eMAG HU"}
 
 # ── Error code configuration per marketplace ───────────────────────────────────
 # Each marketplace defines which error codes should be processed.
@@ -149,6 +155,21 @@ def init_state():
     # Auto-load any previously saved marketplace data
     for mp_name in PREDEFINED_MARKETPLACES + st.session_state.get("custom_mp_names", []):
         if mp_name not in st.session_state["marketplaces"]:
+            if mp_name in DUCKDB_MARKETPLACES:
+                # eMAG HU pilot: load din DuckDB în loc de Parquet
+                try:
+                    from core import reference_store_duckdb as _duckdb_store
+                    if _duckdb_store.is_available(_duckdb_store.EMAG_HU_ID):
+                        cats, chars, vals = _duckdb_store.load_marketplace_data(
+                            _duckdb_store.EMAG_HU_ID
+                        )
+                        mp = MarketplaceData(mp_name)
+                        mp.load_from_dataframes(cats, chars, vals)
+                        st.session_state["marketplaces"][mp_name] = mp
+                        log.info("Loaded %s from DuckDB", mp_name)
+                except Exception as exc:
+                    log.warning("DuckDB load failed for %s: %s", mp_name, exc)
+                continue  # nu face load_from_disk parquet pentru eMAG HU
             mp = MarketplaceData(mp_name)
             folder = DATA_DIR / mp_name.replace(" ", "_")
             if mp.load_from_disk(folder):
