@@ -208,11 +208,14 @@ def _dominant_rgb_ignore_bg(
     """
     Returns (dominant_rgb, rgb_counts) where rgb_counts = [((r,g,b), count), ...].
 
-    Background is estimated from the 4 corner pixels, then removed.
+    Background is estimated from border pixels (all 4 edges sampled), then removed.
+    This handles colored/gradient backgrounds much better than 4-corner sampling.
     Very dark shadows (luminance < 35) are also excluded.
     If dominant is neutral (white/gray/black) and a chromatic color has >= 12%
     share, the chromatic color is used instead.
     """
+    from collections import Counter as _Counter
+
     # Crop border noise
     w, h = img.size
     dx, dy = int(w * crop_border), int(h * crop_border)
@@ -223,9 +226,22 @@ def _dominant_rgb_ignore_bg(
     px = img.load()
     W, H = img.size
 
-    # Estimate background from corners
-    corners = [px[0, 0], px[W - 1, 0], px[0, H - 1], px[W - 1, H - 1]]
-    bg = tuple(sum(c[i] for c in corners) // 4 for i in range(3))
+    # Estimate background from all 4 edge rows/columns (sampled every ~15px)
+    # Most common quantized color = background, handles gradients and colored BGs
+    border_samples = []
+    step = max(1, min(W, H) // 15)
+    for x in range(0, W, step):
+        border_samples.append(px[x, 0])
+        border_samples.append(px[x, H - 1])
+    for y in range(0, H, step):
+        border_samples.append(px[0, y])
+        border_samples.append(px[W - 1, y])
+    _q = 24  # quantization bucket size
+    bg_cnt = _Counter(
+        (p[0] // _q * _q, p[1] // _q * _q, p[2] // _q * _q)
+        for p in border_samples
+    )
+    bg = bg_cnt.most_common(1)[0][0]
 
     # Quantize palette
     q = img.quantize(colors=palette_size, method=Image.Quantize.FASTOCTREE)
@@ -246,8 +262,7 @@ def _dominant_rgb_ignore_bg(
                 continue
             keep.append(True)
 
-    from collections import Counter
-    cnt: Counter = Counter()
+    cnt: _Counter = _Counter()
     for i, idx in enumerate(qpix):
         if keep[i]:
             cnt[idx] += 1
@@ -338,18 +353,24 @@ def analyze_colors(img: Image.Image) -> ColorResult:
     """
     img = img.convert("RGB")
 
-    # White product shortcut: if image is dominated by near-white, return Alb
-    if _is_white_product(img):
-        return ColorResult(
-            dominant_color_raw="rgb(255, 255, 255)",
-            dominant_color_normalized="Alb",
-            confidence=0.85,
-        )
-
+    # Remove background first — white detection happens on product pixels only
     dominant, rgb_counts = _dominant_rgb_ignore_bg(img)
 
     if not rgb_counts:
         return ColorResult()
+
+    # White product detection AFTER background removal:
+    # if the dominant non-background color is white, the product itself is white.
+    # This correctly handles colored products on white backgrounds (common in marketplace photos).
+    if _rgb_to_family(dominant) == "white":
+        total_w = sum(c for _, c in rgb_counts)
+        dom_w   = next((c for rgb, c in rgb_counts if rgb == dominant), 0)
+        conf_w  = round(min(dom_w / total_w, 1.0), 3) if total_w else 0.85
+        return ColorResult(
+            dominant_color_raw        = f"rgb{dominant}",
+            dominant_color_normalized = "Alb",
+            confidence                = conf_w,
+        )
 
     # Check multicolor — but only if top-1 is NOT neutral
     top1 = rgb_counts[0][0]
@@ -362,10 +383,10 @@ def analyze_colors(img: Image.Image) -> ColorResult:
 
     normalized = _FAMILY_TO_NORMALIZED.get(family, "")
 
-    # Confidence: share of dominant color in total
+    # Confidence: real share of dominant color (no artificial inflation)
     total = sum(c for _, c in rgb_counts)
     dominant_count = next((c for rgb, c in rgb_counts if rgb == dominant), 0)
-    confidence = round(min((dominant_count / total) * 1.15, 1.0), 3) if total else 0.0
+    confidence = round(min(dominant_count / total, 1.0), 3) if total else 0.0
 
     # Secondary color
     secondary_rgb = None

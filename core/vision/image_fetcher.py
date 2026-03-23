@@ -47,7 +47,7 @@ def fetch_image(url: str, sku: str = "") -> tuple:
     if not url or not url.strip().startswith("http"):
         return None, "Invalid or missing URL"
 
-    cache_key  = sku.strip() if sku and sku.strip() else _url_hash(url)
+    cache_key  = _url_hash(url)   # always keyed by URL — SKU collision risk eliminated
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cache_path = CACHE_DIR / f"{cache_key}.jpg"
 
