@@ -33,6 +33,63 @@ def _do_save(selected: str, cat_src, char_src, val_src):
             st.error(f"Eroare la procesare: {e}")
 
 
+def _do_save_duckdb(selected: str, cat_src, char_src, val_src, source_type: str = "upload"):
+    """
+    Versiunea DuckDB a lui _do_save, folosită exclusiv pentru eMAG HU pilot.
+    Parsează fișierele identic cu _do_save, dar persistă în DuckDB.
+    """
+    from core import reference_store_duckdb as duckdb_store
+    from core.loader import load_categories, load_characteristics, load_values
+
+    with st.spinner("Se procesează și se salvează în DuckDB..."):
+        try:
+            cats  = load_categories(cat_src)
+            chars = load_characteristics(char_src)
+            vals  = load_values(val_src)
+
+            duckdb_store.init_db(duckdb_store.DB_PATH)
+
+            sources = {
+                "categories":      getattr(cat_src,  "name", str(cat_src)),
+                "characteristics": getattr(char_src, "name", str(char_src)),
+                "values":          getattr(val_src,  "name", str(val_src)),
+            }
+            run_id = duckdb_store.import_emag_hu(cats, chars, vals, source_type, sources)
+
+            cats2, chars2, vals2 = duckdb_store.load_marketplace_data(duckdb_store.EMAG_HU_ID)
+            mp_new = MarketplaceData(selected)
+            mp_new.load_from_dataframes(cats2, chars2, vals2)
+
+            st.session_state["marketplaces"][selected] = mp_new
+            st.session_state.pop(f"_reload_{selected}", None)
+
+            summary = duckdb_store.get_import_summary(run_id)
+            issues  = duckdb_store.get_issues(run_id)
+
+            st.success(
+                f"✅ Date salvate în DuckDB pentru **{selected}**: "
+                f"{summary['categories']} categorii, "
+                f"{summary['characteristics']} caracteristici, "
+                f"{summary['values']:,} valori. "
+                f"({summary['warnings']} warnings, {summary['errors']} errors)"
+            )
+
+            errors_list   = [i for i in issues if i["severity"] == "error"]
+            warnings_list = [i for i in issues if i["severity"] == "warning"]
+
+            if errors_list:
+                for iss in errors_list:
+                    st.error(f"❌ [{iss['issue_type']}] {iss['message']}")
+            if warnings_list:
+                with st.expander(f"⚠️ {len(warnings_list)} warning-uri la import"):
+                    for iss in warnings_list:
+                        st.warning(f"[{iss['issue_type']}] {iss['message']}")
+
+            st.rerun()
+        except Exception as e:
+            st.error(f"Eroare la import DuckDB: {e}")
+
+
 def render():
     st.title("⚙️ Setup Marketplace")
     st.markdown("Încarcă fișierele de referință pentru fiecare marketplace. Datele se salvează local și nu trebuie reîncărcate la fiecare sesiune.")
@@ -57,6 +114,11 @@ def render():
         return
 
     mp = get_marketplace(selected)
+
+    # ── Badge DuckDB pilot ─────────────────────────────────────────────────────
+    if selected == "eMAG HU":
+        st.info("🦆 **Pilot DuckDB** — datele pentru acest marketplace sunt stocate în DuckDB local (`data/reference_data.duckdb`).")
+
     if mp and mp.is_loaded():
         stats = mp.stats()
         st.success(
@@ -137,7 +199,10 @@ def render():
             if cat_file and char_file and val_file:
                 if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
                              use_container_width=True, key=f"save_upload_{selected}"):
-                    _do_save(selected, cat_file, char_file, val_file)
+                    if selected == "eMAG HU":
+                        _do_save_duckdb(selected, cat_file, char_file, val_file, source_type="upload")
+                    else:
+                        _do_save(selected, cat_file, char_file, val_file)
             else:
                 st.warning("⚠️ Încarcă toate cele 3 fișiere pentru a putea salva.")
 
@@ -181,7 +246,11 @@ def render():
             if all_paths_filled and paths_ok:
                 if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
                              use_container_width=True, key=f"save_local_{selected}"):
-                    _do_save(selected, cat_path.strip(), char_path.strip(), val_path.strip())
+                    if selected == "eMAG HU":
+                        _do_save_duckdb(selected, cat_path.strip(), char_path.strip(),
+                                        val_path.strip(), source_type="local_path")
+                    else:
+                        _do_save(selected, cat_path.strip(), char_path.strip(), val_path.strip())
             elif all_paths_filled and not paths_ok:
                 st.warning("⚠️ Corectează căile marcate cu ❌ înainte de a salva.")
             else:
@@ -207,6 +276,41 @@ def render():
 
         with tab3:
             st.dataframe(mp.values.head(100), use_container_width=True, height=300)
+
+    # ── DuckDB status panel (doar pentru eMAG HU) ─────────────────────────────
+    if selected == "eMAG HU":
+        st.markdown("---")
+        st.subheader("🦆 Status DuckDB")
+        from core import reference_store_duckdb as _ddb
+        db_status = _ddb.get_db_status()
+        if db_status["available"]:
+            st.success(
+                f"✅ DuckDB activ — ultimul import: `{db_status['imported_at']}`  \n"
+                f"**{db_status['categories']}** categorii · "
+                f"**{db_status['characteristics']}** caracteristici · "
+                f"**{db_status['values']:,}** valori  \n"
+                f"Fișier DB: `{db_status['db_path']}`"
+            )
+        else:
+            st.warning(f"⚠️ DuckDB nu este disponibil: {db_status.get('reason', 'necunoscut')}")
+
+        if st.button("🔍 Verifică integritatea DuckDB", key="ddb_check"):
+            with st.spinner("Verificare..."):
+                try:
+                    cats_r, chars_r, vals_r = _ddb.load_marketplace_data(_ddb.EMAG_HU_ID)
+                    from core.loader import MarketplaceData as _MD
+                    mp_test = _MD("eMAG HU")
+                    mp_test.load_from_dataframes(cats_r, chars_r, vals_r)
+                    if mp_test.is_loaded():
+                        st.success(
+                            f"✅ Integritate OK — datele din DuckDB sunt compatibile cu procesarea.  \n"
+                            f"Categorii: {mp_test.stats()['categories']} · "
+                            f"Valori indexate: {mp_test.stats()['values']:,}"
+                        )
+                    else:
+                        st.error("❌ Date goale în DuckDB — reimportă fișierele.")
+                except Exception as e:
+                    st.error(f"❌ Eroare la verificare: {e}")
 
     # ── Error code configuration ───────────────────────────────────────────────
     st.markdown("---")
