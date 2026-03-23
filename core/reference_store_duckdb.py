@@ -260,56 +260,59 @@ def _validate_and_create_issues(
                                      f"Characteristic '{row.get('name', '')}' duplicat în "
                                      f"categoria '{row.get('category_id', '')}'."))
 
-    # 4. Mandatory characteristics fără valori
+    # 4. Mandatory characteristics fără valori (vectorizat)
     if not chars.empty:
         mandatory_truthy = {"1", "true", "True", "yes", "1.0"}
         mandatory_mask = chars["mandatory"].astype(str).isin(mandatory_truthy)
-        for _, row in chars[mandatory_mask].iterrows():
-            cat_id  = str(row.get("category_id", ""))
-            char_nm = str(row.get("name", ""))
-            has_val = (
-                not vals.empty
-                and not vals[
-                    (vals["category_id"].astype(str) == cat_id) &
-                    (vals["characteristic_name"].astype(str) == char_nm)
-                ].empty
-            )
-            if not has_val:
+        mandatory_chars = chars[mandatory_mask].copy()
+        if not mandatory_chars.empty:
+            # Build set of (category_id, char_name) care au cel puțin o valoare
+            if not vals.empty:
+                vals_pairs = set(
+                    zip(vals["category_id"].astype(str), vals["characteristic_name"].astype(str))
+                )
+            else:
+                vals_pairs = set()
+            mandatory_chars["_pair"] = list(zip(
+                mandatory_chars["category_id"].astype(str),
+                mandatory_chars["name"].astype(str),
+            ))
+            no_vals = mandatory_chars[~mandatory_chars["_pair"].isin(vals_pairs)]
+            for _, row in no_vals.iterrows():
                 issues.append(_issue("warning", "mandatory_no_values", "characteristic",
                                      str(row.get("id", "")),
-                                     f"Caracteristica obligatorie '{char_nm}' (cat '{cat_id}') "
-                                     f"nu are nicio valoare permisă."))
+                                     f"Caracteristica obligatorie '{row.get('name', '')}' "
+                                     f"(cat '{row.get('category_id', '')}') nu are valori."))
 
-    # 5. Values cu characteristic_name null
+    # 5. Values cu characteristic_name null (raportăm doar numărul total, nu per-rând)
     if not vals.empty:
-        null_char = vals[vals["characteristic_name"].isna()]
-        for idx, row in null_char.iterrows():
-            issues.append(_issue("warning", "null_characteristic_name", "value", str(idx),
-                                 f"Valoarea '{row.get('value', '')}' nu are characteristic_name "
-                                 f"(va fi ignorată la indexare)."))
+        null_count = vals["characteristic_name"].isna().sum()
+        if null_count > 0:
+            issues.append(_issue("warning", "null_characteristic_name", "value", None,
+                                 f"{null_count} rânduri fără characteristic_name "
+                                 f"(vor fi ignorate la indexare)."))
 
-    # 6. Values goale
+    # 6. Values goale (raportăm total, nu per-rând)
     if not vals.empty:
-        empty_mask = vals["value"].isna() | (vals["value"].astype(str).str.strip() == "")
-        for idx, row in vals[empty_mask].iterrows():
-            issues.append(_issue("error", "empty_value", "value", str(idx),
-                                 f"Valoare goală sau null la rândul {idx}."))
+        empty_count = (
+            vals["value"].isna() | (vals["value"].astype(str).str.strip() == "")
+        ).sum()
+        if empty_count > 0:
+            issues.append(_issue("error", "empty_value", "value", None,
+                                 f"{empty_count} valori goale sau null (vor fi excluse la import)."))
 
-    # 7. Orphan values
+    # 7. Orphan values — raportăm characteristic_name-urile unice care nu există în chars
     if not vals.empty and not chars.empty:
         known_char_names = set(chars["name"].astype(str).dropna())
-        orphan_vals = vals[
-            vals["characteristic_name"].notna() &
-            ~vals["characteristic_name"].astype(str).isin(known_char_names)
-        ]
-        seen = set()
-        for idx, row in orphan_vals.iterrows():
-            key = str(row.get("characteristic_name", ""))
-            if key not in seen:
-                seen.add(key)
-                issues.append(_issue("warning", "orphan_value", "value", str(idx),
-                                     f"Valoarea '{row.get('value', '')}' are characteristic_name "
-                                     f"'{key}' care nu există în characteristics."))
+        orphan_names = (
+            vals.loc[vals["characteristic_name"].notna(), "characteristic_name"]
+            .astype(str)
+            .loc[lambda s: ~s.isin(known_char_names)]
+            .unique()
+        )
+        for name in orphan_names:
+            issues.append(_issue("warning", "orphan_value", "value", None,
+                                 f"characteristic_name '{name}' nu există în characteristics."))
 
     return issues
 
@@ -371,84 +374,91 @@ def import_emag_hu(
             len(cats_df), len(chars_df), len(vals_enriched), len(issues),
         )
 
-        # 4. Transaction: delete old + insert new
+        # 4. Transaction: delete old + bulk insert new
+        # Pregătire DataFrames pentru bulk insert (DuckDB citește direct din pandas)
+        cats_bulk = pd.DataFrame({
+            "marketplace_id":     EMAG_HU_ID,
+            "category_id":        cats_df["id"].astype(str),
+            "emag_id":            cats_df["emag_id"].astype(str),
+            "category_name":      cats_df["name"].astype(str),
+            "parent_category_id": cats_df["parent_id"].where(cats_df["parent_id"].notna(), None),
+            "import_run_id":      import_run_id,
+        })
+
+        chars_bulk = pd.DataFrame({
+            "marketplace_id":      EMAG_HU_ID,
+            "characteristic_id":   chars_df["id"].astype(str),
+            "category_id":         chars_df["category_id"].astype(str),
+            "characteristic_name": chars_df["name"].astype(str),
+            "mandatory":           chars_df["mandatory"].astype(str).isin(mandatory_truthy),
+            "import_run_id":       import_run_id,
+        })
+
+        vals_clean = vals_enriched[
+            vals_enriched["value"].notna() &
+            (vals_enriched["value"].astype(str).str.strip() != "")
+        ].copy()
+        vals_bulk = pd.DataFrame({
+            "marketplace_id":      EMAG_HU_ID,
+            "category_id":         vals_clean["category_id"].where(vals_clean["category_id"].notna(), None),
+            "characteristic_id":   vals_clean["characteristic_id"].where(vals_clean["characteristic_id"].notna(), None),
+            "characteristic_name": vals_clean["characteristic_name"].where(vals_clean["characteristic_name"].notna(), None),
+            "value":               vals_clean["value"].astype(str).str.strip(),
+            "import_run_id":       import_run_id,
+        })
+
+        issues_bulk = pd.DataFrame(issues) if issues else pd.DataFrame(columns=[
+            "issue_id", "import_run_id", "marketplace_id", "severity",
+            "issue_type", "entity_type", "entity_id", "message", "created_at",
+        ])
+
         con.execute("BEGIN")
         try:
             for table in ("categories", "characteristics", "characteristic_values"):
                 con.execute(f"DELETE FROM {table} WHERE marketplace_id=?", [EMAG_HU_ID])
 
-            for _, row in cats_df.iterrows():
-                con.execute(
-                    """
-                    INSERT INTO categories
-                      (marketplace_id, category_id, emag_id, category_name,
-                       parent_category_id, import_run_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        EMAG_HU_ID,
-                        str(row.get("id", "") or ""),
-                        str(row.get("emag_id", "") or ""),
-                        str(row.get("name", "") or ""),
-                        str(row.get("parent_id", "") or "") or None,
-                        import_run_id,
-                    ],
-                )
+            con.register("_cats_bulk",   cats_bulk)
+            con.register("_chars_bulk",  chars_bulk)
+            con.register("_vals_bulk",   vals_bulk)
+            con.execute("""
+                INSERT INTO categories
+                  (marketplace_id, category_id, emag_id, category_name,
+                   parent_category_id, import_run_id)
+                SELECT marketplace_id, category_id, emag_id, category_name,
+                       parent_category_id, import_run_id
+                FROM _cats_bulk
+            """)
+            con.execute("""
+                INSERT INTO characteristics
+                  (marketplace_id, characteristic_id, category_id,
+                   characteristic_name, mandatory, import_run_id)
+                SELECT marketplace_id, characteristic_id, category_id,
+                       characteristic_name, mandatory, import_run_id
+                FROM _chars_bulk
+            """)
+            con.execute("""
+                INSERT INTO characteristic_values
+                  (marketplace_id, category_id, characteristic_id,
+                   characteristic_name, value, import_run_id)
+                SELECT marketplace_id, category_id, characteristic_id,
+                       characteristic_name, value, import_run_id
+                FROM _vals_bulk
+            """)
+            con.unregister("_cats_bulk")
+            con.unregister("_chars_bulk")
+            con.unregister("_vals_bulk")
 
-            for _, row in chars_df.iterrows():
-                mandatory = str(row.get("mandatory", "0")) in mandatory_truthy
-                con.execute(
-                    """
-                    INSERT INTO characteristics
-                      (marketplace_id, characteristic_id, category_id,
-                       characteristic_name, mandatory, import_run_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        EMAG_HU_ID,
-                        str(row.get("id", "") or ""),
-                        str(row.get("category_id", "") or ""),
-                        str(row.get("name", "") or ""),
-                        mandatory,
-                        import_run_id,
-                    ],
-                )
-
-            for _, row in vals_enriched.iterrows():
-                value = str(row.get("value", "") or "").strip()
-                if not value:
-                    continue
-                con.execute(
-                    """
-                    INSERT INTO characteristic_values
-                      (marketplace_id, category_id, characteristic_id,
-                       characteristic_name, value, import_run_id)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        EMAG_HU_ID,
-                        str(row.get("category_id", "") or "") or None,
-                        str(row.get("characteristic_id", "") or "") or None,
-                        str(row.get("characteristic_name", "") or "") or None,
-                        value,
-                        import_run_id,
-                    ],
-                )
-
-            for iss in issues:
-                con.execute(
-                    """
+            if not issues_bulk.empty:
+                con.register("_issues_bulk", issues_bulk)
+                con.execute("""
                     INSERT INTO import_issues
                       (issue_id, import_run_id, marketplace_id, severity,
                        issue_type, entity_type, entity_id, message, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        iss["issue_id"], iss["import_run_id"], iss["marketplace_id"],
-                        iss["severity"], iss["issue_type"], iss["entity_type"],
-                        iss["entity_id"], iss["message"], iss["created_at"],
-                    ],
-                )
+                    SELECT issue_id, import_run_id, marketplace_id, severity,
+                           issue_type, entity_type, entity_id, message, created_at
+                    FROM _issues_bulk
+                """)
+                con.unregister("_issues_bulk")
 
             con.execute("COMMIT")
         except Exception:
