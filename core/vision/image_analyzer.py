@@ -11,6 +11,7 @@ to the marketplace's valid values and ready to be merged into new_chars.
 This module is the ONLY entry point needed by the rest of the app.
 """
 from __future__ import annotations
+import time
 from dataclasses import dataclass, field
 from typing import Optional
 from PIL import Image
@@ -137,14 +138,22 @@ def analyze_product_image(
         ImageAnalysisResult with suggested_attributes ready to merge into new_chars.
     """
     ensure_rules_file()
-    result = ImageAnalysisResult(image_url=image_url)
+    t_global = time.perf_counter()
+    result   = ImageAnalysisResult(image_url=image_url)
+
+    log.debug(
+        "[Vision] Start analiza offer=%s category=%r enable_color=%s enable_hint=%s url=%s",
+        offer_id, category, enable_color, enable_product_hint, image_url[:80],
+    )
 
     if not image_url or not image_url.strip().startswith("http"):
         result.skipped_reason = "No valid image URL"
+        log.warning("[Vision] Skipuit — URL invalid offer=%s url=%r", offer_id, image_url)
         return result
 
     if not enable_color and not enable_product_hint:
         result.skipped_reason = "Image analysis disabled"
+        log.debug("[Vision] Skipuit — analiza dezactivata offer=%s", offer_id)
         return result
 
     # ── Load rules ─────────────────────────────────────────────────────────────
@@ -168,12 +177,14 @@ def analyze_product_image(
         return result
 
     result.download_success = True
-    log.debug("[Vision] Image fetched offer=%s url=%s", offer_id, image_url[:80])
+    log.debug("[Vision] Imagine descarcata cu succes offer=%s url=%s", offer_id, image_url[:80])
 
     # ── Color analysis ─────────────────────────────────────────────────────────
     if enable_color:
         try:
+            t_color    = time.perf_counter()
             color_res: ColorResult = analyze_colors(img)
+            color_ms   = round((time.perf_counter() - t_color) * 1000)
 
             result.dominant_color_raw         = color_res.dominant_color_raw
             result.dominant_color_normalized  = color_res.dominant_color_normalized
@@ -183,16 +194,37 @@ def analyze_product_image(
             result.is_multicolor              = color_res.is_multicolor
 
             log.debug(
-                "[Vision] Color offer=%s dominant=%s conf=%.2f multicolor=%s",
-                offer_id, color_res.dominant_color_normalized,
+                "[Vision] Culoare detectata offer=%s dominant=%r(%s) secundar=%r(%s) "
+                "conf=%.2f multicolor=%s palette=%s analiza=%dms",
+                offer_id,
+                color_res.dominant_color_normalized, color_res.dominant_color_raw,
+                color_res.secondary_color_normalized, color_res.secondary_color_raw,
                 color_res.confidence, color_res.is_multicolor,
+                color_res.palette_rgb[:3],
+                color_ms,
             )
 
             # Find which color char is missing and mandatory
             missing_char = _missing_color_char(color_chars, mandatory_chars, existing_chars)
 
+            log.debug(
+                "[Vision] Color chars de verificat: %s | mandatory: %s | missing_char: %s | offer=%s",
+                color_chars, mandatory_chars, missing_char, offer_id,
+            )
+
+            if not missing_char:
+                already = {ch: existing_chars.get(ch) for ch in color_chars if existing_chars.get(ch)}
+                log.debug(
+                    "[Vision] Toti color chars deja completati sau nu sunt obligatorii offer=%s: %s",
+                    offer_id, already,
+                )
+
             if missing_char:
                 valid_set = valid_values_for_cat.get(missing_char, set())
+                log.debug(
+                    "[Vision] Camp culoare lipsa: [%s] | valori permise in marketplace: %d | offer=%s",
+                    missing_char, len(valid_set), offer_id,
+                )
 
                 # Case 1: Multicolor detected with high confidence
                 if color_res.is_multicolor and color_res.confidence >= multicolor_threshold:
@@ -200,32 +232,49 @@ def analyze_product_image(
                     if mc_val:
                         result.suggested_attributes[missing_char] = mc_val
                         result.used_for_attribute_fill = True
-                        log.info("[Vision] Multicolor fill [%s] offer=%s", missing_char, offer_id)
+                        log.info(
+                            "[Vision] MULTICOLOR completat [%s]=%r conf=%.2f offer=%s",
+                            missing_char, mc_val, color_res.confidence, offer_id,
+                        )
                     else:
                         result.needs_review  = True
                         result.review_reason = "Multicolor detected but value not in marketplace list"
+                        log.warning(
+                            "[Vision] Multicolor detectat dar valoarea lipseste din lista marketplace "
+                            "offer=%s valid_set_sample=%s",
+                            offer_id, list(valid_set)[:5],
+                        )
 
                 # Case 2: Single dominant color with sufficient confidence
                 elif color_res.dominant_color_normalized and color_res.confidence >= min_confidence:
                     normalized = color_res.dominant_color_normalized
-                    family     = color_res.dominant_color_raw  # reused as family via analyzer
 
                     if valid_set:
                         # 1. Exact / case-insensitive match on normalized name
                         mapped = _map_to_valid(normalized, valid_set)
+                        log.debug(
+                            "[Vision] Match exact/case-insensitive: %r -> %r offer=%s",
+                            normalized, mapped, offer_id,
+                        )
                         # 2. Fallback: family-term scoring against accepted values
                         if not mapped:
-                            from core.vision.color_analyzer import _rgb_to_family, _norm
-                            # derive family from raw RGB stored in dominant_color_raw
+                            from core.vision.color_analyzer import _rgb_to_family
                             import re as _re
                             m = _re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)", color_res.dominant_color_raw)
                             if m:
                                 fam = _rgb_to_family((int(m.group(1)), int(m.group(2)), int(m.group(3))))
                                 mapped = pick_best_accepted_color(fam, valid_set) or None
+                                log.debug(
+                                    "[Vision] Fallback family scoring: rgb=%s family=%r -> mapped=%r offer=%s",
+                                    color_res.dominant_color_raw, fam, mapped, offer_id,
+                                )
                         if mapped:
                             result.suggested_attributes[missing_char] = mapped
                             result.used_for_attribute_fill = True
-                            log.info("[Vision] Color fill [%s]=%r offer=%s", missing_char, mapped, offer_id)
+                            log.info(
+                                "[Vision] CULOARE completata [%s]=%r (detectat=%r conf=%.2f) offer=%s",
+                                missing_char, mapped, normalized, color_res.confidence, offer_id,
+                            )
                         else:
                             if fallback_review:
                                 result.needs_review  = True
@@ -233,11 +282,20 @@ def analyze_product_image(
                                     f"Color '{normalized}' detected but not in marketplace "
                                     f"valid values ({len(valid_set)} values)"
                                 )
+                            log.warning(
+                                "[Vision] Culoare %r nu exista in lista marketplace "
+                                "[%s] (valid_count=%d sample=%s) offer=%s",
+                                normalized, missing_char, len(valid_set),
+                                list(valid_set)[:6], offer_id,
+                            )
                     else:
                         # Freeform field — use normalized name directly
                         result.suggested_attributes[missing_char] = normalized
                         result.used_for_attribute_fill = True
-                        log.info("[Vision] Freeform color fill [%s]=%r offer=%s", missing_char, normalized, offer_id)
+                        log.info(
+                            "[Vision] CULOARE freeform completata [%s]=%r offer=%s",
+                            missing_char, normalized, offer_id,
+                        )
 
                 # Case 3: Low confidence
                 else:
@@ -247,27 +305,66 @@ def analyze_product_image(
                             f"Color detected ({color_res.dominant_color_normalized}) "
                             f"but confidence too low ({color_res.confidence:.2f} < {min_confidence})"
                         )
+                        log.warning(
+                            "[Vision] Confidence prea mica — nu completam: "
+                            "culoare=%r conf=%.2f < prag=%.2f offer=%s",
+                            color_res.dominant_color_normalized,
+                            color_res.confidence, min_confidence, offer_id,
+                        )
+                    else:
+                        log.warning(
+                            "[Vision] Nicio culoare detectata in imagine offer=%s url=%s",
+                            offer_id, image_url[:80],
+                        )
 
         except Exception as e:
-            log.error("[Vision] Color analysis error offer=%s: %s", offer_id, e, exc_info=True)
+            log.error("[Vision] Eroare analiza culori offer=%s: %s", offer_id, e, exc_info=True)
 
     # ── Product type hint (vision model) ───────────────────────────────────────
     if enable_product_hint and vision_provider is not None:
-        try:
-            if vision_provider.is_available():
+        if not vision_provider.is_available():
+            log.warning("[Vision] Vision provider indisponibil — product hint sarit offer=%s", offer_id)
+        else:
+            try:
+                t_hint = time.perf_counter()
                 prompt = (
                     f"You are analyzing a product image for a marketplace listing.\n"
                     f"Current category assigned from text: '{category}'.\n"
                     f"Look at the image and identify what product type this is in 3-5 words.\n"
                     f"Reply ONLY with the product type name, nothing else. No explanations."
                 )
-                hint = vision_provider.analyze(img, prompt)
+                hint    = vision_provider.analyze(img, prompt)
+                hint_ms = round((time.perf_counter() - t_hint) * 1000)
                 if hint and len(hint.strip()) > 2:
-                    result.product_type_hint        = hint.strip()[:120]
-                    result.product_type_confidence  = min_prod_confidence
+                    result.product_type_hint         = hint.strip()[:120]
+                    result.product_type_confidence   = min_prod_confidence
                     result.used_for_category_support = True
-                    log.info("[Vision] Product hint offer=%s: %r (cat: %s)", offer_id, hint[:60], category)
-        except Exception as e:
-            log.warning("[Vision] Product hint error offer=%s: %s", offer_id, e)
+                    log.info(
+                        "[Vision] Product hint offer=%s: %r (categorie curenta: %r) timp=%dms",
+                        offer_id, hint[:80], category, hint_ms,
+                    )
+                else:
+                    log.warning(
+                        "[Vision] Product hint raspuns gol sau prea scurt offer=%s raspuns=%r timp=%dms",
+                        offer_id, hint, hint_ms,
+                    )
+            except Exception as e:
+                log.warning("[Vision] Eroare product hint offer=%s: %s", offer_id, e, exc_info=True)
+    elif enable_product_hint and vision_provider is None:
+        log.warning("[Vision] enable_product_hint=True dar vision_provider=None offer=%s", offer_id)
+
+    # ── Summary log ────────────────────────────────────────────────────────────
+    total_ms = round((time.perf_counter() - t_global) * 1000)
+    log.info(
+        "[Vision] Analiza completa offer=%s total=%dms | "
+        "filled=%s needs_review=%s skipped=%r | "
+        "culoare=%r conf=%.2f",
+        offer_id, total_ms,
+        list(result.suggested_attributes.keys()) or "nimic",
+        result.needs_review,
+        result.skipped_reason or None,
+        result.dominant_color_normalized,
+        result.color_confidence,
+    )
 
     return result

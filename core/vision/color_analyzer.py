@@ -17,6 +17,9 @@ from io import BytesIO
 from typing import Optional
 
 from PIL import Image
+from core.app_logger import get_logger
+
+log = get_logger("marketplace.vision.color")
 
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
@@ -352,12 +355,25 @@ def analyze_colors(img: Image.Image) -> ColorResult:
     Analyze a PIL image and return a ColorResult.
     """
     img = img.convert("RGB")
+    orig_w, orig_h = img.size
+
+    log.debug("[Color] Start analiza imagine %dx%d px", orig_w, orig_h)
 
     # Remove background first — white detection happens on product pixels only
     dominant, rgb_counts = _dominant_rgb_ignore_bg(img)
 
     if not rgb_counts:
+        log.warning("[Color] Niciun pixel valid dupa eliminarea fundalului — imagine goala sau pura")
         return ColorResult()
+
+    total_pixels = sum(c for _, c in rgb_counts)
+    log.debug(
+        "[Color] Dupa eliminare fundal: %d culori distincte, %d pixeli valizi | "
+        "dominant=%s top3=%s",
+        len(rgb_counts), total_pixels,
+        rgb_counts[0][0],
+        [(rgb, cnt) for rgb, cnt in rgb_counts[:3]],
+    )
 
     # White product detection AFTER background removal:
     # if the dominant non-background color is white, the product itself is white.
@@ -366,6 +382,10 @@ def analyze_colors(img: Image.Image) -> ColorResult:
         total_w = sum(c for _, c in rgb_counts)
         dom_w   = next((c for rgb, c in rgb_counts if rgb == dominant), 0)
         conf_w  = round(min(dom_w / total_w, 1.0), 3) if total_w else 0.85
+        log.debug(
+            "[Color] Produs ALB detectat dupa eliminare fundal: dominant=%s conf=%.2f",
+            dominant, conf_w,
+        )
         return ColorResult(
             dominant_color_raw        = f"rgb{dominant}",
             dominant_color_normalized = "Alb",
@@ -377,6 +397,11 @@ def analyze_colors(img: Image.Image) -> ColorResult:
     h1, s1, _ = _rgb_to_hsv(top1)
     multicolor = s1 >= 0.18 and _is_multicolor(rgb_counts)
 
+    log.debug(
+        "[Color] Top-1 pixel: rgb=%s hsv=(h=%.0f s=%.2f) saturatie_ok=%s -> multicolor=%s",
+        top1, h1, s1, s1 >= 0.18, multicolor,
+    )
+
     family = _rgb_to_family(dominant)
     if multicolor:
         family = "multicolor"
@@ -384,20 +409,28 @@ def analyze_colors(img: Image.Image) -> ColorResult:
     normalized = _FAMILY_TO_NORMALIZED.get(family, "")
 
     # Confidence: real share of dominant color (no artificial inflation)
-    total = sum(c for _, c in rgb_counts)
+    total          = sum(c for _, c in rgb_counts)
     dominant_count = next((c for rgb, c in rgb_counts if rgb == dominant), 0)
-    confidence = round(min(dominant_count / total, 1.0), 3) if total else 0.0
+    confidence     = round(min(dominant_count / total, 1.0), 3) if total else 0.0
 
     # Secondary color
-    secondary_rgb = None
+    secondary_rgb    = None
     secondary_family = ""
     for rgb, _ in rgb_counts[1:]:
         if rgb != dominant:
-            secondary_rgb = rgb
+            secondary_rgb    = rgb
             secondary_family = _FAMILY_TO_NORMALIZED.get(_rgb_to_family(rgb), "")
             break
 
     palette = [rgb for rgb, _ in rgb_counts[:5]]
+
+    log.debug(
+        "[Color] Rezultat: dominant=%r(%s) family=%r conf=%.2f | "
+        "secundar=%r(%s) | multicolor=%s | palette=%s",
+        normalized, dominant, family, confidence,
+        secondary_family, secondary_rgb,
+        multicolor, palette,
+    )
 
     return ColorResult(
         dominant_color_raw        = f"rgb{dominant}",
