@@ -1,10 +1,14 @@
 import streamlit as st
+import io
 import time
 import re
 import math
 from core.state import all_marketplace_names, get_marketplace, get_error_codes, get_all_processable_codes
 from core.offers_parser import extract_products, get_error_code
 from core.processor import process_product, validate_existing, explain_missing_chars
+from core.app_logger import get_logger
+
+log = get_logger("marketplace.process")
 
 # Prețuri claude-haiku-4-5-20251001 (per token)
 _AI_PRICE_INPUT  = 0.80 / 1_000_000   # $0.80 per million input tokens
@@ -19,53 +23,7 @@ TITLE_CATEGORY_RULES_KEY = "title_cat_rules"  # prefix — se foloseste per-mark
 
 
 def _default_title_rules() -> list[dict]:
-    """
-    Reguli bazate pe cuvinte cheie prezente ORIUNDE in titlu (AND logic).
-    Camp 'keywords': cuvinte separate prin virgula, TOATE trebuie sa apara in titlu.
-    Camp 'exclude': cuvinte care NU trebuie sa apara (optional).
-    Reguli cu mai multe keywords = mai specifice = verificate primele.
-    """
-    return [
-        # Treninguri / Kituri
-        {"keywords": "kit, copii",              "category": "Treninguri lifestyle copii"},
-        {"keywords": "trening, copii",          "category": "Treninguri lifestyle copii"},
-        {"keywords": "trening, barbati",        "category": "Treninguri lifestyle barbati"},
-        {"keywords": "trening, femei",          "category": "Treninguri lifestyle femei"},
-        # Tricouri
-        {"keywords": "tricou, copii",           "category": "Tricouri sport copii"},
-        {"keywords": "tricou, baieti",          "category": "Tricouri sport copii"},
-        {"keywords": "tricou, fete",            "category": "Tricouri sport copii"},
-        {"keywords": "tricou, barbati",         "category": "Tricouri sport barbati"},
-        {"keywords": "tricou, femei",           "category": "Tricouri sport femei"},
-        {"keywords": "tricou, dama",            "category": "Tricouri sport femei"},
-        # Hanorace
-        {"keywords": "hanorac, copii",          "category": "Hanorace sport copii"},
-        {"keywords": "hanorac, barbati",        "category": "Hanorace sport barbati"},
-        {"keywords": "hanorac, femei",          "category": "Hanorace sport femei"},
-        # Pantaloni / Sorturi
-        {"keywords": "pantalon, copii",         "category": "Pantaloni sport copii"},
-        {"keywords": "pantalon, barbati",       "category": "Pantaloni sport barbati"},
-        {"keywords": "pantalon, femei",         "category": "Pantaloni sport femei"},
-        {"keywords": "sort, barbati",           "category": "Pantaloni sport barbati"},
-        {"keywords": "sort, copii",             "category": "Pantaloni sport copii"},
-        # Genti / Rucsacuri
-        {"keywords": "ghiozdan",               "category": "Ghiozdane și rucsacuri școală"},
-        {"keywords": "rucsac",                  "category": "Rucsacuri"},
-        {"keywords": "geanta, sport",           "category": "Rucsacuri"},
-        {"keywords": "borseta",                 "category": "Rucsacuri"},
-        # Accesorii
-        {"keywords": "sapca",                   "category": "Sepci si bandane sport barbati"},
-        {"keywords": "caciula, barbati",        "category": "Caciuli sport barbati"},
-        {"keywords": "caciula, copii",          "category": "Caciuli sport copii"},
-        {"keywords": "caciula",                 "category": "Caciuli sport barbati"},
-        {"keywords": "sosete, barbati",         "category": "Sosete sport barbati"},
-        {"keywords": "sosete, femei",           "category": "Sosete sport femei"},
-        {"keywords": "sosete, copii",           "category": "Sosete sport copii"},
-        {"keywords": "sosete",                  "category": "Sosete sport barbati"},
-        {"keywords": "manusi",                  "category": "Manusi sport"},
-        # Mingi
-        {"keywords": "minge",                   "category": "Mingi"},
-    ]
+    return []
 
 
 def _rule_keywords(rule: dict) -> list[str]:
@@ -107,6 +65,10 @@ def _resolve_category(title: str, current_cat: str, mp, rules: list) -> tuple[st
             if not any(ex in title_lower for ex in exclude):
                 return cat, "assigned"
 
+    log.debug(
+        "_resolve_category UNKNOWN: titlu=%r, cat_curenta=%r, reguli=%d, niciuna nu se potriveste",
+        title[:60], current_cat, len(rules),
+    )
     return "", "unknown"
 
 
@@ -116,10 +78,18 @@ def _estimate_ai_cost(to_process: list, mp, rules: list) -> dict:
     - Category AI: produse fără categorie valabilă → batch calls
     - Char AI: produse cu categorii valabile dar cu caracteristici obligatorii lipsă → per-product calls
     """
+    # Memoize _resolve_category — evita apeluri duble per produs
+    _resolve_cache: dict = {}
+    def _resolve_cached(title: str, cat: str):
+        key = (title, cat)
+        if key not in _resolve_cache:
+            _resolve_cache[key] = _resolve_category(title, cat, mp, rules)
+        return _resolve_cache[key]
+
     # ── Category AI ──────────────────────────────────────────────────────────
     needs_cat_ai = [
         p for p in to_process
-        if _resolve_category(str(p.get("name") or ""), str(p.get("category") or ""), mp, rules)[1] == "unknown"
+        if _resolve_cached(str(p.get("name") or ""), str(p.get("category") or ""))[1] == "unknown"
     ]
     n_cat_ai  = len(needs_cat_ai)
     n_batches = math.ceil(n_cat_ai / _AI_BATCH_SIZE) if n_cat_ai else 0
@@ -138,7 +108,7 @@ def _estimate_ai_cost(to_process: list, mp, rules: list) -> dict:
     for prod in to_process:
         title = str(prod.get("name") or "")
         cat   = str(prod.get("category") or "")
-        _, action = _resolve_category(title, cat, mp, rules)
+        _, action = _resolve_cached(title, cat)
         if action != "ok":
             continue  # categoria nu e rezolvată — se estimează separat mai jos
         cat_id = mp.category_id(cat)
@@ -203,9 +173,55 @@ def _audit_products(products: list, mp) -> dict:
 
 
 def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, marketplace="", image_options=None):
+    from core.ai_logger import start_run as _ai_start_run
+    _ai_start_run(marketplace)
+
     results = []
     total = len(products)
     processable_codes = get_all_processable_codes(marketplace)
+
+    # ── Diagnostic log la start ────────────────────────────────────────────────
+    mp_stats = mp.stats() if mp else {}
+    n_with_cat    = sum(1 for p in products if str(p.get("category") or "").strip())
+    n_valid_cat   = sum(1 for p in products if mp.category_id(str(p.get("category") or "").strip()))
+    n_processable = sum(
+        1 for p in products
+        if get_error_code(str(p.get("error") or "")) in processable_codes
+    )
+    log.info(
+        "START procesare [%s]: %d produse total, %d de procesat (cod eligibil), "
+        "%d cu categorie in fisier, %d cu categorie valida in MP, "
+        "%d reguli configurate, AI=%s, "
+        "MP incarcat: %d categorii / %d caracteristici / %d valori",
+        marketplace, total, n_processable,
+        n_with_cat, n_valid_cat,
+        len(rules), use_ai,
+        mp_stats.get("categories", 0), mp_stats.get("characteristics", 0), mp_stats.get("values", 0),
+    )
+    if n_processable == 0:
+        codes_in_file = set(
+            get_error_code(str(p.get("error") or "")) for p in products
+        ) - {None}
+        if not codes_in_file:
+            log.warning(
+                "[%s] NICIUN produs nu are cod de eroare in fisier (%d produse). "
+                "Coloana 'Eroare oferta' lipseste sau este goala — nu se va procesa nimic.",
+                marketplace, total,
+            )
+        else:
+            log.warning(
+                "[%s] Niciun produs nu are cod eligibil. "
+                "Coduri in fisier: %s. Coduri procesabile configurate: %s.",
+                marketplace, sorted(codes_in_file),
+                sorted(get_all_processable_codes(marketplace)),
+            )
+
+    if n_valid_cat == 0 and n_processable > 0:
+        log.warning(
+            "[%s] Niciun produs nu are o categorie valida pentru acest marketplace. "
+            "Reguli: %d. AI: %s. Fara reguli sau AI activ, categoriile NU pot fi determinate automat.",
+            marketplace, len(rules), use_ai,
+        )
 
     # ── Pre-procesare batch categorie (1 apel API pentru toate produsele fara categorie) ─
     if use_ai:
@@ -270,7 +286,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
             "original_cat": cat,
             "error_code":   err_code,
             "action":       "skip",
-            "new_category": cat,
+            "new_category": cat if mp.category_id(cat) else "",
             "cleared":      [],
             "new_chars":    {},
             "needs_manual": False,
@@ -297,6 +313,11 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                 final_cat = ai_cat
                 result["action"] = "cat_assigned"
                 result["new_category"] = ai_cat
+            elif ai_cat == "__timeout__":
+                result["mapping_log"]["category_reason"] = (
+                    "AI timeout — modelul nu a raspuns la timp. "
+                    "Mareste OLLAMA_TIMEOUT in .env sau foloseste un model mai rapid."
+                )
             elif ai_cat:
                 result["mapping_log"]["category_reason"] = (
                     f"AI a sugerat '{ai_cat}' dar nu există în lista marketplace-ului"
@@ -318,18 +339,14 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         cat_id = mp.category_id(final_cat)
 
         # ── Clear invalid existing values ─────────────────────────────────────
+        # Orice valoare care nu există în lista de valori permise pentru
+        # categoria și marketplace-ul curent este ștearsă automat.
         invalid = validate_existing(existing, final_cat, mp)
         cleared = []
         for char_name, bad_val in invalid.items():
-            str_val = str(bad_val).strip()
-            # Always clear: size value in Culoare field
-            if char_name == "Culoare:" and str_val in SIZE_INTL:
-                cleared.append(char_name)
-                existing[char_name] = None
-            # Clear invalid Marime convertita / Stil
-            elif char_name in ("Marime convertita", "Stil:", "Marime:"):
-                cleared.append(char_name)
-                existing[char_name] = None
+            log.debug("Clear valoare invalida [%s]=%r (titlu: %s)", char_name, bad_val, title[:60])
+            cleared.append(char_name)
+            existing[char_name] = None
 
         # ── Sterge caracteristici care nu apartin acestui marketplace ──────────
         # Previne propagarea campurilor din alte marketplace-uri (RO/BG in HU etc.)
@@ -342,7 +359,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         result["cleared"] = cleared
 
         # ── Auto-fill characteristics ─────────────────────────────────────────
-        new_chars = process_product(title, desc, final_cat, existing, mp, use_ai=use_ai, marketplace=marketplace, offer_id=str(prod.get("id", "")))
+        new_chars = process_product(title, desc, final_cat, existing, mp, use_ai=use_ai, marketplace=marketplace, offer_id=str(prod.get("id", "")), product_meta={k: prod.get(k) for k in ("ean", "brand", "sku", "weight", "warranty")})
         result["new_chars"] = new_chars
 
         # ── Image analysis hook (optional, backward-compatible) ───────────────
@@ -478,7 +495,6 @@ def render():
 
     if offers_file:
         file_bytes = offers_file.read()
-        import io
         buf = io.BytesIO(file_bytes)
         buf.name = offers_file.name
 
@@ -583,7 +599,26 @@ def render():
     processable = get_all_processable_codes(selected_mp)
     to_process = [p for p in products
                   if get_error_code(str(p.get("error") or "")) in processable]
-    st.info(f"**{len(to_process)}** produse cu erori vor fi procesate din totalul de **{len(products)}**.")
+
+    if not to_process and products:
+        error_codes_in_file = set(
+            get_error_code(str(p.get("error") or "")) for p in products
+        ) - {None}
+        if not error_codes_in_file:
+            st.warning(
+                "⚠️ **Niciun produs nu are codul de eroare completat.** "
+                "Asigură-te că ai descărcat coloana **Eroare ofertă** din eMAG înainte de export. "
+                "Fără această coloană, sistemul nu știe ce produse trebuie procesate."
+            )
+        else:
+            st.warning(
+                f"⚠️ **Niciun produs nu corespunde codurilor de eroare configurate** pentru {selected_mp}. "
+                f"Coduri găsite în fișier: `{', '.join(sorted(error_codes_in_file))}` — "
+                f"coduri procesabile configurate: `{', '.join(sorted(processable))}`. "
+                "Verifică configurarea codurilor în ⚙️ Setup."
+            )
+    else:
+        st.info(f"**{len(to_process)}** produse cu erori vor fi procesate din totalul de **{len(products)}**.")
 
     # AI toggle
     from core.ai_enricher import is_configured as ai_configured
@@ -605,7 +640,14 @@ def render():
             st.caption("⚠️ API key neconfigurata. Mergi la **⚙️ Setup → Configurare API** pentru a o adăuga.")
 
     # ── AI Cost Estimate ──────────────────────────────────────────────────────
-    if use_ai and to_process:
+    from core.llm_router import get_router as _get_router
+    _is_anthropic = False
+    try:
+        _is_anthropic = _get_router().provider_name == "anthropic"
+    except Exception:
+        pass
+
+    if use_ai and to_process and _is_anthropic:
         est = _estimate_ai_cost(to_process, mp, rules)
         with st.expander("💰 Cost estimativ API Claude", expanded=True):
             c1, c2, c3, c4 = st.columns(4)

@@ -21,10 +21,17 @@ class AnthropicProvider(BaseLLMProvider):
                 "Pachetul 'anthropic' nu este instalat. Rulează: pip install anthropic"
             )
 
-    def complete(self, prompt: str, max_tokens: int = 300) -> str:
-        msg = self._client.messages.create(
+    def complete(self, prompt: str, max_tokens: int = 300, *,
+                 system: str | None = None,
+                 temperature: float | None = None) -> str:
+        kwargs = dict(
             model=_MODEL,
             max_tokens=max_tokens,
             messages=[{"role": "user", "content": prompt}],
         )
+        if system:
+            kwargs["system"] = system
+        if temperature is not None:
+            kwargs["temperature"] = temperature
+        msg = self._client.messages.create(**kwargs)
         return msg.content[0].text

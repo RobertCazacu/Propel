@@ -4,6 +4,8 @@ Handles Categories, Characteristics and Values Excel/CSV files
 with flexible column detection (tolerant of extra/missing columns).
 Accepts both Streamlit file-like objects and local file paths (str/Path).
 """
+import unicodedata
+import difflib
 import pandas as pd
 import json
 from pathlib import Path
@@ -12,6 +14,12 @@ from typing import Optional, Union
 from core.app_logger import get_logger
 
 log = get_logger("marketplace.loader")
+
+
+def _normalize_str(s: str) -> str:
+    """Strip diacritics and lowercase for fuzzy matching (ș→s, ő→o, etc.)."""
+    nfkd = unicodedata.normalize("NFKD", str(s))
+    return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
 
 
 def _read_tabular(file_or_path: Union[str, Path, object]) -> pd.DataFrame:
@@ -162,11 +170,13 @@ class MarketplaceData:
         self.values: pd.DataFrame = pd.DataFrame()
 
         # Fast lookup indexes (built after loading)
-        self._cat_name_to_id: dict = {}       # "Tricouri copii" -> 3216
-        self._cat_id_to_name: dict = {}       # 3216 -> "Tricouri copii"
-        self._mandatory: dict = {}            # cat_id -> [char_name, ...]
-        self._valid_values: dict = {}         # cat_id -> {char_name -> set(values)}
-        self._cat_chars: dict = {}            # cat_id -> set(all char names for that category)
+        self._cat_name_to_id: dict = {}           # "Tricouri copii" -> 3216
+        self._cat_name_normalized: dict = {}      # "tricouri copii" -> 3216 (diacritics-free)
+        self._cat_id_to_name: dict = {}           # 3216 -> "Tricouri copii"
+        self._mandatory: dict = {}                # cat_id -> [char_name, ...]
+        self._valid_values: dict = {}             # cat_id -> {char_name -> set(values)}
+        self._valid_values_normalized: dict = {}  # cat_id -> {char_name -> {norm_val -> orig_val}}
+        self._cat_chars: dict = {}                # cat_id -> set(all char names for that category)
 
     # ── Loaders ────────────────────────────────────────────────────────────────
     def load_from_files(self, cat_file, char_file, val_file):
@@ -204,6 +214,13 @@ class MarketplaceData:
         self._cat_name_to_id = dict(zip(cats["name"], join_ids))
         self._cat_id_to_name = dict(zip(join_ids, cats["name"]))
 
+        # normalized category lookup (diacritics-insensitive, case-insensitive)
+        self._cat_name_normalized = {}
+        for name, cat_id in self._cat_name_to_id.items():
+            nk = _normalize_str(name)
+            if nk not in self._cat_name_normalized:
+                self._cat_name_normalized[nk] = cat_id
+
         # mandatory characteristics (vectorized)
         chars = self.characteristics.copy()
         chars["name"] = chars["name"].astype(str).str.strip()
@@ -225,9 +242,31 @@ class MarketplaceData:
         for (cat_id, char_name), grp in vals.groupby(["category_id", "characteristic_name"]):
             self._valid_values.setdefault(cat_id, {})[char_name] = set(grp["value"])
 
+        # normalized valid values (diacritics-insensitive) — built from _valid_values
+        self._valid_values_normalized = {}
+        for cat_id, char_dict in self._valid_values.items():
+            self._valid_values_normalized[cat_id] = {}
+            for char_name, val_set in char_dict.items():
+                norm_map: dict = {}
+                for v in val_set:
+                    nv = _normalize_str(v)
+                    if nv not in norm_map:
+                        norm_map[nv] = v
+                self._valid_values_normalized[cat_id][char_name] = norm_map
+
     # ── Lookup helpers ─────────────────────────────────────────────────────────
     def category_id(self, name: str) -> Optional[int]:
-        return self._cat_name_to_id.get(name)
+        result = self._cat_name_to_id.get(name)
+        if result is None:
+            result = self._cat_name_normalized.get(_normalize_str(name))
+        if result is None and self._cat_name_to_id:
+            # Fuzzy fallback: last resort for minor typos / abbreviations
+            matches = difflib.get_close_matches(
+                name, self._cat_name_to_id.keys(), n=1, cutoff=0.90
+            )
+            if matches:
+                result = self._cat_name_to_id[matches[0]]
+        return result
 
     def category_name(self, cat_id) -> Optional[str]:
         return self._cat_id_to_name.get(cat_id)
@@ -270,6 +309,11 @@ class MarketplaceData:
                     return fmt
         except ValueError:
             pass
+        # Normalized fallback — diacritics-insensitive (e.g. "Negru" matches "Negru" in BG/HU)
+        norm_s = _normalize_str(s)
+        norm_map = self._valid_values_normalized.get(cat_id, {}).get(char_name, {})
+        if norm_s in norm_map:
+            return norm_map[norm_s]
         return None
 
     def category_list(self) -> list:

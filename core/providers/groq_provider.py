@@ -17,7 +17,13 @@ class GroqProvider(BaseLLMProvider):
             )
         self._model = os.getenv("GROQ_MODEL", _DEFAULT_MODEL)
 
-    def complete(self, prompt: str, max_tokens: int = 300) -> str:
+    def complete(self, prompt: str, max_tokens: int = 300, *,
+                 system: str | None = None,
+                 temperature: float | None = None) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
         resp = requests.post(
             _API_URL,
             headers={
@@ -25,10 +31,11 @@ class GroqProvider(BaseLLMProvider):
                 "Content-Type":  "application/json",
             },
             json={
-                "model":      self._model,
-                "messages":   [{"role": "user", "content": prompt}],
-                "max_tokens": max_tokens,
-                "temperature": 0.1,
+                "model":       self._model,
+                "messages":    messages,
+                "max_tokens":  max_tokens,
+                "temperature": temperature if temperature is not None else 0.2,
+                "response_format": {"type": "json_object"},
             },
             timeout=30,
         )

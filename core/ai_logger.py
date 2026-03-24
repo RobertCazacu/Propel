@@ -18,16 +18,34 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 AI_LOGS_DIR = Path(__file__).parent.parent / "data" / "ai_logs"
-MAX_AGE_HOURS = 24
+MAX_AGE_DAYS = 30
+
+_run_file: Path | None = None
+
+
+# ── Run context ────────────────────────────────────────────────────────────────
+
+def start_run(marketplace: str) -> Path:
+    """
+    Call at the start of each processing run.
+    Creates a new log file: data/ai_logs/YYYY-MM-DD_HH-MM-SS_marketplace.json
+    """
+    global _run_file
+    AI_LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    _cleanup()
+    ts_str  = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    safe_mp = marketplace.replace(" ", "_")
+    _run_file = AI_LOGS_DIR / f"{ts_str}_{safe_mp}.json"
+    return _run_file
 
 
 # ── Cleanup ────────────────────────────────────────────────────────────────────
 
 def _cleanup():
-    """Remove log files older than MAX_AGE_HOURS."""
+    """Remove log files older than MAX_AGE_DAYS."""
     if not AI_LOGS_DIR.exists():
         return
-    cutoff = datetime.now() - timedelta(hours=MAX_AGE_HOURS)
+    cutoff = datetime.now() - timedelta(days=MAX_AGE_DAYS)
     for f in AI_LOGS_DIR.glob("*.json"):
         try:
             if datetime.fromtimestamp(f.stat().st_mtime) < cutoff:
@@ -36,15 +54,17 @@ def _cleanup():
             pass
 
 
-def _today_file() -> Path:
+def _current_file() -> Path:
+    """Return the active run file, or a fallback if start_run() was not called."""
+    if _run_file is not None:
+        return _run_file
     AI_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     return AI_LOGS_DIR / f"{datetime.now().strftime('%Y-%m-%d')}.json"
 
 
 def _append_entry(entry: dict):
-    """Append one entry to today's log file (JSON array)."""
-    _cleanup()
-    path = _today_file()
+    """Append one entry to the current run's log file (JSON array)."""
+    path = _current_file()
     if path.exists():
         try:
             entries = json.loads(path.read_text(encoding="utf-8"))

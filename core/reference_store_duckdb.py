@@ -1,10 +1,10 @@
 """
-DuckDB reference store — pilot pentru eMAG HU.
+DuckDB reference store — backend unificat pentru marketplace-urile pilot.
 
 Gestionează schema, importul, validarea și citirea datelor de referință
 (categories, characteristics, values) din DuckDB local.
 
-Folosit EXCLUSIV pentru eMAG HU. Celelalte marketplace-uri continuă cu Parquet.
+Marketplace-uri active: eMAG HU, Allegro.
 """
 import uuid
 from pathlib import Path
@@ -21,6 +21,14 @@ log = get_logger("marketplace.duckdb")
 # ── Constante ──────────────────────────────────────────────────────────────────
 EMAG_HU_ID   = "emag_hu"
 EMAG_HU_NAME = "eMAG HU"
+ALLEGRO_ID   = "allegro"
+ALLEGRO_NAME = "Allegro"
+
+# Map display name → marketplace_id (folosit în setup.py și state.py)
+DUCKDB_ID_MAP: dict[str, str] = {
+    EMAG_HU_NAME: EMAG_HU_ID,
+    ALLEGRO_NAME: ALLEGRO_ID,
+}
 
 # Path absolut anchored la modul — nu relativ la cwd
 DB_PATH = Path(__file__).parent.parent / "data" / "reference_data.duckdb"
@@ -113,13 +121,14 @@ _UPSERT_MARKETPLACE = """
 def init_db(db_path: Path = DB_PATH) -> None:
     """
     Inițializează fișierul DB: creează directorul, tabelele și
-    înregistrarea eMAG HU în tabela marketplaces (upsert idempotent).
+    înregistrările tuturor marketplace-urilor DuckDB (upsert idempotent).
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with duckdb.connect(str(db_path)) as con:
         for ddl in _DDL_STATEMENTS:
             con.execute(ddl)
-        con.execute(_UPSERT_MARKETPLACE, [EMAG_HU_ID, EMAG_HU_NAME])
+        for mp_name, mp_id in DUCKDB_ID_MAP.items():
+            con.execute(_UPSERT_MARKETPLACE, [mp_id, mp_name])
     log.info("DuckDB inițializat: %s", db_path)
 
 
@@ -319,7 +328,8 @@ def _validate_and_create_issues(
 
 # ── Import ─────────────────────────────────────────────────────────────────────
 
-def import_emag_hu(
+def import_marketplace(
+    marketplace_id: str,
     cats_df: pd.DataFrame,
     chars_df: pd.DataFrame,
     vals_df: pd.DataFrame,
@@ -328,7 +338,7 @@ def import_emag_hu(
     db_path: Path = DB_PATH,
 ) -> str:
     """
-    Importă date pentru eMAG HU în DuckDB.
+    Importă date pentru orice marketplace DuckDB.
 
     Pași:
     1. Creează import_run (status=started)
@@ -356,7 +366,7 @@ def import_emag_hu(
             VALUES (?, ?, ?, ?, ?, ?, 'started', ?)
             """,
             [
-                import_run_id, EMAG_HU_ID, source_type,
+                import_run_id, marketplace_id, source_type,
                 sources.get("categories"), sources.get("characteristics"), sources.get("values"),
                 now,
             ],
@@ -367,17 +377,17 @@ def import_emag_hu(
 
         # 3. Validate (before touching existing data)
         issues = _validate_and_create_issues(
-            import_run_id, EMAG_HU_ID, cats_df, chars_df, vals_enriched
+            import_run_id, marketplace_id, cats_df, chars_df, vals_enriched
         )
         log.info(
-            "Import eMAG HU: %d categorii, %d caracteristici, %d valori, %d issues",
-            len(cats_df), len(chars_df), len(vals_enriched), len(issues),
+            "Import [%s]: %d categorii, %d caracteristici, %d valori, %d issues",
+            marketplace_id, len(cats_df), len(chars_df), len(vals_enriched), len(issues),
         )
 
         # 4. Transaction: delete old + bulk insert new
         # Pregătire DataFrames pentru bulk insert (DuckDB citește direct din pandas)
         cats_bulk = pd.DataFrame({
-            "marketplace_id":     EMAG_HU_ID,
+            "marketplace_id":     marketplace_id,
             "category_id":        cats_df["id"].astype(str),
             "emag_id":            cats_df["emag_id"].astype(str),
             "category_name":      cats_df["name"].astype(str),
@@ -386,7 +396,7 @@ def import_emag_hu(
         })
 
         chars_bulk = pd.DataFrame({
-            "marketplace_id":      EMAG_HU_ID,
+            "marketplace_id":      marketplace_id,
             "characteristic_id":   chars_df["id"].astype(str),
             "category_id":         chars_df["category_id"].astype(str),
             "characteristic_name": chars_df["name"].astype(str),
@@ -399,7 +409,7 @@ def import_emag_hu(
             (vals_enriched["value"].astype(str).str.strip() != "")
         ].copy()
         vals_bulk = pd.DataFrame({
-            "marketplace_id":      EMAG_HU_ID,
+            "marketplace_id":      marketplace_id,
             "category_id":         vals_clean["category_id"].where(vals_clean["category_id"].notna(), None),
             "characteristic_id":   vals_clean["characteristic_id"].where(vals_clean["characteristic_id"].notna(), None),
             "characteristic_name": vals_clean["characteristic_name"].where(vals_clean["characteristic_name"].notna(), None),
@@ -415,7 +425,7 @@ def import_emag_hu(
         con.execute("BEGIN")
         try:
             for table in ("categories", "characteristics", "characteristic_values"):
-                con.execute(f"DELETE FROM {table} WHERE marketplace_id=?", [EMAG_HU_ID])
+                con.execute(f"DELETE FROM {table} WHERE marketplace_id=?", [marketplace_id])
 
             con.register("_cats_bulk",   cats_bulk)
             con.register("_chars_bulk",  chars_bulk)
@@ -470,7 +480,7 @@ def import_emag_hu(
             "UPDATE import_runs SET status='completed', completed_at=? WHERE import_run_id=?",
             [datetime.now(timezone.utc), import_run_id],
         )
-        log.info("Import eMAG HU completat. run_id=%s", import_run_id)
+        log.info("Import [%s] completat. run_id=%s", marketplace_id, import_run_id)
         return import_run_id
 
     except Exception as exc:
@@ -481,10 +491,22 @@ def import_emag_hu(
             )
         except Exception:
             pass
-        log.error("Import eMAG HU eșuat: %s", exc, exc_info=True)
+        log.error("Import [%s] eșuat: %s", marketplace_id, exc, exc_info=True)
         raise
     finally:
         con.close()
+
+
+def import_emag_hu(
+    cats_df: pd.DataFrame,
+    chars_df: pd.DataFrame,
+    vals_df: pd.DataFrame,
+    source_type: str,
+    sources: dict,
+    db_path: Path = DB_PATH,
+) -> str:
+    """Wrapper backward-compatible — apelează import_marketplace cu EMAG_HU_ID."""
+    return import_marketplace(EMAG_HU_ID, cats_df, chars_df, vals_df, source_type, sources, db_path)
 
 
 # ── Read API ───────────────────────────────────────────────────────────────────
@@ -609,9 +631,9 @@ def load_marketplace_data(
     return cats, chars, vals
 
 
-def get_db_status(db_path: Path = DB_PATH) -> dict:
+def get_db_status(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> dict:
     """
-    Returnează statusul DB pentru afișare în UI.
+    Returnează statusul DB pentru un marketplace, pentru afișare în UI.
     Folosit de panoul de diagnosticare din setup.py.
     """
     if not db_path.exists():
@@ -625,18 +647,18 @@ def get_db_status(db_path: Path = DB_PATH) -> dict:
                 WHERE marketplace_id=? AND status='completed'
                 ORDER BY completed_at DESC LIMIT 1
                 """,
-                [EMAG_HU_ID],
+                [marketplace_id],
             ).fetchone()
             if not run:
                 return {"available": False, "reason": "Niciun import completat în DB."}
             cats  = con.execute(
-                "SELECT COUNT(*) FROM categories WHERE marketplace_id=?", [EMAG_HU_ID]
+                "SELECT COUNT(*) FROM categories WHERE marketplace_id=?", [marketplace_id]
             ).fetchone()[0]
             chars = con.execute(
-                "SELECT COUNT(*) FROM characteristics WHERE marketplace_id=?", [EMAG_HU_ID]
+                "SELECT COUNT(*) FROM characteristics WHERE marketplace_id=?", [marketplace_id]
             ).fetchone()[0]
             vals  = con.execute(
-                "SELECT COUNT(*) FROM characteristic_values WHERE marketplace_id=?", [EMAG_HU_ID]
+                "SELECT COUNT(*) FROM characteristic_values WHERE marketplace_id=?", [marketplace_id]
             ).fetchone()[0]
         return {
             "available":      True,

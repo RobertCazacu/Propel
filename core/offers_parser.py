@@ -6,6 +6,9 @@ Flexible: tolerates extra columns and different naming.
 import pandas as pd
 import re
 from typing import Optional
+from core.app_logger import get_logger
+
+log = get_logger("marketplace.offers_parser")
 
 
 # Column aliases for the offers file
@@ -19,6 +22,12 @@ OFFER_COL_ALIASES = {
     "image_url":   ["image url", "image_url", "url imagine", "url_imagine", "img_url",
                     "photo_url", "imagine", "imagini", "image", "poza", "foto",
                     "image src", "image_src"],
+    # Extra product metadata — used as AI context
+    "ean":         ["ean", "barcode", "cod bare", "gtin", "isbn", "upc"],
+    "brand":       ["brand", "marca", "marcă", "brand_name"],
+    "sku":         ["sku", "part_number", "part number", "cod produs", "cod_produs", "model"],
+    "weight":      ["weight", "greutate", "weight_kg", "greutate_kg"],
+    "warranty":    ["warranty", "garantie", "garanție", "garantie_luni", "warranty_months"],
 }
 
 
@@ -68,6 +77,15 @@ def extract_products(file) -> list[dict]:
 
     mapping = {field: _find_col(df, aliases) for field, aliases in OFFER_COL_ALIASES.items()}
 
+    log.info(
+        "Offers file: %d randuri, coloane detectate: %s",
+        len(df),
+        {k: v for k, v in mapping.items() if v},
+    )
+    missing_cols = [k for k, v in mapping.items() if not v]
+    if missing_cols:
+        log.warning("Coloane nedetectate in fisier: %s", missing_cols)
+
     products = []
     for _, row in df.iterrows():
         # Base fields
@@ -79,6 +97,12 @@ def extract_products(file) -> list[dict]:
             "description": row.get(mapping["description"]) if mapping["description"] else None,
             "category":    row.get(mapping["category"])    if mapping["category"]    else None,
             "image_url":   row.get(mapping["image_url"])   if mapping["image_url"]   else None,
+            # Extra metadata for AI context
+            "ean":         row.get(mapping["ean"])         if mapping["ean"]         else None,
+            "brand":       row.get(mapping["brand"])       if mapping["brand"]       else None,
+            "sku":         row.get(mapping["sku"])         if mapping["sku"]         else None,
+            "weight":      row.get(mapping["weight"])      if mapping["weight"]      else None,
+            "warranty":    row.get(mapping["warranty"])    if mapping["warranty"]    else None,
         }
 
         # Existing characteristics
@@ -92,6 +116,19 @@ def extract_products(file) -> list[dict]:
         prod["existing_chars"] = existing
         prod["_char_pairs"]    = char_pairs  # keep for export
         products.append(prod)
+
+    n_with_cat = sum(1 for p in products if p.get("category"))
+    log.info(
+        "Produse parsate: %d total, %d cu categorie, %d fara categorie",
+        len(products), n_with_cat, len(products) - n_with_cat,
+    )
+    if n_with_cat == 0:
+        log.warning(
+            "ATENTIE: Niciun produs nu are categorie in fisier. "
+            "Coloana '%s' este goala sau absenta. "
+            "Categoriile vor trebui determinate prin reguli sau AI.",
+            mapping.get("category") or "categorie (nedetectata)",
+        )
 
     return products, char_pairs
 

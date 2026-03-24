@@ -65,12 +65,15 @@ class LLMRouter:
     def provider_name(self) -> str:
         return self._provider.name
 
-    def complete(self, prompt: str, max_tokens: int = 300) -> str:
+    def complete(self, prompt: str, max_tokens: int = 300, *,
+                 system: str | None = None,
+                 temperature: float | None = None) -> str:
         """
         Trimite prompt-ul la providerul activ și returnează răspunsul text.
         Propagă excepțiile — gestionarea erorilor rămâne la apelant.
         """
-        return self._provider.complete(prompt, max_tokens)
+        return self._provider.complete(prompt, max_tokens,
+                                       system=system, temperature=temperature)
 
     def is_available(self) -> bool:
         """Verifică dacă providerul activ e configururat și accesibil."""

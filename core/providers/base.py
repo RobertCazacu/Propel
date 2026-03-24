@@ -10,9 +10,13 @@ class BaseLLMProvider(ABC):
         """Numele providerului (ex: 'anthropic', 'ollama')."""
 
     @abstractmethod
-    def complete(self, prompt: str, max_tokens: int = 300) -> str:
+    def complete(self, prompt: str, max_tokens: int = 300, *,
+                 system: str | None = None,
+                 temperature: float | None = None) -> str:
         """
         Trimite prompt-ul și returnează răspunsul text.
+        system: mesaj de sistem static (instrucțiuni, context permanent).
+        temperature: 0.0–1.0; None = folosește default-ul providerului.
         Ridică excepție dacă apelul eșuează.
         """
 

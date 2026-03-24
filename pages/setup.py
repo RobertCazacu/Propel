@@ -3,7 +3,7 @@ from pathlib import Path
 from core.state import (
     all_marketplace_names, get_marketplace, set_marketplace,
     add_custom_marketplace, PREDEFINED_MARKETPLACES,
-    get_error_codes, set_error_codes,
+    get_error_codes, set_error_codes, DUCKDB_MARKETPLACES,
 )
 
 from core.loader import MarketplaceData
@@ -35,11 +35,16 @@ def _do_save(selected: str, cat_src, char_src, val_src):
 
 def _do_save_duckdb(selected: str, cat_src, char_src, val_src, source_type: str = "upload"):
     """
-    Versiunea DuckDB a lui _do_save, folosită exclusiv pentru eMAG HU pilot.
+    Versiunea DuckDB a lui _do_save, folosită pentru marketplace-urile DuckDB.
     Parsează fișierele identic cu _do_save, dar persistă în DuckDB.
     """
     from core import reference_store_duckdb as duckdb_store
     from core.loader import load_categories, load_characteristics, load_values
+
+    mp_id = duckdb_store.DUCKDB_ID_MAP.get(selected)
+    if not mp_id:
+        st.error(f"Marketplace '{selected}' nu este configurat pentru DuckDB.")
+        return
 
     with st.spinner("Se procesează și se salvează în DuckDB..."):
         try:
@@ -54,9 +59,9 @@ def _do_save_duckdb(selected: str, cat_src, char_src, val_src, source_type: str 
                 "characteristics": getattr(char_src, "name", str(char_src)),
                 "values":          getattr(val_src,  "name", str(val_src)),
             }
-            run_id = duckdb_store.import_emag_hu(cats, chars, vals, source_type, sources)
+            run_id = duckdb_store.import_marketplace(mp_id, cats, chars, vals, source_type, sources)
 
-            cats2, chars2, vals2 = duckdb_store.load_marketplace_data(duckdb_store.EMAG_HU_ID)
+            cats2, chars2, vals2 = duckdb_store.load_marketplace_data(mp_id)
             mp_new = MarketplaceData(selected)
             mp_new.load_from_dataframes(cats2, chars2, vals2)
 
@@ -116,7 +121,7 @@ def render():
     mp = get_marketplace(selected)
 
     # ── Badge DuckDB pilot ─────────────────────────────────────────────────────
-    if selected == "eMAG HU":
+    if selected in DUCKDB_MARKETPLACES:
         st.info("🦆 **Pilot DuckDB** — datele pentru acest marketplace sunt stocate în DuckDB local (`data/reference_data.duckdb`).")
 
     if mp and mp.is_loaded():
@@ -199,7 +204,7 @@ def render():
             if cat_file and char_file and val_file:
                 if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
                              use_container_width=True, key=f"save_upload_{selected}"):
-                    if selected == "eMAG HU":
+                    if selected in DUCKDB_MARKETPLACES:
                         _do_save_duckdb(selected, cat_file, char_file, val_file, source_type="upload")
                     else:
                         _do_save(selected, cat_file, char_file, val_file)
@@ -246,7 +251,7 @@ def render():
             if all_paths_filled and paths_ok:
                 if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
                              use_container_width=True, key=f"save_local_{selected}"):
-                    if selected == "eMAG HU":
+                    if selected in DUCKDB_MARKETPLACES:
                         _do_save_duckdb(selected, cat_path.strip(), char_path.strip(),
                                         val_path.strip(), source_type="local_path")
                     else:
@@ -277,12 +282,13 @@ def render():
         with tab3:
             st.dataframe(mp.values.head(100), use_container_width=True, height=300)
 
-    # ── DuckDB status panel (doar pentru eMAG HU) ─────────────────────────────
-    if selected == "eMAG HU":
+    # ── DuckDB status panel ────────────────────────────────────────────────────
+    if selected in DUCKDB_MARKETPLACES:
         st.markdown("---")
         st.subheader("🦆 Status DuckDB")
         from core import reference_store_duckdb as _ddb
-        db_status = _ddb.get_db_status()
+        _mp_id = _ddb.DUCKDB_ID_MAP.get(selected)
+        db_status = _ddb.get_db_status(_mp_id) if _mp_id else {"available": False, "reason": "ID necunoscut"}
         if db_status["available"]:
             st.success(
                 f"✅ DuckDB activ — ultimul import: `{db_status['imported_at']}`  \n"
@@ -297,9 +303,9 @@ def render():
         if st.button("🔍 Verifică integritatea DuckDB", key="ddb_check"):
             with st.spinner("Verificare..."):
                 try:
-                    cats_r, chars_r, vals_r = _ddb.load_marketplace_data(_ddb.EMAG_HU_ID)
+                    cats_r, chars_r, vals_r = _ddb.load_marketplace_data(_mp_id)
                     from core.loader import MarketplaceData as _MD
-                    mp_test = _MD("eMAG HU")
+                    mp_test = _MD(selected)
                     mp_test.load_from_dataframes(cats_r, chars_r, vals_r)
                     if mp_test.is_loaded():
                         st.success(
