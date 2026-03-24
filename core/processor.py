@@ -40,10 +40,23 @@ def detect_marime(title: str, data: MarketplaceData, cat_id, char_name: str = "M
     size_raw = extract_size_from_title(title)
     if not size_raw:
         return None
-    # Try to match against valid values list first
+    # Try to match against valid values list first (full segment)
     found = data.find_valid(size_raw, cat_id, char_name)
     if found:
         return found
+    # Try leading numeric token only — handles "42 férfi futócipő" → "42"
+    m = re.match(r'^(\d+(?:[,.]\d+)?)', size_raw.strip())
+    if m:
+        size_num = m.group(1)
+        found = data.find_valid(size_num, cat_id, char_name)
+        if found:
+            return found
+        if not data.valid_values(cat_id, char_name):
+            try:
+                num = float(size_num.replace(",", "."))
+                return f"{num:g} EU"
+            except ValueError:
+                pass
     # Daca nu exista lista de valori permise (camp freeform), returneaza marimea formatata
     if not data.valid_values(cat_id, char_name):
         try:
@@ -96,12 +109,19 @@ def detect_pentru(title: str, desc: str, data: MarketplaceData, cat_id) -> Optio
     if any(_wb(x, text) for x in ["copii", "kids", "junior", "jr", "children", "copil"]):
         if "Copii" in vs:
             return "Copii"
-    if any(_wb(x, text) for x in ["barbati", "men", "mens", "masculin", "barbat"]):
+    if any(_wb(x, text) for x in ["barbati", "men", "mens", "masculin", "barbat", "férfi"]):
         if "Barbati" in vs:
             return "Barbati"
-    if any(_wb(x, text) for x in ["dama", "women", "femei", "feminin", "doamne", "lady"]):
+        # HU valid values
+        for v in vs:
+            if v.lower() in ("férfi", "férfiak"):
+                return v
+    if any(_wb(x, text) for x in ["dama", "women", "femei", "feminin", "doamne", "lady", "női", "nők"]):
         if "Femei" in vs:
             return "Femei"
+        for v in vs:
+            if v.lower() in ("női", "nők"):
+                return v
     return None
 
 
@@ -187,7 +207,7 @@ def detect_sport(title: str, desc: str, data: MarketplaceData, cat_id) -> Option
     sports = [
         ("Fotbal",    ["fotbal", "football", "soccer"]),
         ("Baschet",   ["baschet", "basketball", "jordan", "nba"]),
-        ("Alergare",  ["alergare", "running", "run", "jogging", "marathon"]),
+        ("Alergare",  ["alergare", "running", "run", "jogging", "marathon", "futócipő", "futás"]),
         ("Fitness",   ["fitness", "gym", "antrenament", "training", "workout", "crossfit"]),
         ("Tenis",     ["tenis", "tennis"]),
         ("Golf",      ["golf"]),
@@ -444,7 +464,7 @@ def process_product(
                     char_options = {
                         ch: vals
                         for ch, vals in data._valid_values.get(cat_id, {}).items()
-                        if ch not in combined_existing and len(vals) <= 40
+                        if not combined_existing.get(ch) and len(vals) <= 40
                     }
                     ai_fills = enrich_with_ai(
                         title=title,
