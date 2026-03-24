@@ -1,7 +1,35 @@
 import streamlit as st
 import io
+import time
 import pandas as pd
+from datetime import datetime
+from pathlib import Path
 from core.exporter import export_excel, export_model_format
+
+_EXPORTS_DIR = Path(__file__).parent.parent / "data" / "exports"
+_EXPORT_TTL_HOURS = 24
+
+
+def _auto_save_export(data: bytes, filename: str, marketplace: str = "") -> Path:
+    """Salvează fișierul de export local și șterge fișierele mai vechi de 24h."""
+    _EXPORTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Curăță fișierele expirate
+    cutoff = time.time() - _EXPORT_TTL_HOURS * 3600
+    for f in _EXPORTS_DIR.glob("*.xlsx"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except Exception:
+            pass
+
+    # Salvează fișierul nou
+    ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    mp_slug = marketplace.replace(" ", "_") if marketplace else "export"
+    save_name = f"{ts}_{mp_slug}_{filename}"
+    save_path = _EXPORTS_DIR / save_name
+    save_path.write_bytes(data)
+    return save_path
 
 
 def render():
@@ -136,6 +164,7 @@ def render():
             with st.spinner("Se generează..."):
                 try:
                     output_bytes = export_excel(io.BytesIO(file_bytes), results, char_pairs)
+                    saved_path = _auto_save_export(output_bytes, f"{base_name}_fixed.xlsx", processed_mp)
                     st.download_button(
                         f"⬇️ Descarcă {base_name}_fixed.xlsx",
                         data=output_bytes,
@@ -143,6 +172,7 @@ def render():
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+                    st.caption(f"💾 Salvat local: `{saved_path}`")
                 except Exception as e:
                     st.error(f"Eroare: {e}")
 
@@ -157,6 +187,7 @@ def render():
                         results,
                         products,
                     )
+                    saved_path = _auto_save_export(output_bytes, f"{base_name}_model.xlsx", processed_mp)
                     st.download_button(
                         f"⬇️ Descarcă {base_name}_model.xlsx",
                         data=output_bytes,
@@ -164,5 +195,6 @@ def render():
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                         use_container_width=True,
                     )
+                    st.caption(f"💾 Salvat local: `{saved_path}`")
                 except Exception as e:
                     st.error(f"Eroare: {e}")
