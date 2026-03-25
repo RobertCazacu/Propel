@@ -54,3 +54,11 @@ data/exports/
 /dict
 /sequential
 /str
+/MarketplaceData
+/Optional[int]
+/Optional[str]
+/bool},
+/first()
+/pd.DataFrame
+/set
+/tuple[bool
