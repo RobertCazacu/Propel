@@ -195,3 +195,38 @@ def add_custom_marketplace(name: str):
         names.append(name)
         st.session_state["custom_mp_names"] = names
         save_custom_marketplaces(names)
+
+
+def clear_marketplace_data(name: str):
+    """Șterge datele (categorii, caracteristici, valori) pentru un marketplace, fără a-l elimina din listă."""
+    import shutil
+    # Curăță session state
+    st.session_state.get("marketplaces", {}).pop(name, None)
+    # Șterge fișierele parquet de pe disk
+    folder = DATA_DIR / name.replace(" ", "_")
+    if folder.exists():
+        shutil.rmtree(folder)
+    # Șterge și din DuckDB dacă e cazul
+    if name in DUCKDB_MARKETPLACES:
+        try:
+            from core import reference_store_duckdb as _ddb
+            mp_id = _ddb.DUCKDB_ID_MAP.get(name)
+            if mp_id:
+                _ddb.clear_marketplace_data(mp_id)
+        except Exception as exc:
+            log.warning("Eroare la ștergerea DuckDB pentru %s: %s", name, exc)
+    log.info("Date șterse pentru marketplace '%s'", name)
+
+
+def remove_custom_marketplace(name: str) -> bool:
+    """Elimină complet un marketplace custom (date + intrare din listă). Nu funcționează pe cele predefinite."""
+    if name in PREDEFINED_MARKETPLACES:
+        return False
+    clear_marketplace_data(name)
+    names = st.session_state.get("custom_mp_names", [])
+    if name in names:
+        names.remove(name)
+        st.session_state["custom_mp_names"] = names
+        save_custom_marketplaces(names)
+    log.info("Marketplace '%s' eliminat complet", name)
+    return True

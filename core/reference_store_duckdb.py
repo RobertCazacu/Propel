@@ -57,13 +57,15 @@ _DDL_STATEMENTS = [
     """,
     """
     CREATE TABLE IF NOT EXISTS characteristics (
-        marketplace_id      VARCHAR NOT NULL,
-        characteristic_id   VARCHAR NOT NULL,
-        category_id         VARCHAR NOT NULL,
-        characteristic_name VARCHAR NOT NULL,
-        mandatory           BOOLEAN NOT NULL DEFAULT FALSE,
-        import_run_id       VARCHAR,
-        created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        marketplace_id         VARCHAR NOT NULL,
+        characteristic_id      VARCHAR NOT NULL,
+        emag_characteristic_id VARCHAR,
+        category_id            VARCHAR NOT NULL,
+        characteristic_name    VARCHAR NOT NULL,
+        mandatory              BOOLEAN NOT NULL DEFAULT FALSE,
+        restrictive            BOOLEAN NOT NULL DEFAULT TRUE,
+        import_run_id          VARCHAR,
+        created_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
     """
@@ -106,6 +108,12 @@ _DDL_STATEMENTS = [
     """,
 ]
 
+# ── Schema migrations (backward-compatible, safe to run on existing DBs) ───────
+_MIGRATIONS = [
+    "ALTER TABLE characteristics ADD COLUMN IF NOT EXISTS emag_characteristic_id VARCHAR",
+    "ALTER TABLE characteristics ADD COLUMN IF NOT EXISTS restrictive BOOLEAN DEFAULT TRUE",
+]
+
 _UPSERT_MARKETPLACE = """
     INSERT INTO marketplaces (marketplace_id, marketplace_name, storage_backend, is_active)
     VALUES (?, ?, 'duckdb', TRUE)
@@ -127,9 +135,14 @@ def init_db(db_path: Path = DB_PATH) -> None:
     with duckdb.connect(str(db_path)) as con:
         for ddl in _DDL_STATEMENTS:
             con.execute(ddl)
+        for migration in _MIGRATIONS:
+            try:
+                con.execute(migration)
+            except Exception:
+                pass  # column already exists or other benign conflict
         for mp_name, mp_id in DUCKDB_ID_MAP.items():
             con.execute(_UPSERT_MARKETPLACE, [mp_id, mp_name])
-    log.info("DuckDB inițializat: %s", db_path)
+    log.info("DuckDB initializat: %s", db_path)
 
 
 def is_available(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> bool:
@@ -157,6 +170,18 @@ def is_available(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> b
     except Exception as exc:
         log.warning("is_available check failed for %s: %s", marketplace_id, exc)
         return False
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def _norm_id(x) -> str:
+    """Normalize '2819.0' → '2819', 2819 → '2819', '2819' → '2819'."""
+    if pd.isna(x) or str(x).strip() in ("", "nan", "None"):
+        return ""
+    try:
+        return str(int(float(x)))
+    except (ValueError, TypeError):
+        return str(x).strip()
 
 
 # ── Enrich ─────────────────────────────────────────────────────────────────────
@@ -215,7 +240,12 @@ def _validate_and_create_issues(
     """
     issues: list[dict] = []
     now = datetime.now(timezone.utc).isoformat()
-    cat_ids = set(cats["id"].astype(str).dropna()) if not cats.empty else set()
+
+    cat_ids = set(cats["id"].apply(_norm_id).replace("", pd.NA).dropna()) if not cats.empty else set()
+
+    # Also accept emag_id as a valid category reference (chars may use emag_id as category_id)
+    cat_emag_ids = set(cats["emag_id"].apply(_norm_id).replace("", pd.NA).dropna()) if not cats.empty and "emag_id" in cats.columns else set()
+    cat_ids_all = cat_ids | cat_emag_ids
 
     def _issue(severity, issue_type, entity_type=None, entity_id=None, message=""):
         return {
@@ -230,9 +260,9 @@ def _validate_and_create_issues(
             "created_at":     now,
         }
 
-    # 1. Orphan characteristics
+    # 1. Orphan characteristics (accept both sequential id and emag_id)
     if not chars.empty:
-        orphan_chars = chars[~chars["category_id"].astype(str).isin(cat_ids)]
+        orphan_chars = chars[~chars["category_id"].apply(_norm_id).isin(cat_ids_all)]
         seen = set()
         for _, row in orphan_chars.iterrows():
             key = str(row.get("id", ""))
@@ -278,12 +308,12 @@ def _validate_and_create_issues(
             # Build set of (category_id, char_name) care au cel puțin o valoare
             if not vals.empty:
                 vals_pairs = set(
-                    zip(vals["category_id"].astype(str), vals["characteristic_name"].astype(str))
+                    zip(vals["category_id"].apply(_norm_id), vals["characteristic_name"].astype(str))
                 )
             else:
                 vals_pairs = set()
             mandatory_chars["_pair"] = list(zip(
-                mandatory_chars["category_id"].astype(str),
+                mandatory_chars["category_id"].apply(_norm_id),
                 mandatory_chars["name"].astype(str),
             ))
             no_vals = mandatory_chars[~mandatory_chars["_pair"].isin(vals_pairs)]
@@ -386,22 +416,59 @@ def import_marketplace(
 
         # 4. Transaction: delete old + bulk insert new
         # Pregătire DataFrames pentru bulk insert (DuckDB citește direct din pandas)
+        def _norm_id_series(s: pd.Series) -> pd.Series:
+            """Normalize float IDs: 2819.0 → '2819' (avoids spurious '.0' in VARCHAR fields)."""
+            return s.apply(
+                lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() not in ("", "nan", "None")
+                else str(x) if pd.notna(x) else None
+            )
+
         cats_bulk = pd.DataFrame({
             "marketplace_id":     marketplace_id,
-            "category_id":        cats_df["id"].astype(str),
+            "category_id":        _norm_id_series(cats_df["id"]),
             "emag_id":            cats_df["emag_id"].astype(str),
             "category_name":      cats_df["name"].astype(str),
             "parent_category_id": cats_df["parent_id"].where(cats_df["parent_id"].notna(), None),
             "import_run_id":      import_run_id,
         })
 
+        # Build emag_id → sequential id lookup for characteristics remapping.
+        # The characteristics file uses cats.emag_id as category_id (eMAG external IDs),
+        # while the rest of the system (categories table, values) uses cats.id (sequential).
+        # We remap chars category_id to the canonical sequential id so all tables are consistent.
+        _emag_to_seq: dict = {}
+        if "emag_id" in cats_df.columns:
+            for seq_id, emag_id in zip(
+                _norm_id_series(cats_df["id"]),
+                cats_df["emag_id"].apply(_norm_id),
+            ):
+                if emag_id and emag_id != seq_id:
+                    _emag_to_seq[emag_id] = seq_id
+
+        def _remap_cat_id(x) -> str:
+            norm = _norm_id(x)
+            return _emag_to_seq.get(norm, norm)
+
+        restrictive_truthy = {"1", "True", "true", "yes", "1.0"}
+        _emag_char_ids = (
+            chars_df["characteristic_id"].astype(str)
+            if "characteristic_id" in chars_df.columns
+            else pd.Series("", index=chars_df.index)
+        )
+        _restrictive = (
+            chars_df["restrictive"].astype(str).isin(restrictive_truthy)
+            if "restrictive" in chars_df.columns
+            else pd.Series(True, index=chars_df.index)
+        )
         chars_bulk = pd.DataFrame({
-            "marketplace_id":      marketplace_id,
-            "characteristic_id":   chars_df["id"].astype(str),
-            "category_id":         chars_df["category_id"].astype(str),
-            "characteristic_name": chars_df["name"].astype(str),
-            "mandatory":           chars_df["mandatory"].astype(str).isin(mandatory_truthy),
-            "import_run_id":       import_run_id,
+            "marketplace_id":         marketplace_id,
+            "characteristic_id":      chars_df["id"].astype(str),
+            "emag_characteristic_id": _emag_char_ids,
+            "category_id":            chars_df["category_id"].apply(_remap_cat_id),
+            "characteristic_name":    chars_df["name"].astype(str),
+            "mandatory":              chars_df["mandatory"].astype(str).isin(mandatory_truthy),
+            "restrictive":            _restrictive,
+            "import_run_id":          import_run_id,
         })
 
         vals_clean = vals_enriched[
@@ -410,7 +477,7 @@ def import_marketplace(
         ].copy()
         vals_bulk = pd.DataFrame({
             "marketplace_id":      marketplace_id,
-            "category_id":         vals_clean["category_id"].where(vals_clean["category_id"].notna(), None),
+            "category_id":         _norm_id_series(vals_clean["category_id"]),
             "characteristic_id":   vals_clean["characteristic_id"].where(vals_clean["characteristic_id"].notna(), None),
             "characteristic_name": vals_clean["characteristic_name"].where(vals_clean["characteristic_name"].notna(), None),
             "value":               vals_clean["value"].astype(str).str.strip(),
@@ -440,10 +507,10 @@ def import_marketplace(
             """)
             con.execute("""
                 INSERT INTO characteristics
-                  (marketplace_id, characteristic_id, category_id,
-                   characteristic_name, mandatory, import_run_id)
-                SELECT marketplace_id, characteristic_id, category_id,
-                       characteristic_name, mandatory, import_run_id
+                  (marketplace_id, characteristic_id, emag_characteristic_id,
+                   category_id, characteristic_name, mandatory, restrictive, import_run_id)
+                SELECT marketplace_id, characteristic_id, emag_characteristic_id,
+                       category_id, characteristic_name, mandatory, restrictive, import_run_id
                 FROM _chars_bulk
             """)
             con.execute("""
@@ -601,10 +668,12 @@ def load_marketplace_data(
         chars = con.execute(
             """
             SELECT
-                characteristic_id   AS id,
+                characteristic_id      AS id,
+                emag_characteristic_id AS characteristic_id,
                 category_id,
-                characteristic_name AS name,
-                mandatory
+                characteristic_name    AS name,
+                mandatory,
+                restrictive
             FROM characteristics
             WHERE marketplace_id = ?
             """,
@@ -629,6 +698,18 @@ def load_marketplace_data(
         marketplace_id, len(cats), len(chars), len(vals),
     )
     return cats, chars, vals
+
+
+def clear_marketplace_data(marketplace_id: str, db_path: Path = DB_PATH) -> None:
+    """Șterge toate datele pentru un marketplace din DuckDB (categories, characteristics, values, import_runs)."""
+    if not db_path.exists():
+        return
+    with duckdb.connect(str(db_path)) as con:
+        con.execute("DELETE FROM characteristic_values WHERE marketplace_id=?", [marketplace_id])
+        con.execute("DELETE FROM characteristics WHERE marketplace_id=?", [marketplace_id])
+        con.execute("DELETE FROM categories WHERE marketplace_id=?", [marketplace_id])
+        con.execute("DELETE FROM import_runs WHERE marketplace_id=?", [marketplace_id])
+    log.info("DuckDB: date șterse pentru marketplace_id='%s'", marketplace_id)
 
 
 def get_db_status(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> dict:

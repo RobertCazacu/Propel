@@ -4,6 +4,7 @@ from core.state import (
     all_marketplace_names, get_marketplace, set_marketplace,
     add_custom_marketplace, PREDEFINED_MARKETPLACES,
     get_error_codes, set_error_codes, DUCKDB_MARKETPLACES,
+    clear_marketplace_data, remove_custom_marketplace,
 )
 
 from core.loader import MarketplaceData
@@ -363,6 +364,55 @@ def render():
         st.warning("⚠️ Niciun provider AI configurat. Procesarea folosește doar reguli de bază.")
 
     st.info("🔧 Configurează și schimbă providerii AI din pagina **🤖 LLM Providers** din navigație.")
+    # ── Zona periculoasă ───────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("⚠️ Zona periculoasă")
+
+    col_clear, col_delete = st.columns(2)
+
+    # ── Șterge datele ─────────────────────────────────────────────────────────
+    with col_clear:
+        st.markdown("**Șterge datele încărcate**")
+        st.caption("Elimină categoriile, caracteristicile și valorile pentru acest marketplace. Marketplace-ul rămâne în listă.")
+        if st.button("🗑️ Șterge datele", key=f"btn_clear_{selected}", use_container_width=True):
+            st.session_state[f"confirm_clear_{selected}"] = True
+
+    if st.session_state.get(f"confirm_clear_{selected}"):
+        st.warning(f"Ești sigur că vrei să ștergi **toate datele** pentru **{selected}**? Acțiunea nu poate fi anulată.")
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Da, șterge datele", key=f"confirm_clear_yes_{selected}", type="primary"):
+            clear_marketplace_data(selected)
+            st.session_state.pop(f"confirm_clear_{selected}", None)
+            st.success(f"✅ Datele pentru **{selected}** au fost șterse.")
+            st.rerun()
+        if c2.button("❌ Anulează", key=f"confirm_clear_no_{selected}"):
+            st.session_state.pop(f"confirm_clear_{selected}", None)
+            st.rerun()
+
+    # ── Șterge marketplace ────────────────────────────────────────────────────
+    with col_delete:
+        if selected not in PREDEFINED_MARKETPLACES:
+            st.markdown("**Șterge marketplace-ul**")
+            st.caption("Elimină complet marketplace-ul și toate datele asociate.")
+            if st.button("🗑️ Șterge marketplace", key=f"btn_delete_{selected}", use_container_width=True):
+                st.session_state[f"confirm_delete_{selected}"] = True
+        else:
+            st.markdown("**Șterge marketplace-ul**")
+            st.caption("Marketplace-urile predefinite nu pot fi șterse.")
+            st.button("🗑️ Șterge marketplace", key=f"btn_delete_{selected}", disabled=True, use_container_width=True)
+
+    if st.session_state.get(f"confirm_delete_{selected}"):
+        st.warning(f"Ești sigur că vrei să ștergi **marketplace-ul {selected}** și toate datele asociate? Acțiunea nu poate fi anulată.")
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Da, șterge marketplace-ul", key=f"confirm_delete_yes_{selected}", type="primary"):
+            remove_custom_marketplace(selected)
+            st.session_state.pop(f"confirm_delete_{selected}", None)
+            st.success(f"✅ Marketplace-ul **{selected}** a fost șters.")
+            st.rerun()
+        if c2.button("❌ Anulează", key=f"confirm_delete_no_{selected}"):
+            st.session_state.pop(f"confirm_delete_{selected}", None)
+            st.rerun()
+
     with st.expander("🔌 Conexiune MySQL (coming soon)"):
         st.info(
             "În viitor poți conecta direct la baza de date MySQL/MariaDB "

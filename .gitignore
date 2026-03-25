@@ -35,3 +35,30 @@ desktop.ini
 
 # ── Streamlit secrets ──────────────────────────────────────────────────────────
 .streamlit/secrets.toml
+
+# ── Tool & swarm state ─────────────────────────────────────────────────────────
+.claude-flow/
+.ruflo/
+.swarm/
+.mcp.json
+
+# ── Database files ──────────────────────────────────────────────────────────────
+data/reference_data.duckdb
+*.duckdb
+
+# ── Export files (auto-saved, 24h retention) ───────────────────────────────────
+data/exports/
+
+# ── Stray debug/temp files at root ─────────────────────────────────────────────
+/0
+/dict
+/sequential
+/str
+/MarketplaceData
+/Optional[int]
+/Optional[str]
+/bool},
+/first()
+/pd.DataFrame
+/set
+/tuple[bool

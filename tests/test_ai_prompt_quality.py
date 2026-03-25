@@ -101,7 +101,8 @@ def test_enrich_with_ai_uses_temperature(monkeypatch):
     assert calls, "complete() was not called"
     assert calls[0]["temperature"] == 0.2
     assert calls[0]["system"] is not None
-    assert result.get("Culoare") == "Negru"
+    validated, _ = result
+    assert validated.get("Culoare") == "Negru"
 
 
 # ── Task 3: Reasoning field ────────────────────────────────────────────────────

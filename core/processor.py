@@ -40,10 +40,23 @@ def detect_marime(title: str, data: MarketplaceData, cat_id, char_name: str = "M
     size_raw = extract_size_from_title(title)
     if not size_raw:
         return None
-    # Try to match against valid values list first
+    # Try to match against valid values list first (full segment)
     found = data.find_valid(size_raw, cat_id, char_name)
     if found:
         return found
+    # Try leading numeric token only — handles "42 férfi futócipő" → "42"
+    m = re.match(r'^(\d+(?:[,.]\d+)?)', size_raw.strip())
+    if m:
+        size_num = m.group(1)
+        found = data.find_valid(size_num, cat_id, char_name)
+        if found:
+            return found
+        if not data.valid_values(cat_id, char_name):
+            try:
+                num = float(size_num.replace(",", "."))
+                return f"{num:g} EU"
+            except ValueError:
+                pass
     # Daca nu exista lista de valori permise (camp freeform), returneaza marimea formatata
     if not data.valid_values(cat_id, char_name):
         try:
@@ -96,12 +109,19 @@ def detect_pentru(title: str, desc: str, data: MarketplaceData, cat_id) -> Optio
     if any(_wb(x, text) for x in ["copii", "kids", "junior", "jr", "children", "copil"]):
         if "Copii" in vs:
             return "Copii"
-    if any(_wb(x, text) for x in ["barbati", "men", "mens", "masculin", "barbat"]):
+    if any(_wb(x, text) for x in ["barbati", "men", "mens", "masculin", "barbat", "férfi"]):
         if "Barbati" in vs:
             return "Barbati"
-    if any(_wb(x, text) for x in ["dama", "women", "femei", "feminin", "doamne", "lady"]):
+        # HU valid values
+        for v in vs:
+            if v.lower() in ("férfi", "férfiak"):
+                return v
+    if any(_wb(x, text) for x in ["dama", "women", "femei", "feminin", "doamne", "lady", "női", "nők"]):
         if "Femei" in vs:
             return "Femei"
+        for v in vs:
+            if v.lower() in ("női", "nők"):
+                return v
     return None
 
 
@@ -187,7 +207,7 @@ def detect_sport(title: str, desc: str, data: MarketplaceData, cat_id) -> Option
     sports = [
         ("Fotbal",    ["fotbal", "football", "soccer"]),
         ("Baschet",   ["baschet", "basketball", "jordan", "nba"]),
-        ("Alergare",  ["alergare", "running", "run", "jogging", "marathon"]),
+        ("Alergare",  ["alergare", "running", "run", "jogging", "marathon", "futócipő", "futás"]),
         ("Fitness",   ["fitness", "gym", "antrenament", "training", "workout", "crossfit"]),
         ("Tenis",     ["tenis", "tennis"]),
         ("Golf",      ["golf"]),
@@ -401,6 +421,7 @@ def process_product(
 
     desc_clean = strip_html(description)
     results = {}
+    _char_log: list[dict] = []
 
     # ── Rule-based detection ──────────────────────────────────────────────────
     for char_name, detector in ALL_DETECTORS:
@@ -414,6 +435,15 @@ def process_product(
             if val:
                 results[char_name] = val
                 log.debug("Rule detect [%s] = %r  (titlu: %s)", char_name, val, title[:60])
+                _char_log.append({
+                    "char_name":           char_name,
+                    "char_canonical":      data.canonical_char_name(cat_id, char_name) or char_name,
+                    "source":              "rule",
+                    "value_input":         val,
+                    "value_mapped":        val,
+                    "allowed_values_count": len(data.valid_values(cat_id, char_name)),
+                    "validation_pass":     True,
+                })
         except Exception as exc:
             log.warning("Exceptie in detector %r pentru %r: %s", char_name, title[:60], exc)
 
@@ -444,9 +474,9 @@ def process_product(
                     char_options = {
                         ch: vals
                         for ch, vals in data._valid_values.get(cat_id, {}).items()
-                        if ch not in combined_existing and len(vals) <= 40
+                        if not combined_existing.get(ch) and len(vals) <= 40
                     }
-                    ai_fills = enrich_with_ai(
+                    ai_fills, ai_suggested = enrich_with_ai(
                         title=title,
                         description=desc_clean,
                         category=cat_name,
@@ -456,11 +486,33 @@ def process_product(
                         mandatory_chars=mandatory_missing,
                         marketplace=marketplace,
                         product_meta=product_meta,
+                        data=data,
                     )
+                    _cat_vals = data._valid_values.get(cat_id, {})
                     for k, v in ai_fills.items():
                         if k not in results:
                             results[k] = v
                             log.debug("AI detect [%s] = %r  (titlu: %s)", k, v, title[:60])
+                        _char_log.append({
+                            "char_name":           k,
+                            "char_canonical":      data.canonical_char_name(cat_id, k) or k,
+                            "source":              "ai",
+                            "value_input":         str(v),
+                            "value_mapped":        str(v),
+                            "allowed_values_count": len(_cat_vals.get(k, set())),
+                            "validation_pass":     True,
+                        })
+                    for k, v in ai_suggested.items():
+                        if k not in ai_fills:
+                            _char_log.append({
+                                "char_name":           k,
+                                "char_canonical":      data.canonical_char_name(cat_id, k),
+                                "source":              "ai",
+                                "value_input":         str(v),
+                                "value_mapped":        None,
+                                "allowed_values_count": len(_cat_vals.get(k, set())),
+                                "validation_pass":     False,
+                            })
                     still_missing = [c for c in mandatory_missing if not results.get(c) and not combined_existing.get(c)]
                     if still_missing:
                         log.warning(
@@ -469,6 +521,39 @@ def process_product(
                         )
         except Exception as exc:
             log.error("Exceptie in AI enrichment pentru %r: %s", title[:60], exc, exc_info=True)
+
+    # ── Post-validation gate — safety net before returning ───────────────────
+    # Ensures every (char, value) pair in results is valid per characteristics/values tables.
+    # Rule detectors already return find_valid-validated values; AI uses strict mode above.
+    # This gate catches any edge-cases and canonicalises key names to characteristics display form.
+    if results:
+        try:
+            from core.char_validator import validate_new_chars_strict
+            validated_results, gate_audit = validate_new_chars_strict(
+                results, cat_id, data, source="gate"
+            )
+            gate_rejected = [e for e in gate_audit if not e["accept"]]
+            for entry in gate_rejected:
+                log.warning(
+                    "Post-gate rejection: char=%r value=%r reason=%s",
+                    entry["char_input"], entry["value_input"], entry["reason"],
+                )
+            results = validated_results
+        except Exception as exc:
+            log.warning("Post-gate exceptie (non-fatal): %s", exc)
+
+    if _char_log:
+        try:
+            from core.ai_logger import log_char_source_detail
+            log_char_source_detail(
+                offer_id=offer_id,
+                marketplace=marketplace,
+                title=title,
+                category=cat_name,
+                char_entries=_char_log,
+            )
+        except Exception:
+            pass
 
     return results
 

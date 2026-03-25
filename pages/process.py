@@ -176,6 +176,17 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
     from core.ai_logger import start_run as _ai_start_run
     _ai_start_run(marketplace)
 
+    # ── Vision run logger (optional) ──────────────────────────────────────────
+    _run_logger = None
+    if image_options and any(image_options.get(k) for k in ("enable_color", "enable_product_hint", "enable_yolo", "enable_clip")):
+        try:
+            from core.vision.vision_logger import new_run_logger
+            _run_logger = new_run_logger(marketplace)
+        except Exception:
+            pass
+    if image_options is not None:
+        image_options = {**image_options, "run_logger": _run_logger}
+
     results = []
     total = len(products)
     processable_codes = get_all_processable_codes(marketplace)
@@ -363,7 +374,13 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         result["new_chars"] = new_chars
 
         # ── Image analysis hook (optional, backward-compatible) ───────────────
-        if image_options and (image_options.get("enable_color") or image_options.get("enable_product_hint")):
+        _img_any = image_options and (
+            image_options.get("enable_color")
+            or image_options.get("enable_product_hint")
+            or image_options.get("enable_yolo")
+            or image_options.get("enable_clip")
+        )
+        if _img_any:
             # Take only the first URL (column may contain comma-separated list)
             raw_urls = str(prod.get("image_url") or "")
             image_url = raw_urls.split(",")[0].strip()
@@ -382,14 +399,64 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                     enable_product_hint=image_options.get("enable_product_hint", False),
                     vision_provider=image_options.get("vision_provider"),
                     sku=str(prod.get("id", "")),
+                    enable_yolo=image_options.get("enable_yolo", False),
+                    enable_clip=image_options.get("enable_clip", False),
+                    yolo_model=image_options.get("yolo_model", "yolov8n.pt"),
+                    clip_model=image_options.get("clip_model", "ViT-B-32"),
+                    yolo_conf=image_options.get("yolo_conf", 0.35),
+                    clip_conf=image_options.get("clip_conf", 0.25),
+                    suggestion_only=image_options.get("suggestion_only", False),
+                    save_debug=image_options.get("save_debug", False),
+                    run_logger=image_options.get("run_logger"),
                 )
                 result["image_analysis"] = img_result.to_dict()
                 img_log_result = img_result.to_dict()
-                all_filled = {**existing, **new_chars}
-                for char_name, val in img_result.suggested_attributes.items():
-                    if not all_filled.get(char_name):
-                        new_chars[char_name] = val
-                result["new_chars"] = new_chars
+                # Only auto-fill if not suggestion_only mode
+                if not image_options.get("suggestion_only", False):
+                    # Strict gate: only add image suggestions that exist in tables
+                    from core.char_validator import validate_new_chars_strict
+                    img_validated, img_audit = validate_new_chars_strict(
+                        img_result.suggested_attributes, cat_id, mp, source="image"
+                    )
+                    all_filled = {**existing, **new_chars}
+                    for char_name, val in img_validated.items():
+                        if not all_filled.get(char_name):
+                            new_chars[char_name] = val
+
+                    # Rejected image suggestions → chars_reasons + needs_manual flag
+                    img_rejected = [e for e in img_audit if not e["accept"]]
+                    if img_rejected:
+                        result.setdefault("chars_reasons", []).extend(img_rejected)
+
+                    # Structured log for all image chars (accepted + rejected)
+                    if img_audit:
+                        try:
+                            from core.ai_logger import log_char_source_detail
+                            log_char_source_detail(
+                                offer_id=str(prod.get("id", "")),
+                                marketplace=marketplace,
+                                title=title,
+                                category=final_cat,
+                                char_entries=[
+                                    {
+                                        "char_name":           e["char_input"],
+                                        "char_canonical":      e["char_canonical"],
+                                        "source":              "image",
+                                        "value_input":         e["value_input"],
+                                        "value_mapped":        e["value_mapped"],
+                                        "allowed_values_count": len(
+                                            mp._valid_values.get(cat_id, {}).get(
+                                                e["char_canonical"] or e["char_input"], set()
+                                            )
+                                        ),
+                                        "validation_pass":     e["accept"],
+                                    }
+                                    for e in img_audit
+                                ],
+                            )
+                        except Exception:
+                            pass
+                    result["new_chars"] = new_chars
             except Exception as e:
                 err_dict = {"skipped_reason": str(e), "download_success": False}
                 result["image_analysis"] = err_dict
@@ -429,6 +496,12 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         pct = int((i + 1) / total * 100)
         progress_bar.progress(pct)
         status_text.text(f"Procesare: {i+1}/{total} produse...")
+
+    if _run_logger:
+        try:
+            _run_logger.finish()
+        except Exception:
+            pass
 
     return results
 
@@ -681,15 +754,26 @@ def render():
             value=False,
             help="Analizează imaginea produsului și completează automat caracteristica de culoare dacă lipsește.",
         )
+        enable_yolo = st.checkbox(
+            "Detectare obiect YOLO",
+            value=False,
+            help="Folosește YOLO pentru a detecta și decupa obiectul principal din imagine înainte de analiză.",
+        )
     with col_img2:
         enable_product_hint = st.checkbox(
             "Folosește imaginea pentru îmbunătățirea categoriei",
             value=False,
             help="Folosește un model vision (Ollama llava-phi3) pentru a sugera tipul de produs din imagine.",
         )
+        enable_clip = st.checkbox(
+            "Validare semantică CLIP",
+            value=False,
+            help="Folosește CLIP pentru a valida semantic categoria detectată față de imaginea produsului.",
+        )
 
+    _any_image = enable_color or enable_product_hint or enable_yolo or enable_clip
     image_options = None
-    if enable_color or enable_product_hint:
+    if _any_image:
         vision_provider = None
         if enable_product_hint:
             try:
@@ -697,10 +781,70 @@ def render():
                 vision_provider = build_vision_provider("ollama")
             except Exception:
                 vision_provider = None
+
+        # Advanced options (shown only when at least one image option is active)
+        with st.expander("⚙️ Setări avansate imagine", expanded=False):
+            col_a1, col_a2 = st.columns(2)
+            with col_a1:
+                yolo_model = st.selectbox(
+                    "Model YOLO",
+                    ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"],
+                    index=0,
+                    disabled=not enable_yolo,
+                    help="Dimensiunea modelului YOLO: n=nano (rapid), s=small, m=medium.",
+                )
+                yolo_conf = st.slider(
+                    "Prag confidență YOLO",
+                    min_value=0.10, max_value=0.90, value=0.35, step=0.05,
+                    disabled=not enable_yolo,
+                    help="Detecțiile sub acest prag sunt ignorate.",
+                )
+            with col_a2:
+                clip_model = st.selectbox(
+                    "Model CLIP",
+                    ["ViT-B-32", "ViT-L-14"],
+                    index=0,
+                    disabled=not enable_clip,
+                    help="ViT-B-32 = rapid; ViT-L-14 = mai precis dar mai lent.",
+                )
+                clip_conf = st.slider(
+                    "Prag confidență CLIP",
+                    min_value=0.10, max_value=0.90, value=0.25, step=0.05,
+                    disabled=not enable_clip,
+                    help="Scorul CLIP sub acest prag nu este luat în considerare.",
+                )
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                image_strategy = st.selectbox(
+                    "Strategie imagini",
+                    ["first_only", "best_confidence", "aggregate_vote"],
+                    index=0,
+                    help="first_only=prima imagine; best_confidence=cea cu scorul YOLO mai mare; aggregate_vote=vot majoritar.",
+                )
+                suggestion_only = st.checkbox(
+                    "Doar sugestii (nu completează automat)",
+                    value=False,
+                    help="Când activ, rezultatele din imagine sunt vizibile dar nu suprascriu caracteristicile.",
+                )
+            with col_b2:
+                save_debug = st.checkbox(
+                    "Salvează crop/overlay debug",
+                    value=False,
+                    help="Salvează imaginile decupate și overlay-urile YOLO pentru inspecție manuală.",
+                )
         image_options = {
             "enable_color": enable_color,
             "enable_product_hint": enable_product_hint,
+            "enable_yolo": enable_yolo,
+            "enable_clip": enable_clip,
             "vision_provider": vision_provider,
+            "yolo_model": yolo_model if enable_yolo else "yolov8n.pt",
+            "clip_model": clip_model if enable_clip else "ViT-B-32",
+            "yolo_conf": yolo_conf if enable_yolo else 0.35,
+            "clip_conf": clip_conf if enable_clip else 0.25,
+            "image_strategy": image_strategy,
+            "suggestion_only": suggestion_only,
+            "save_debug": save_debug,
         }
 
     if st.button(f"🚀 Pornește procesarea pentru {selected_mp}", type="primary", use_container_width=True):
