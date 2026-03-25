@@ -464,12 +464,12 @@ def enrich_with_ai(
     Daca mandatory_chars e specificat, trimite AI doar caracteristicile obligatorii lipsa.
     """
     # Filtreaza doar cele lipsa
-    missing_options = {k: v for k, v in char_options.items() if k not in existing}
+    missing_options = {k: v for k, v in char_options.items() if not existing.get(k)}
 
     # Adauga caracteristicile obligatorii fara lista de valori (campuri freeform)
     if mandatory_chars:
         for ch in mandatory_chars:
-            if ch not in existing and ch not in missing_options:
+            if not existing.get(ch) and ch not in missing_options:
                 # Camp freeform — AI poate pune orice valoare
                 missing_options[ch] = set()
 

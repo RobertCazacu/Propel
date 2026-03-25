@@ -30,6 +30,10 @@ def _read_tabular(file_or_path: Union[str, Path, object]) -> pd.DataFrame:
 
     CSV detection is based on file extension (.csv, .tsv).
     TSV files are read with tab separator.
+
+    For Excel files with multiple sheets: automatically concatenates all sheets
+    that share the same column schema as the first data sheet (skips SQL/query
+    sheets where the first column header looks like a SQL statement).
     """
     if isinstance(file_or_path, (str, Path)):
         p = Path(file_or_path)
@@ -40,7 +44,7 @@ def _read_tabular(file_or_path: Union[str, Path, object]) -> pd.DataFrame:
             return pd.read_csv(p, dtype=str, encoding_errors="replace")
         if ext == ".tsv":
             return pd.read_csv(p, sep="\t", dtype=str, encoding_errors="replace")
-        return pd.read_excel(p, sheet_name=0)
+        return _read_excel_all_sheets(p)
     else:
         # Streamlit UploadedFile or any file-like object
         name = getattr(file_or_path, "name", "") or ""
@@ -49,7 +53,50 @@ def _read_tabular(file_or_path: Union[str, Path, object]) -> pd.DataFrame:
             return pd.read_csv(file_or_path, dtype=str, encoding_errors="replace")
         if ext == ".tsv":
             return pd.read_csv(file_or_path, sep="\t", dtype=str, encoding_errors="replace")
-        return pd.read_excel(file_or_path, sheet_name=0)
+        return _read_excel_all_sheets(file_or_path)
+
+
+def _read_excel_all_sheets(source) -> pd.DataFrame:
+    """
+    Read an Excel file and concatenate all sheets that share the same column
+    schema as the first data sheet.  Skips sheets whose first column header
+    contains SQL keywords (export artefacts like 'SELECT …').
+    """
+    xl = pd.ExcelFile(source)
+    if len(xl.sheet_names) == 1:
+        return xl.parse(xl.sheet_names[0])
+
+    dfs: list[pd.DataFrame] = []
+    ref_cols: Optional[list] = None
+
+    for sheet in xl.sheet_names:
+        try:
+            df = xl.parse(sheet)
+        except Exception:
+            continue
+        if df.empty:
+            continue
+        # Skip SQL/query sheets (first column header looks like a SQL statement)
+        first_col = str(df.columns[0]).strip().upper()
+        if first_col.startswith("SELECT") or first_col.startswith("--") or first_col.startswith("/*"):
+            continue
+        cols = list(df.columns)
+        if ref_cols is None:
+            ref_cols = cols
+            dfs.append(df)
+        elif cols == ref_cols:
+            dfs.append(df)
+        else:
+            log.warning("Sheet '%s' sărit: schema diferită de primul sheet (coloane: %s)", sheet, cols)
+
+    if not dfs:
+        return xl.parse(xl.sheet_names[0])
+    if len(dfs) == 1:
+        return dfs[0]
+
+    result = pd.concat(dfs, ignore_index=True)
+    log.info("Excel multi-sheet concat: %d sheets → %d rânduri total", len(dfs), len(result))
+    return result
 
 
 # ── Column aliases ─────────────────────────────────────────────────────────────

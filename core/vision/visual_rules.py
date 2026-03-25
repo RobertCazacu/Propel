@@ -47,6 +47,42 @@ DEFAULT_RULES: dict = {
 
         # Minimum confidence for product_type_hint to be reported
         "min_product_confidence": 0.65,
+
+        # ── YOLO settings ────────────────────────────────────────────────────
+        # Minimum YOLO detection confidence to accept a detection
+        "min_yolo_confidence": 0.35,
+
+        # ── CLIP settings ────────────────────────────────────────────────────
+        # Minimum CLIP score to trust a label as valid
+        "min_clip_confidence": 0.25,
+
+        # ── Fusion settings ──────────────────────────────────────────────────
+        # Prefer text over image when both are available
+        "prefer_text_over_image": True,
+
+        # How to resolve text vs image conflict:
+        # "review"       → mark needs_review, pick higher confidence (default)
+        # "prefer_text"  → always use text
+        # "prefer_image" → always use image
+        "conflict_policy": "review",
+
+        # Text confidence below this threshold: run image analysis for category
+        "min_text_conf_for_image": 0.70,
+
+        # ── Image strategy ───────────────────────────────────────────────────
+        # "first_only"       → analyze only the first image URL
+        # "best_confidence"  → analyze up to max_images_per_product, keep highest YOLO conf
+        # "aggregate_vote"   → analyze multiple, majority-vote on attributes
+        "image_strategy": "first_only",
+
+        # Maximum number of images to analyze per product
+        "max_images_per_product": 1,
+
+        # If True: image suggestions are only advisory — never auto-fill
+        "suggestion_only": False,
+
+        # If True: automatically enable color detection when mandatory color char is missing
+        "auto_enable_color_if_mandatory": True,
     },
     "categories": {
         # Per-category overrides — example (uncomment to activate):
