@@ -4,6 +4,7 @@ Handles Categories, Characteristics and Values Excel/CSV files
 with flexible column detection (tolerant of extra/missing columns).
 Accepts both Streamlit file-like objects and local file paths (str/Path).
 """
+import re
 import unicodedata
 import difflib
 import pandas as pd
@@ -20,6 +21,17 @@ def _normalize_str(s: str) -> str:
     """Strip diacritics and lowercase for fuzzy matching (ș→s, ő→o, etc.)."""
     nfkd = unicodedata.normalize("NFKD", str(s))
     return "".join(c for c in nfkd if not unicodedata.combining(c)).lower().strip()
+
+
+def _normalize_char_name(s: str) -> str:
+    """Canonical lookup key for characteristic names.
+
+    Maps 'Culoare:' and 'Culoare' and '  culoare  ' all to the same key 'culoare'.
+    Used only for matching; output always uses the display name from the
+    characteristics table.
+    """
+    s = re.sub(r'\s+', ' ', str(s).strip())
+    return s.rstrip(':').strip().casefold()
 
 
 def _read_tabular(file_or_path: Union[str, Path, object]) -> pd.DataFrame:
@@ -109,10 +121,12 @@ CAT_COL_ALIASES = {
 }
 
 CHAR_COL_ALIASES = {
-    "id":             ["id", "char_id", "characteristic_id", "id_caracteristica"],
-    "category_id":    ["category_id", "cat_id", "id_categorie"],
-    "name":           ["name", "name_ro", "nume", "characteristic_name", "denumire"],
-    "mandatory":      ["mandatory", "obligatoriu", "required", "is_mandatory"],
+    "id":                ["id", "char_id", "id_caracteristica"],
+    "characteristic_id": ["characteristic_id", "emag_characteristic_id", "char_emag_id"],
+    "category_id":       ["category_id", "cat_id", "id_categorie"],
+    "name":              ["name", "name_ro", "nume", "characteristic_name", "denumire"],
+    "mandatory":         ["mandatory", "obligatoriu", "required", "is_mandatory"],
+    "restrictive":       ["restrictive", "is_restrictive", "restrictiv"],
 }
 
 VAL_COL_ALIASES = {
@@ -154,10 +168,12 @@ def load_characteristics(file) -> pd.DataFrame:
     df = _read_tabular(file)
     mapping = _map_cols(df, CHAR_COL_ALIASES)
     result = pd.DataFrame()
-    result["id"]          = df[mapping["id"]]          if mapping["id"]          else range(len(df))
-    result["category_id"] = df[mapping["category_id"]] if mapping["category_id"] else None
-    result["name"]        = df[mapping["name"]]        if mapping["name"]        else None
-    result["mandatory"]   = df[mapping["mandatory"]]   if mapping["mandatory"]   else 0
+    result["id"]                = df[mapping["id"]]                if mapping["id"]                else range(len(df))
+    result["characteristic_id"] = df[mapping["characteristic_id"]] if mapping["characteristic_id"] else result["id"]
+    result["category_id"]       = df[mapping["category_id"]]       if mapping["category_id"]       else None
+    result["name"]              = df[mapping["name"]]              if mapping["name"]              else None
+    result["mandatory"]         = df[mapping["mandatory"]]         if mapping["mandatory"]         else 0
+    result["restrictive"]       = df[mapping["restrictive"]]       if mapping["restrictive"]       else 1
     return result.dropna(subset=["category_id", "name"])
 
 
@@ -221,9 +237,16 @@ class MarketplaceData:
         self._cat_name_normalized: dict = {}      # "tricouri copii" -> 3216 (diacritics-free)
         self._cat_id_to_name: dict = {}           # 3216 -> "Tricouri copii"
         self._mandatory: dict = {}                # cat_id -> [char_name, ...]
-        self._valid_values: dict = {}             # cat_id -> {char_name -> set(values)}
-        self._valid_values_normalized: dict = {}  # cat_id -> {char_name -> {norm_val -> orig_val}}
-        self._cat_chars: dict = {}                # cat_id -> set(all char names for that category)
+        self._valid_values: dict = {}             # cat_id -> {display_name -> set(values)}
+        self._valid_values_normalized: dict = {}  # cat_id -> {display_name -> {norm_val -> orig_val}}
+        self._cat_chars: dict = {}                # cat_id -> set(all char display names)
+        self._char_name_map: dict = {}            # cat_id -> {norm_key -> display_name from characteristics}
+        self._marketplace_values: dict = {}       # norm_char_name -> set(values) across all cats
+        self._valid_values_by_char_id: dict = {}  # emag_char_id -> set(values)
+        self._char_name_to_emag_id: dict = {}     # cat_id -> {norm_name -> emag_char_id}
+        self._char_emag_id_to_display: dict = {}  # emag_char_id -> display_name
+        self._char_restrictive: set = set()       # set of emag_char_ids that are restrictive
+        self._char_restrictive_by_name: dict = {} # cat_id -> {norm_name -> bool}
 
     # ── Loaders ────────────────────────────────────────────────────────────────
     def load_from_files(self, cat_file, char_file, val_file):
@@ -280,14 +303,67 @@ class MarketplaceData:
         for cat_id, grp in chars[valid_name_mask].groupby("category_id"):
             self._cat_chars[cat_id] = set(grp["name"])
 
-        # valid values (vectorized)
+        # char name canonical map — built from characteristics display names
+        # key: _normalize_char_name(display_name)  →  display_name (the authoritative form)
+        # Allows tolerant lookup: "Culoare:" and "Culoare" both resolve to the same entry.
+        self._char_name_map = {}
+        for cat_id, grp in chars[valid_name_mask].groupby("category_id"):
+            self._char_name_map[cat_id] = {
+                _normalize_char_name(name): name
+                for name in grp["name"]
+            }
+
+        # characteristic_id (eMAG external ID) indexes + restrictive flag
+        self._valid_values_by_char_id = {}
+        self._char_name_to_emag_id = {}
+        self._char_emag_id_to_display = {}
+        self._char_restrictive = set()
+        self._char_restrictive_by_name = {}
+
+        _restr_vals = {"1", "True", "true", "yes", "1.0"}
+        if "characteristic_id" in chars.columns:
+            char_id_data = chars[valid_name_mask & chars["characteristic_id"].notna()].copy()
+            char_id_data = char_id_data[
+                char_id_data["characteristic_id"].astype(str).str.strip().isin(["", "nan"]) == False
+            ]
+            for _, row in char_id_data.iterrows():
+                emag_id = row["characteristic_id"]
+                cat_id_row = row["category_id"]
+                name = row["name"]
+                norm_name = _normalize_char_name(name)
+                self._char_name_to_emag_id.setdefault(cat_id_row, {})[norm_name] = emag_id
+                self._char_emag_id_to_display[emag_id] = name
+                if str(row.get("restrictive", "1")).strip() in _restr_vals:
+                    self._char_restrictive.add(emag_id)
+
+        if "restrictive" in chars.columns:
+            for cat_id_row, grp in chars[valid_name_mask].groupby("category_id"):
+                self._char_restrictive_by_name[cat_id_row] = {
+                    _normalize_char_name(name): str(restr).strip() in _restr_vals
+                    for name, restr in zip(grp["name"], grp["restrictive"])
+                }
+
+        # valid values — keyed by canonical display name from characteristics (via _char_name_map)
         vals = self.values.copy()
         vals = vals[vals["characteristic_name"].notna() & vals["value"].notna()]
         vals["characteristic_name"] = vals["characteristic_name"].astype(str).str.strip()
         vals["value"] = vals["value"].astype(str).str.strip()
         vals = vals[vals["value"] != "nan"]
         for (cat_id, char_name), grp in vals.groupby(["category_id", "characteristic_name"]):
-            self._valid_values.setdefault(cat_id, {})[char_name] = set(grp["value"])
+            # Resolve to canonical display name (from characteristics) if possible
+            canonical = self._char_name_map.get(cat_id, {}).get(
+                _normalize_char_name(char_name), char_name
+            )
+            self._valid_values.setdefault(cat_id, {})[canonical] = set(grp["value"])
+
+        # valid values by eMAG characteristic_id (stable across label renames)
+        if "characteristic_id" in vals.columns:
+            cid_vals = vals[vals["characteristic_id"].notna()].copy()
+            cid_vals = cid_vals[
+                cid_vals["characteristic_id"].astype(str).str.strip().isin(["", "nan"]) == False
+            ]
+            for char_id, grp in cid_vals.groupby("characteristic_id"):
+                self._valid_values_by_char_id[char_id] = set(grp["value"])
 
         # normalized valid values (diacritics-insensitive) — built from _valid_values
         self._valid_values_normalized = {}
@@ -300,6 +376,15 @@ class MarketplaceData:
                     if nv not in norm_map:
                         norm_map[nv] = v
                 self._valid_values_normalized[cat_id][char_name] = norm_map
+
+        # marketplace-wide fallback values — aggregated across all categories
+        # Used when a char has values in other categories but not the current one.
+        self._marketplace_values = {}
+        for char_dict in self._valid_values.values():
+            for char_name, val_set in char_dict.items():
+                self._marketplace_values.setdefault(
+                    _normalize_char_name(char_name), set()
+                ).update(val_set)
 
     # ── Lookup helpers ─────────────────────────────────────────────────────────
     def category_id(self, name: str) -> Optional[int]:
@@ -321,15 +406,75 @@ class MarketplaceData:
     def mandatory_chars(self, cat_id) -> list:
         return self._mandatory.get(cat_id, [])
 
+    def canonical_char_name(self, cat_id, char_name: str) -> Optional[str]:
+        """Return the display name from the characteristics table for this category.
+
+        Returns None if char_name cannot be resolved to any known characteristic.
+        Tolerant of trailing ':', whitespace, and case differences.
+        """
+        # Fast path: already the canonical form
+        if char_name in self._cat_chars.get(cat_id, set()):
+            return char_name
+        # Normalised lookup
+        return self._char_name_map.get(cat_id, {}).get(_normalize_char_name(char_name))
+
+    def _get_char_emag_id(self, cat_id, char_name: str):
+        """Return the eMAG characteristic_id for this char in the given category, or None."""
+        norm = _normalize_char_name(char_name)
+        return self._char_name_to_emag_id.get(cat_id, {}).get(norm)
+
+    def is_restrictive(self, cat_id, char_name: str) -> bool:
+        """Return True if this char only accepts values from the table (restrictive=1).
+
+        Defaults to True when the flag is unknown (safe default — avoid invalid values).
+        """
+        emag_id = self._get_char_emag_id(cat_id, char_name)
+        if emag_id is not None:
+            return emag_id in self._char_restrictive
+        # Fallback: name-based lookup
+        norm = _normalize_char_name(char_name)
+        cat_restr = self._char_restrictive_by_name.get(cat_id, {})
+        if norm in cat_restr:
+            return cat_restr[norm]
+        return True  # safe default
+
     def valid_values(self, cat_id, char_name: str) -> set:
-        return self._valid_values.get(cat_id, {}).get(char_name, set())
+        cat_dict = self._valid_values.get(cat_id, {})
+        result = cat_dict.get(char_name)
+        if result is not None:
+            return result
+        # Normalised fallback: "Culoare" finds values stored under "Culoare:"
+        canonical = self.canonical_char_name(cat_id, char_name)
+        if canonical and canonical != char_name:
+            return cat_dict.get(canonical, set())
+        return set()
+
+    def _find_in_set(self, value: str, val_set: set) -> Optional[str]:
+        """Normalised lookup in an arbitrary value set (for marketplace fallback)."""
+        s = str(value).strip()
+        if s in val_set:
+            return s
+        norm_s = _normalize_str(s)
+        for v in val_set:
+            if _normalize_str(v) == norm_s:
+                return v
+        return None
+
+    def marketplace_fallback_values(self, char_name: str) -> set:
+        """Values aggregated across all categories for this char name.
+
+        Used as a last-resort fallback when the category-specific values list is empty.
+        """
+        return self._marketplace_values.get(_normalize_char_name(char_name), set())
 
     def all_char_names(self, cat_id) -> list:
         return list(self._valid_values.get(cat_id, {}).keys())
 
     def has_char(self, cat_id, char_name: str) -> bool:
         """Returns True if char_name is a known characteristic for this category in this marketplace."""
-        return char_name in self._cat_chars.get(cat_id, set())
+        if char_name in self._cat_chars.get(cat_id, set()):
+            return True
+        return self.canonical_char_name(cat_id, char_name) is not None
 
     def find_valid(self, value: str, cat_id, char_name: str) -> Optional[str]:
         """Try to match value to a valid option (with common transformations)."""
@@ -358,9 +503,16 @@ class MarketplaceData:
             pass
         # Normalized fallback — diacritics-insensitive (e.g. "Negru" matches "Negru" in BG/HU)
         norm_s = _normalize_str(s)
-        norm_map = self._valid_values_normalized.get(cat_id, {}).get(char_name, {})
+        # Use canonical name so the normalized map key matches
+        canonical = self.canonical_char_name(cat_id, char_name) or char_name
+        norm_map = self._valid_values_normalized.get(cat_id, {}).get(canonical, {})
         if norm_s in norm_map:
             return norm_map[norm_s]
+        # Fuzzy fallback — difflib closest match (handles minor typos from AI output)
+        if norm_map:
+            matches = difflib.get_close_matches(norm_s, norm_map.keys(), n=1, cutoff=0.80)
+            if matches:
+                return norm_map[matches[0]]
         return None
 
     def category_list(self) -> list:

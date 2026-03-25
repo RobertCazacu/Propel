@@ -413,10 +413,49 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                 img_log_result = img_result.to_dict()
                 # Only auto-fill if not suggestion_only mode
                 if not image_options.get("suggestion_only", False):
+                    # Strict gate: only add image suggestions that exist in tables
+                    from core.char_validator import validate_new_chars_strict
+                    img_validated, img_audit = validate_new_chars_strict(
+                        img_result.suggested_attributes, cat_id, mp, source="image"
+                    )
                     all_filled = {**existing, **new_chars}
-                    for char_name, val in img_result.suggested_attributes.items():
+                    for char_name, val in img_validated.items():
                         if not all_filled.get(char_name):
                             new_chars[char_name] = val
+
+                    # Rejected image suggestions → chars_reasons + needs_manual flag
+                    img_rejected = [e for e in img_audit if not e["accept"]]
+                    if img_rejected:
+                        result.setdefault("chars_reasons", []).extend(img_rejected)
+
+                    # Structured log for all image chars (accepted + rejected)
+                    if img_audit:
+                        try:
+                            from core.ai_logger import log_char_source_detail
+                            log_char_source_detail(
+                                offer_id=str(prod.get("id", "")),
+                                marketplace=marketplace,
+                                title=title,
+                                category=final_cat,
+                                char_entries=[
+                                    {
+                                        "char_name":           e["char_input"],
+                                        "char_canonical":      e["char_canonical"],
+                                        "source":              "image",
+                                        "value_input":         e["value_input"],
+                                        "value_mapped":        e["value_mapped"],
+                                        "allowed_values_count": len(
+                                            mp._valid_values.get(cat_id, {}).get(
+                                                e["char_canonical"] or e["char_input"], set()
+                                            )
+                                        ),
+                                        "validation_pass":     e["accept"],
+                                    }
+                                    for e in img_audit
+                                ],
+                            )
+                        except Exception:
+                            pass
                     result["new_chars"] = new_chars
             except Exception as e:
                 err_dict = {"skipped_reason": str(e), "download_success": False}

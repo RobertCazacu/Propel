@@ -457,11 +457,16 @@ def enrich_with_ai(
     mandatory_chars: list = None,
     marketplace: str = "",
     product_meta: dict = None,
-) -> dict:
+    data=None,           # Optional[MarketplaceData] — enables strict value validation
+) -> tuple[dict, dict]:
     """
     Completeaza caracteristicile cu AI.
     Optimizare: verifica cache-ul mai intai, apeleaza API doar daca e necesar.
     Daca mandatory_chars e specificat, trimite AI doar caracteristicile obligatorii lipsa.
+
+    Returns:
+        (validated, suggested_remapped) — validated = chars that passed validation;
+        suggested_remapped = all AI suggestions (original keys, _reasoning excluded).
     """
     # Filtreaza doar cele lipsa
     missing_options = {k: v for k, v in char_options.items() if not existing.get(k)}
@@ -474,14 +479,14 @@ def enrich_with_ai(
                 missing_options[ch] = set()
 
     if not missing_options:
-        return {}
+        return {}, {}
 
     # Daca avem lista de mandatory, prioritizeaza-le
     if mandatory_chars:
         mandatory_missing = {k: v for k, v in missing_options.items() if k in mandatory_chars}
         # Daca nu lipseste niciun mandatory, skip AI
         if not mandatory_missing:
-            return {}
+            return {}, {}
         # Trimite doar mandatory lipsa (plus cateva optionale ca context)
         optional_extra = {k: v for k, v in missing_options.items()
                          if k not in mandatory_chars and len(mandatory_missing) < 8}
@@ -495,7 +500,7 @@ def enrich_with_ai(
     done_set = set(cache.get("done_map", {}).get(dk, []))
     if mandatory_chars and done_set and set(mandatory_chars) <= done_set:
         log.debug("Skip AI (done_map hit) pentru %r", title[:60])
-        return {}
+        return {}, {}
 
     h = _char_key(title, category, marketplace, tuple(missing_options.keys()))
     if h in cache["char_map"]:
@@ -507,7 +512,7 @@ def enrich_with_ai(
                 if not vs or str(v).strip() in vs:
                     validated_cached[k] = v
         if validated_cached:
-            return validated_cached
+            return validated_cached, {}
 
     # Strip trailing ":" din char names inainte de trimitere la AI (EasySales pattern).
     # AI-ul va raspunde cu chei fara ":" — le remapam inapoi dupa parsare.
@@ -548,23 +553,78 @@ def enrich_with_ai(
         log.debug("AI char raw response: %s", raw[:300])
         suggested = _parse_json(raw)
 
+        # Resolve category id once for strict path
+        _ai_cat_id = data.category_id(category) if data is not None else None
+
         for ch_display, ch_val in suggested.items():
             # Remapeaza cheia inapoi la numele original (cu ":" daca era)
             ch_name = stripped_to_orig.get(ch_display, ch_display)
-            valid_set = valid_values_for_cat.get(ch_name, set())
             val_str = str(ch_val).strip()
-            if not valid_set:
-                if val_str:
-                    validated[ch_name] = ch_val
-                    log.debug("AI char freeform acceptat [%s] = %r", ch_name, ch_val)
-            elif val_str in valid_set:
-                validated[ch_name] = ch_val
-                log.debug("AI char acceptat [%s] = %r", ch_name, ch_val)
+            if not val_str:
+                continue
+
+            if data is not None and _ai_cat_id is not None:
+                # ── Strict path: use data.find_valid (handles canonicalization,
+                #    numeric EU formats, diacritics normalization, fuzzy) ─────
+                mapped = data.find_valid(val_str, _ai_cat_id, ch_name)
+                if mapped is not None:
+                    validated[ch_name] = mapped
+                    log.debug("AI char acceptat [%s] = %r → %r", ch_name, ch_val, mapped)
+                else:
+                    vs = data.valid_values(_ai_cat_id, ch_name)
+                    restrictive = data.is_restrictive(_ai_cat_id, ch_name)
+                    if not vs:
+                        # Try marketplace-level fallback (same char in other categories)
+                        fb = data.marketplace_fallback_values(ch_name)
+                        if fb:
+                            fb_mapped = data._find_in_set(val_str, fb)
+                            if fb_mapped is not None:
+                                validated[ch_name] = fb_mapped
+                                log.debug("AI char fallback-acceptat [%s] = %r → %r",
+                                          ch_name, ch_val, fb_mapped)
+                            elif not restrictive:
+                                # Non-restrictive: accept AI value as freeform
+                                validated[ch_name] = val_str
+                                log.debug("AI char freeform-acceptat [%s] = %r", ch_name, ch_val)
+                            else:
+                                log.warning(
+                                    "AI char respins [%s] = %r — fara match in fallback (%d vals)",
+                                    ch_name, ch_val, len(fb),
+                                )
+                        elif not restrictive:
+                            # Non-restrictive and no values defined: accept as freeform
+                            validated[ch_name] = val_str
+                            log.debug("AI char freeform-acceptat [%s] = %r (no values defined)", ch_name, ch_val)
+                        else:
+                            log.warning(
+                                "AI char respins [%s] = %r — nicio valoare definita, niciun fallback",
+                                ch_name, ch_val,
+                            )
+                    elif not restrictive:
+                        # Non-restrictive: accept AI value even if not in the table
+                        validated[ch_name] = val_str
+                        log.debug("AI char freeform-acceptat [%s] = %r (non-restrictive)", ch_name, ch_val)
+                    else:
+                        log.warning(
+                            "AI char respins [%s] = %r — nu e in lista de valori permise (%d valori)",
+                            ch_name, ch_val, len(vs),
+                        )
             else:
-                log.warning(
-                    "AI char respins [%s] = %r — nu e in lista de valori permise (%d valori)",
-                    ch_name, ch_val, len(valid_set),
-                )
+                # ── Legacy path (no data object): direct set lookup ──────────
+                valid_set = valid_values_for_cat.get(ch_name, set())
+                if not valid_set:
+                    log.warning(
+                        "AI char respins freeform [%s] = %r — fara valori permise (no data object)",
+                        ch_name, ch_val,
+                    )
+                elif val_str in valid_set:
+                    validated[ch_name] = ch_val
+                    log.debug("AI char acceptat [%s] = %r", ch_name, ch_val)
+                else:
+                    log.warning(
+                        "AI char respins [%s] = %r — nu e in lista de valori permise (%d valori)",
+                        ch_name, ch_val, len(valid_set),
+                    )
 
         if validated:
             log.info("AI char enrichment OK pentru %r — validate: %s", title[:60], list(validated.keys()))
@@ -607,7 +667,13 @@ def enrich_with_ai(
     except Exception:
         pass
 
-    return validated
+    # Build remapped suggested dict (original keys, _reasoning excluded) for caller
+    suggested_remapped = {
+        stripped_to_orig.get(k, k): v
+        for k, v in suggested.items()
+        if k != "_reasoning"
+    }
+    return validated, suggested_remapped
 
 
 def test_connection() -> tuple[bool, str]:

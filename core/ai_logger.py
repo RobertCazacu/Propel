@@ -243,6 +243,45 @@ def log_image_analysis(
         pass
 
 
+def log_char_source_detail(
+    *,
+    offer_id: str,
+    marketplace: str,
+    title: str,
+    category: str,
+    char_entries: list[dict],
+):
+    """Log per-characteristic source + validation detail.
+
+    Each entry in char_entries must contain:
+      char_name, source (rule|ai|image), value,
+      allowed_values_count (int), validation_pass (bool)
+    """
+    if not char_entries:
+        return
+    entry = {
+        "timestamp":   datetime.now().isoformat(timespec="milliseconds"),
+        "type":        "char_source_detail",
+        "marketplace": marketplace,
+        "offer_id":    offer_id,
+        "title":       str(title)[:200],
+        "category":    category,
+        "chars":       char_entries,
+        "stats": {
+            "total":           len(char_entries),
+            "rule":            sum(1 for e in char_entries if e.get("source") == "rule"),
+            "ai":              sum(1 for e in char_entries if e.get("source") == "ai"),
+            "image":           sum(1 for e in char_entries if e.get("source") == "image"),
+            "validation_pass": sum(1 for e in char_entries if e.get("validation_pass")),
+            "validation_fail": sum(1 for e in char_entries if not e.get("validation_pass")),
+        },
+    }
+    try:
+        _append_entry(entry)
+    except Exception:
+        pass
+
+
 # ── Read helpers (for diagnostic page) ────────────────────────────────────────
 
 def list_ai_log_files() -> list[Path]:
