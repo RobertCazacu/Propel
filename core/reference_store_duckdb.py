@@ -6,6 +6,7 @@ Gestionează schema, importul, validarea și citirea datelor de referință
 
 Marketplace-uri active: eMAG HU, Allegro.
 """
+import re
 import uuid
 from pathlib import Path
 from datetime import datetime, timezone
@@ -140,7 +141,9 @@ def init_db(db_path: Path = DB_PATH) -> None:
                 con.execute(migration)
             except Exception:
                 pass  # column already exists or other benign conflict
-        for mp_name, mp_id in DUCKDB_ID_MAP.items():
+        # Register known pilot marketplaces (backward compat).
+        # New marketplaces are registered on-demand via ensure_marketplace().
+        for mp_id, mp_name in [(EMAG_HU_ID, EMAG_HU_NAME), (ALLEGRO_ID, ALLEGRO_NAME)]:
             con.execute(_UPSERT_MARKETPLACE, [mp_id, mp_name])
     log.info("DuckDB initializat: %s", db_path)
 
@@ -182,6 +185,29 @@ def _norm_id(x) -> str:
         return str(int(float(x)))
     except (ValueError, TypeError):
         return str(x).strip()
+
+
+def marketplace_id_slug(name: str) -> str:
+    """Generate a deterministic, safe VARCHAR marketplace_id from a display name.
+
+    'eMAG HU'      → 'emag_hu'   (matches EMAG_HU_ID — no data migration needed)
+    'Allegro'      → 'allegro'   (matches ALLEGRO_ID)
+    'eMAG Romania' → 'emag_romania'
+    'My Custom MP' → 'my_custom_mp'
+    """
+    slug = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")
+    return slug or "marketplace"
+
+
+def ensure_marketplace(db_path: Path, marketplace_id: str, marketplace_name: str) -> str:
+    """Upsert marketplace metadata into the DB.  Returns marketplace_id.
+
+    Safe to call multiple times (idempotent).
+    Requires the DB to be initialised first (call init_db once).
+    """
+    with duckdb.connect(str(db_path)) as con:
+        con.execute(_UPSERT_MARKETPLACE, [marketplace_id, marketplace_name])
+    return marketplace_id
 
 
 # ── Enrich ─────────────────────────────────────────────────────────────────────

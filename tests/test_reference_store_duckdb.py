@@ -310,3 +310,43 @@ def test_load_marketplace_data_integration_with_marketplace_data(tmp_db, sample_
     stats = mp.stats()
     assert stats["categories"] == 2
     assert stats["values"] == 3
+
+
+# ── Task 2: marketplace_id_slug ───────────────────────────────────────────────
+
+def test_slug_known_marketplaces():
+    from core.reference_store_duckdb import marketplace_id_slug
+    assert marketplace_id_slug("eMAG HU")      == "emag_hu"
+    assert marketplace_id_slug("Allegro")       == "allegro"
+    assert marketplace_id_slug("eMAG Romania")  == "emag_romania"
+    assert marketplace_id_slug("Trendyol")      == "trendyol"
+    assert marketplace_id_slug("FashionDays")   == "fashiondays"
+
+
+def test_slug_custom_marketplaces():
+    from core.reference_store_duckdb import marketplace_id_slug
+    assert marketplace_id_slug("My Custom MP") == "my_custom_mp"
+    assert marketplace_id_slug("cat-001 Store") == "cat_001_store"
+    assert marketplace_id_slug("  Spaces  ")   == "spaces"
+
+
+def test_ensure_marketplace_registers_new(tmp_db):
+    import duckdb
+    from core.reference_store_duckdb import init_db, ensure_marketplace
+    init_db(tmp_db)
+    mp_id = ensure_marketplace(tmp_db, "my_custom_mp", "My Custom MP")
+    assert mp_id == "my_custom_mp"
+    with duckdb.connect(str(tmp_db), read_only=True) as con:
+        row = con.execute(
+            "SELECT marketplace_name FROM marketplaces WHERE marketplace_id=?",
+            ["my_custom_mp"],
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "My Custom MP"
+
+
+def test_ensure_marketplace_idempotent(tmp_db):
+    from core.reference_store_duckdb import init_db, ensure_marketplace
+    init_db(tmp_db)
+    ensure_marketplace(tmp_db, "test_mp", "Test MP")
+    ensure_marketplace(tmp_db, "test_mp", "Test MP")  # must not raise or duplicate
