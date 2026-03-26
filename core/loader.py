@@ -534,12 +534,37 @@ class MarketplaceData:
 
     # ── Persistence ────────────────────────────────────────────────────────────
     def save_to_disk(self, folder: Path):
+        """Save marketplace data as Parquet files.
+
+        .. deprecated::
+            Use DuckDB backend via ``core.reference_store_duckdb.import_marketplace`` instead.
+            This method is preserved for ``REFERENCE_BACKEND=parquet`` and ``dual`` modes.
+            Will be removed once all marketplaces are fully migrated to DuckDB.
+        """
+        import warnings
+        warnings.warn(
+            "save_to_disk is deprecated; use DuckDB backend (REFERENCE_BACKEND=duckdb).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         folder.mkdir(parents=True, exist_ok=True)
         self.categories.to_parquet(folder / "categories.parquet")
         self.characteristics.to_parquet(folder / "characteristics.parquet")
         self.values.to_parquet(folder / "values.parquet")
 
     def load_from_disk(self, folder: Path) -> bool:
+        """Load marketplace data from Parquet files.
+
+        .. deprecated::
+            Use DuckDB backend via ``core.reference_store_duckdb.load_marketplace_data`` instead.
+            This method is preserved for ``REFERENCE_BACKEND=parquet`` and ``dual`` modes.
+        """
+        import warnings
+        warnings.warn(
+            "load_from_disk is deprecated; use DuckDB backend (REFERENCE_BACKEND=duckdb).",
+            DeprecationWarning,
+            stacklevel=2,
+        )
         try:
             self.categories      = pd.read_parquet(folder / "categories.parquet")
             self.characteristics = pd.read_parquet(folder / "characteristics.parquet")
