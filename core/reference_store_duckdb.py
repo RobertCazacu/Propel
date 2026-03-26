@@ -6,6 +6,7 @@ Gestionează schema, importul, validarea și citirea datelor de referință
 
 Marketplace-uri active: eMAG HU, Allegro.
 """
+import json
 import re
 import uuid
 from pathlib import Path
@@ -105,6 +106,48 @@ _DDL_STATEMENTS = [
         entity_id      VARCHAR,
         message        VARCHAR NOT NULL,
         created_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS product_knowledge (
+        ean               VARCHAR,
+        brand             VARCHAR,
+        normalized_title  VARCHAR NOT NULL,
+        marketplace       VARCHAR NOT NULL,
+        offer_id          VARCHAR NOT NULL,
+        category          VARCHAR NOT NULL,
+        final_attributes  VARCHAR NOT NULL,
+        confidence        DOUBLE NOT NULL DEFAULT 0.0,
+        run_id            VARCHAR,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+    """,
+    """
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_ean
+        ON product_knowledge(ean)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_pk_brand_title
+        ON product_knowledge(brand, normalized_title)
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS ai_run_log (
+        run_id            VARCHAR NOT NULL,
+        ean               VARCHAR,
+        offer_id          VARCHAR,
+        marketplace       VARCHAR NOT NULL,
+        model_used        VARCHAR NOT NULL,
+        tokens_input      INTEGER NOT NULL DEFAULT 0,
+        tokens_output     INTEGER NOT NULL DEFAULT 0,
+        cost_usd          DOUBLE NOT NULL DEFAULT 0.0,
+        fields_requested  INTEGER NOT NULL DEFAULT 0,
+        fields_accepted   INTEGER NOT NULL DEFAULT 0,
+        fields_rejected   INTEGER NOT NULL DEFAULT 0,
+        retry_count       INTEGER NOT NULL DEFAULT 0,
+        fallback_used     BOOLEAN NOT NULL DEFAULT FALSE,
+        duration_ms       INTEGER NOT NULL DEFAULT 0,
+        created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
 ]
@@ -782,3 +825,159 @@ def get_db_status(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> 
         }
     except Exception as exc:
         return {"available": False, "reason": str(exc)}
+
+
+def ensure_schema(db_path: Path | None = None) -> None:
+    """Asigură că schema DuckDB este la zi (tabele + indecși).
+
+    Similar cu init_db() dar fără înregistrarea marketplace-urilor.
+    Potrivit pentru contexte de test și inițializare lazy.
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with duckdb.connect(str(db_path)) as con:
+        for ddl in _DDL_STATEMENTS:
+            con.execute(ddl)
+        for migration in _MIGRATIONS:
+            try:
+                con.execute(migration)
+            except Exception:
+                pass
+
+
+# ── product_knowledge CRUD ─────────────────────────────────────────────────────
+
+def upsert_product_knowledge(
+    *,
+    ean: str | None,
+    brand: str,
+    normalized_title: str,
+    marketplace: str,
+    offer_id: str,
+    category: str,
+    final_attributes: dict,
+    confidence: float,
+    run_id: str,
+) -> None:
+    """Insert sau update în product_knowledge.
+
+    Cheia de matching: EAN (dacă există) sau brand+normalized_title.
+    DOAR valorile validate (care au trecut char_validator) trebuie salvate.
+    """
+    attrs_json = json.dumps(final_attributes, ensure_ascii=False)
+    con = duckdb.connect(str(DB_PATH))
+    try:
+        if ean:
+            con.execute("""
+                INSERT INTO product_knowledge
+                    (ean, brand, normalized_title, marketplace, offer_id,
+                     category, final_attributes, confidence, run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (ean) DO UPDATE SET
+                    brand             = excluded.brand,
+                    normalized_title  = excluded.normalized_title,
+                    marketplace       = excluded.marketplace,
+                    offer_id          = excluded.offer_id,
+                    category          = excluded.category,
+                    final_attributes  = excluded.final_attributes,
+                    confidence        = excluded.confidence,
+                    run_id            = excluded.run_id,
+                    updated_at        = now()
+            """, [ean, brand, normalized_title, marketplace, offer_id,
+                  category, attrs_json, confidence, run_id])
+        else:
+            con.execute("""
+                DELETE FROM product_knowledge
+                WHERE ean IS NULL
+                  AND brand = ?
+                  AND normalized_title = ?
+            """, [brand, normalized_title])
+            con.execute("""
+                INSERT INTO product_knowledge
+                    (ean, brand, normalized_title, marketplace, offer_id,
+                     category, final_attributes, confidence, run_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [None, brand, normalized_title, marketplace, offer_id,
+                  category, attrs_json, confidence, run_id])
+    finally:
+        con.close()
+
+
+def get_product_knowledge(
+    *,
+    ean: str | None = None,
+    brand: str | None = None,
+    normalized_title: str | None = None,
+) -> dict | None:
+    """Caută în knowledge store. Prioritate: EAN > brand+title.
+
+    Returnează dict cu toate câmpurile sau None dacă nu există.
+    final_attributes este deja decodat ca dict.
+    """
+    con = duckdb.connect(str(DB_PATH), read_only=True)
+    try:
+        if ean:
+            row = con.execute("""
+                SELECT ean, brand, normalized_title, marketplace, offer_id,
+                       category, final_attributes, confidence, run_id, updated_at
+                FROM product_knowledge WHERE ean = ? LIMIT 1
+            """, [ean]).fetchone()
+        elif brand and normalized_title:
+            row = con.execute("""
+                SELECT ean, brand, normalized_title, marketplace, offer_id,
+                       category, final_attributes, confidence, run_id, updated_at
+                FROM product_knowledge
+                WHERE ean IS NULL AND brand = ? AND normalized_title = ?
+                LIMIT 1
+            """, [brand, normalized_title]).fetchone()
+        else:
+            return None
+
+        if row is None:
+            return None
+
+        cols = ["ean", "brand", "normalized_title", "marketplace", "offer_id",
+                "category", "final_attributes", "confidence", "run_id", "updated_at"]
+        result = dict(zip(cols, row))
+        result["final_attributes"] = json.loads(result["final_attributes"])
+        return result
+    finally:
+        con.close()
+
+
+# ── ai_run_log write ───────────────────────────────────────────────────────────
+
+def write_ai_run_log(
+    *,
+    run_id: str,
+    ean: str | None,
+    offer_id: str | None,
+    marketplace: str,
+    model_used: str,
+    tokens_input: int,
+    tokens_output: int,
+    cost_usd: float,
+    fields_requested: int,
+    fields_accepted: int,
+    fields_rejected: int,
+    retry_count: int,
+    fallback_used: bool,
+    duration_ms: int,
+) -> None:
+    """Scrie o intrare de telemetry în ai_run_log."""
+    con = duckdb.connect(str(DB_PATH))
+    try:
+        con.execute("""
+            INSERT INTO ai_run_log
+                (run_id, ean, offer_id, marketplace, model_used,
+                 tokens_input, tokens_output, cost_usd,
+                 fields_requested, fields_accepted, fields_rejected,
+                 retry_count, fallback_used, duration_ms)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, [run_id, ean, offer_id, marketplace, model_used,
+              tokens_input, tokens_output, cost_usd,
+              fields_requested, fields_accepted, fields_rejected,
+              retry_count, fallback_used, duration_ms])
+    finally:
+        con.close()

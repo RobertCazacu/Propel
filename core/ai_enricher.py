@@ -12,14 +12,34 @@ import re
 import hashlib
 import time
 import threading
+import unicodedata
 from pathlib import Path
 from core.app_logger import get_logger
 from core.llm_router import get_router
 from core.ai_logger import log_category_batch, log_char_enrichment
+from core.reference_store_duckdb import get_product_knowledge, upsert_product_knowledge
+from core.schema_builder import SchemaBuilder, build_json_schema
 
 log = get_logger("marketplace.ai")
 
 CACHE_PATH = Path(__file__).parent.parent / "data" / "ai_cache.json"
+
+
+def _normalize_title(title: str) -> str:
+    """Normalizează titlul pentru knowledge store matching.
+
+    'Samsung Galaxy S24 128GB Negru!' → 'samsung galaxy s24 128gb negru'
+    """
+    # Lowercase
+    s = title.lower().strip()
+    # Remove diacritice
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    # Remove punctuatie, păstrează alfanumeric și spații
+    s = re.sub(r"[^\w\s]", " ", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 _cache_lock = threading.Lock()
 
 # Load .env if present
@@ -458,6 +478,8 @@ def enrich_with_ai(
     marketplace: str = "",
     product_meta: dict = None,
     data=None,           # Optional[MarketplaceData] — enables strict value validation
+    ean: str | None = None,
+    brand: str | None = None,
 ) -> tuple[dict, dict]:
     """
     Completeaza caracteristicile cu AI.
@@ -491,6 +513,14 @@ def enrich_with_ai(
         optional_extra = {k: v for k, v in missing_options.items()
                          if k not in mandatory_chars and len(mandatory_missing) < 8}
         missing_options = {**mandatory_missing, **dict(list(optional_extra.items())[:5])}
+
+    # ── Knowledge store lookup ──────────────────────────────────────────────────
+    _norm_title = _normalize_title(title)
+    _known = get_product_knowledge(ean=ean, brand=brand, normalized_title=_norm_title) if (ean or brand) else None
+    _known_attrs = _known["final_attributes"] if _known else {}
+
+    if _known_attrs:
+        log.debug("Knowledge store hit: %d atribute cunoscute pentru '%s'", len(_known_attrs), title[:50])
 
     # Verifica cache
     cache = _load_cache()
@@ -547,6 +577,9 @@ def enrich_with_ai(
         # Setul de display-names obligatorii (cu ":" deja stripuit) pentru marcare în prompt
         mandatory_display_set = {k.rstrip(":") for k in (mandatory_chars or [])}
         prompt = _build_prompt(title, description, category, existing, missing_options_display, marketplace, mandatory_display_set, product_meta)
+        if _known_attrs:
+            known_context = "\n".join(f"  {k}: {v}" for k, v in _known_attrs.items())
+            prompt += f"\n\nDate cunoscute din alte marketplace-uri (verificate):\n{known_context}"
         system_prompt = _build_char_system_prompt(marketplace)
         raw = _complete_with_retry(prompt, max_tok, system_prompt, 0.2)
         duration_ms = round((time.perf_counter() - t_start) * 1000)
@@ -638,6 +671,24 @@ def enrich_with_ai(
                 if newly_done:
                     log.debug("Done-map updated pentru %r — obligatorii rezolvate: %s", title[:60], sorted(newly_done))
             _save_cache(cache)
+
+            # ── Save to knowledge store (doar atribute validate) ─────────────
+            if ean or brand:
+                import uuid as _uuid
+                try:
+                    upsert_product_knowledge(
+                        ean=ean,
+                        brand=brand or "",
+                        normalized_title=_norm_title,
+                        marketplace=marketplace,
+                        offer_id=str(existing.get("_offer_id", "")),
+                        category=str(category),
+                        final_attributes=validated,
+                        confidence=round(len(validated) / max(len(missing_options), 1), 2),
+                        run_id=str(_uuid.uuid4()),
+                    )
+                except Exception as e:
+                    log.warning("Nu s-a putut salva în knowledge store: %s", e)
         else:
             log.warning("AI char enrichment — niciun camp validat pentru %r (raw: %s)", title[:60], raw[:200])
 

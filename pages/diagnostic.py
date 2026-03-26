@@ -44,10 +44,11 @@ def render():
 
     st.markdown("---")
 
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab_ai_metrics = st.tabs([
         "📂 Categorii nemapate",
         "🏷 Caracteristici nemapate",
         "🔎 Detalii per produs",
+        "📊 AI Metrics",
     ])
 
     # ── Tab 1: motive categorie ────────────────────────────────────────────────
@@ -151,6 +152,60 @@ def render():
 
         if len(filtered) > 100:
             st.caption(f"... și încă {len(filtered) - 100} produse (restrânge cu căutarea)")
+
+    # ── Tab 4: AI Metrics ─────────────────────────────────────────────────────
+    with tab_ai_metrics:
+        st.subheader("AI Run Metrics")
+
+        try:
+            import duckdb
+            from core.reference_store_duckdb import DB_PATH
+
+            con = duckdb.connect(str(DB_PATH), read_only=True)
+
+            # ── Summary KPIs ────────────────────────────────────────────────
+            summary = con.execute("""
+                SELECT
+                    COUNT(*) AS total_runs,
+                    ROUND(AVG(CAST(fields_accepted AS DOUBLE) / NULLIF(fields_requested, 0)) * 100, 1) AS accept_rate_pct,
+                    ROUND(AVG(cost_usd), 6) AS avg_cost_usd,
+                    ROUND(SUM(CAST(retry_count > 0 AS INTEGER)) * 100.0 / NULLIF(COUNT(*), 0), 1) AS retry_rate_pct,
+                    ROUND(SUM(CAST(fallback_used AS INTEGER)) * 100.0 / NULLIF(COUNT(*), 0), 1) AS fallback_rate_pct
+                FROM ai_run_log
+            """).fetchone()
+
+            if summary and summary[0] > 0:
+                col1, col2, col3, col4 = st.columns(4)
+                col1.metric("Total Runs", f"{summary[0]:,}")
+                col2.metric("Accept Rate", f"{summary[1] or 0:.1f}%", delta_color="normal")
+                col3.metric("Avg Cost/Offer", f"${summary[2] or 0:.5f}")
+                col4.metric("Retry Rate", f"{summary[3] or 0:.1f}%")
+
+                # ── Per marketplace ────────────────────────────────────────
+                st.markdown("#### Pe marketplace")
+                df_mp = con.execute("""
+                    SELECT
+                        marketplace,
+                        COUNT(*) AS runs,
+                        ROUND(AVG(CAST(fields_accepted AS DOUBLE) / NULLIF(fields_requested, 0)) * 100, 1) AS accept_rate,
+                        ROUND(SUM(cost_usd), 4) AS total_cost_usd
+                    FROM ai_run_log
+                    GROUP BY marketplace
+                    ORDER BY runs DESC
+                    LIMIT 10
+                """).df()
+                st.dataframe(df_mp, use_container_width=True)
+
+                # ── Knowledge store size ───────────────────────────────────
+                pk_count = con.execute("SELECT COUNT(*) FROM product_knowledge").fetchone()[0]
+                st.info(f"Knowledge store: **{pk_count:,}** produse indexate")
+            else:
+                st.info("Nu există date de telemetry încă. Procesează câteva oferte pentru a vedea metrici.")
+
+            con.close()
+
+        except Exception as e:
+            st.warning(f"AI Metrics indisponibil: {e}")
 
     # ── Tab: App Log ───────────────────────────────────────────────────────────
     st.markdown("---")
