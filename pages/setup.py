@@ -3,7 +3,7 @@ from pathlib import Path
 from core.state import (
     all_marketplace_names, get_marketplace, set_marketplace,
     add_custom_marketplace, PREDEFINED_MARKETPLACES,
-    get_error_codes, set_error_codes, DUCKDB_MARKETPLACES,
+    get_error_codes, set_error_codes,
     clear_marketplace_data, remove_custom_marketplace,
     get_backend,
 )
