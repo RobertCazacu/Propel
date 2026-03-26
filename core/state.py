@@ -2,6 +2,7 @@
 Global state helpers for the Streamlit app.
 Manages per-marketplace data objects and processing results.
 """
+import os
 import streamlit as st
 import json
 from pathlib import Path
@@ -48,6 +49,16 @@ def save_dashboard_stats(results: list):
     except Exception:
         pass
 
+def get_backend() -> str:
+    """Return the configured storage backend.
+
+    Reads REFERENCE_BACKEND environment variable.
+    Valid values: 'duckdb' (default), 'parquet', 'dual'.
+    'dual' writes to both DuckDB and Parquet, reads from DuckDB.
+    """
+    return os.environ.get("REFERENCE_BACKEND", "duckdb").lower()
+
+
 PREDEFINED_MARKETPLACES = [
     "eMAG Romania",
     "Trendyol",
@@ -55,8 +66,9 @@ PREDEFINED_MARKETPLACES = [
     "FashionDays",
 ]
 
-# Marketplace-uri care folosesc DuckDB ca backend de stocare (pilot controlat)
-DUCKDB_MARKETPLACES = {"eMAG HU", "Allegro"}
+# DEPRECATED: all marketplaces now use DuckDB when REFERENCE_BACKEND=duckdb (default).
+# Kept for backward compatibility with any import that references this symbol.
+DUCKDB_MARKETPLACES: set = set()
 
 # ── Error code configuration per marketplace ───────────────────────────────────
 # Each marketplace defines which error codes should be processed.
@@ -152,26 +164,39 @@ def init_state():
     if not st.session_state["error_codes_config"]:
         st.session_state["error_codes_config"] = load_error_codes_config()
 
-    # Auto-load any previously saved marketplace data
+    # Auto-load any previously saved marketplace data.
+    # Note: "eMAG HU" is NOT in PREDEFINED_MARKETPLACES — it lives in custom_mp_names
+    # (loaded from data/custom_marketplaces.json). This is unchanged from the current code.
+    # Both lists are iterated together so the logic below covers all known marketplaces.
+    backend = get_backend()
     for mp_name in PREDEFINED_MARKETPLACES + st.session_state.get("custom_mp_names", []):
-        if mp_name not in st.session_state["marketplaces"]:
-            if mp_name in DUCKDB_MARKETPLACES:
-                try:
-                    from core import reference_store_duckdb as _duckdb_store
-                    mp_id = _duckdb_store.DUCKDB_ID_MAP.get(mp_name)
-                    if mp_id and _duckdb_store.is_available(mp_id):
-                        cats, chars, vals = _duckdb_store.load_marketplace_data(mp_id)
-                        mp = MarketplaceData(mp_name)
-                        mp.load_from_dataframes(cats, chars, vals)
-                        st.session_state["marketplaces"][mp_name] = mp
-                        log.info("Loaded %s from DuckDB", mp_name)
-                except Exception as exc:
-                    log.warning("DuckDB load failed for %s: %s", mp_name, exc)
-                continue  # nu face load_from_disk parquet
+        if mp_name in st.session_state["marketplaces"]:
+            continue
+
+        loaded = False
+
+        # ── Try DuckDB first (if backend is duckdb or dual) ──────────────────
+        if backend in ("duckdb", "dual"):
+            try:
+                from core import reference_store_duckdb as _ddb
+                mp_id = _ddb.marketplace_id_slug(mp_name)
+                if _ddb.is_available(mp_id):
+                    cats, chars, vals = _ddb.load_marketplace_data(mp_id)
+                    mp = MarketplaceData(mp_name)
+                    mp.load_from_dataframes(cats, chars, vals)
+                    st.session_state["marketplaces"][mp_name] = mp
+                    log.info("Loaded %s from DuckDB (backend=%s)", mp_name, backend)
+                    loaded = True
+            except Exception as exc:
+                log.warning("DuckDB load failed for %s: %s", mp_name, exc)
+
+        # ── Fallback to Parquet (if not loaded from DuckDB, or backend=parquet) ──
+        if not loaded and backend in ("parquet", "dual"):
             mp = MarketplaceData(mp_name)
             folder = DATA_DIR / mp_name.replace(" ", "_")
             if mp.load_from_disk(folder):
                 st.session_state["marketplaces"][mp_name] = mp
+                log.info("Loaded %s from Parquet (fallback, backend=%s)", mp_name, backend)
 
 
 def get_marketplace(name: str) -> MarketplaceData | None:
@@ -179,6 +204,14 @@ def get_marketplace(name: str) -> MarketplaceData | None:
 
 
 def set_marketplace(name: str, mp: MarketplaceData):
+    """Store a MarketplaceData in session state and persist to Parquet.
+
+    .. deprecated::
+        In REFERENCE_BACKEND=duckdb mode, persistence is handled by
+        ``_do_save_unified`` in ``pages/setup.py`` via DuckDB import pipeline.
+        This function still writes Parquet for REFERENCE_BACKEND=parquet|dual.
+        Do not call this function when using the DuckDB backend.
+    """
     st.session_state["marketplaces"][name] = mp
     # Persist to disk
     folder = DATA_DIR / name.replace(" ", "_")
@@ -206,15 +239,13 @@ def clear_marketplace_data(name: str):
     folder = DATA_DIR / name.replace(" ", "_")
     if folder.exists():
         shutil.rmtree(folder)
-    # Șterge și din DuckDB dacă e cazul
-    if name in DUCKDB_MARKETPLACES:
-        try:
-            from core import reference_store_duckdb as _ddb
-            mp_id = _ddb.DUCKDB_ID_MAP.get(name)
-            if mp_id:
-                _ddb.clear_marketplace_data(mp_id)
-        except Exception as exc:
-            log.warning("Eroare la ștergerea DuckDB pentru %s: %s", name, exc)
+    # Always attempt DuckDB clear (no-op if marketplace doesn't exist in DB)
+    try:
+        from core import reference_store_duckdb as _ddb
+        mp_id = _ddb.marketplace_id_slug(name)
+        _ddb.clear_marketplace_data(mp_id)
+    except Exception as exc:
+        log.warning("Eroare la ștergerea DuckDB pentru %s: %s", name, exc)
     log.info("Date șterse pentru marketplace '%s'", name)
 
 
