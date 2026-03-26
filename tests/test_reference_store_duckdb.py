@@ -346,7 +346,13 @@ def test_ensure_marketplace_registers_new(tmp_db):
 
 
 def test_ensure_marketplace_idempotent(tmp_db):
+    import duckdb
     from core.reference_store_duckdb import init_db, ensure_marketplace
     init_db(tmp_db)
     ensure_marketplace(tmp_db, "test_mp", "Test MP")
     ensure_marketplace(tmp_db, "test_mp", "Test MP")  # must not raise or duplicate
+    with duckdb.connect(str(tmp_db), read_only=True) as con:
+        count = con.execute(
+            "SELECT COUNT(*) FROM marketplaces WHERE marketplace_id=?", ["test_mp"]
+        ).fetchone()[0]
+    assert count == 1
