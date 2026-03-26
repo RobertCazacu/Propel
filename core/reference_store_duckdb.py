@@ -417,11 +417,14 @@ def import_marketplace(
         # 4. Transaction: delete old + bulk insert new
         # Pregătire DataFrames pentru bulk insert (DuckDB citește direct din pandas)
         def _norm_id_series(s: pd.Series) -> pd.Series:
-            """Normalize float IDs: 2819.0 → '2819' (avoids spurious '.0' in VARCHAR fields)."""
-            return s.apply(
-                lambda x: str(int(float(x))) if pd.notna(x) and str(x).strip() not in ("", "nan", "None")
-                else str(x) if pd.notna(x) else None
-            )
+            """Normalize IDs for VARCHAR storage.
+
+            Numeric-like: 2819.0 → '2819'
+            Alphanumeric: 'cat-001' → 'cat-001' (preserved as-is)
+            Empty/null  : → None (SQL NULL)
+            """
+            normed = s.apply(_norm_id)
+            return normed.where(normed != "", None)
 
         cats_bulk = pd.DataFrame({
             "marketplace_id":     marketplace_id,
