@@ -356,3 +356,104 @@ def test_ensure_marketplace_idempotent(tmp_db):
             "SELECT COUNT(*) FROM marketplaces WHERE marketplace_id=?", ["test_mp"]
         ).fetchone()[0]
     assert count == 1
+
+
+# ── Task 6: Universal marketplace support ─────────────────────────────────────
+
+def test_import_marketplace_numeric_ids(tmp_db):
+    """Numeric IDs (as float strings) are normalized without crash."""
+    import pandas as pd
+    from core.reference_store_duckdb import init_db, import_marketplace, is_available
+    cats = pd.DataFrame({
+        "id": ["2819.0", "2820.0"], "emag_id": ["100.0", "101.0"],
+        "name": ["Cat A", "Cat B"], "parent_id": [None, None],
+    })
+    chars = pd.DataFrame({
+        "id": ["10.0", "20.0"], "category_id": ["2819.0", "2820.0"],
+        "name": ["Culoare", "Marime"], "mandatory": [True, False],
+    })
+    vals = pd.DataFrame({
+        "category_id": ["2819.0"], "characteristic_id": ["10.0"],
+        "characteristic_name": ["Culoare"], "value": ["Rosu"],
+    })
+    init_db(tmp_db)
+    run_id = import_marketplace("test_num", cats, chars, vals, "test", {}, tmp_db)
+    assert run_id
+    assert is_available("test_num", tmp_db)
+
+
+def test_import_marketplace_alphanumeric_ids(tmp_db):
+    """Alphanumeric IDs are preserved as-is without crash."""
+    import pandas as pd
+    from core.reference_store_duckdb import init_db, import_marketplace, is_available
+    cats = pd.DataFrame({
+        "id": ["cat-001", "cat-002"], "emag_id": ["cat-001", "cat-002"],
+        "name": ["Cat A", "Cat B"], "parent_id": [None, None],
+    })
+    chars = pd.DataFrame({
+        "id": ["ch-A1", "ch-B2"], "category_id": ["cat-001", "cat-001"],
+        "name": ["Culoare", "Marime"], "mandatory": [True, False],
+    })
+    vals = pd.DataFrame({
+        "category_id": ["cat-001"], "characteristic_id": ["ch-A1"],
+        "characteristic_name": ["Culoare"], "value": ["Rosu"],
+    })
+    init_db(tmp_db)
+    run_id = import_marketplace("test_alpha", cats, chars, vals, "test", {}, tmp_db)
+    assert run_id
+    assert is_available("test_alpha", tmp_db)
+
+
+def test_two_marketplaces_are_isolated(tmp_db, sample_data):
+    """Data from marketplace A must not appear in marketplace B query."""
+    import pandas as pd
+    from core.reference_store_duckdb import init_db, ensure_marketplace, import_marketplace, load_marketplace_data
+    cats, chars, vals = sample_data
+    init_db(tmp_db)
+    ensure_marketplace(tmp_db, "mp_a", "MP A")
+    ensure_marketplace(tmp_db, "mp_b", "MP B")
+    import_marketplace("mp_a", cats, chars, vals, "test", {}, tmp_db)
+    import_marketplace("mp_b", pd.DataFrame({"id": ["x"], "emag_id": ["x"], "name": ["X"], "parent_id": [None]}),
+                       pd.DataFrame({"id": ["99"], "category_id": ["x"], "name": ["Col"], "mandatory": [False]}),
+                       pd.DataFrame({"category_id": ["x"], "characteristic_id": ["99"],
+                                     "characteristic_name": ["Col"], "value": ["V"]}),
+                       "test", {}, tmp_db)
+
+    cats_a, _, _ = load_marketplace_data("mp_a", tmp_db)
+    cats_b, _, _ = load_marketplace_data("mp_b", tmp_db)
+    assert len(cats_a) == 2
+    assert len(cats_b) == 1
+
+
+def test_custom_marketplace_end_to_end(tmp_db):
+    """A brand-new custom marketplace goes through full lifecycle."""
+    import pandas as pd
+    from core.reference_store_duckdb import (
+        init_db, marketplace_id_slug, ensure_marketplace,
+        import_marketplace, load_marketplace_data, is_available
+    )
+    from core.loader import MarketplaceData
+
+    mp_name = "My Test Marketplace"
+    mp_id   = marketplace_id_slug(mp_name)
+    assert mp_id == "my_test_marketplace"
+
+    cats = pd.DataFrame({"id": ["1"], "emag_id": ["1"], "name": ["Shoes"], "parent_id": [None]})
+    chars = pd.DataFrame({"id": ["10"], "category_id": ["1"], "name": ["Size"], "mandatory": [True]})
+    vals = pd.DataFrame({"category_id": ["1"], "characteristic_id": ["10"],
+                         "characteristic_name": ["Size"], "value": ["42"]})
+
+    init_db(tmp_db)
+    ensure_marketplace(tmp_db, mp_id, mp_name)
+    import_marketplace(mp_id, cats, chars, vals, "test", {}, tmp_db)
+
+    assert is_available(mp_id, tmp_db)
+    cats_r, chars_r, vals_r = load_marketplace_data(mp_id, tmp_db)
+    mp = MarketplaceData(mp_name)
+    mp.load_from_dataframes(cats_r, chars_r, vals_r)
+
+    assert mp.is_loaded()
+    assert "Shoes" in mp.category_list()
+    cat_id = mp.category_id("Shoes")
+    assert "Size" in mp.mandatory_chars(cat_id)
+    assert "42" in mp.valid_values(cat_id, "Size")
