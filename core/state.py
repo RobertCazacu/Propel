@@ -140,8 +140,84 @@ def get_all_processable_codes(marketplace: str) -> set:
     """Returns the set of error codes that should be processed for this marketplace."""
     return set(get_error_codes(marketplace)["processable_codes"])
 
+@st.cache_data(ttl=60)
+def _cached_is_available(mp_id: str) -> bool:
+    """Verificare rapidă (cached 60s) dacă un marketplace are date în DuckDB."""
+    try:
+        from core import reference_store_duckdb as _ddb
+        return _ddb.is_available(mp_id)
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=600)
+def _cached_load_marketplace_data(mp_id: str):
+    """Încarcă datele marketplace din DuckDB (cached 10 min).
+    Returnează (cats, chars, vals) ca DataFrames.
+    """
+    from core import reference_store_duckdb as _ddb
+    return _ddb.load_marketplace_data(mp_id)
+
+
+def is_marketplace_available(name: str) -> bool:
+    """Verificare rapidă (fără load complet) dacă un marketplace are date.
+
+    Folosit în sidebar și selectbox-uri pentru a afișa status fără să încarce
+    categorii/caracteristici/valori în memorie.
+    """
+    backend = get_backend()
+    if backend in ("duckdb", "dual"):
+        try:
+            from core import reference_store_duckdb as _ddb
+            mp_id = _ddb.marketplace_id_slug(name)
+            return _cached_is_available(mp_id)
+        except Exception:
+            return False
+    # Parquet: verificare rapidă pe disk
+    folder = DATA_DIR / name.replace(" ", "_")
+    return (folder / "categories.parquet").exists()
+
+
+def load_marketplace_on_select(name: str) -> bool:
+    """Încarcă datele complete ale unui marketplace la selecție.
+
+    Dacă e deja în session_state, returnează imediat (fără re-load).
+    Altfel, încarcă din DuckDB (cu cache) sau Parquet și stochează în session_state.
+    """
+    if st.session_state.get("marketplaces", {}).get(name) and \
+       st.session_state["marketplaces"][name].is_loaded():
+        return True
+
+    backend = get_backend()
+    loaded = False
+
+    if backend in ("duckdb", "dual"):
+        try:
+            from core import reference_store_duckdb as _ddb
+            mp_id = _ddb.marketplace_id_slug(name)
+            if _cached_is_available(mp_id):
+                cats, chars, vals = _cached_load_marketplace_data(mp_id)
+                mp = MarketplaceData(name)
+                mp.load_from_dataframes(cats, chars, vals)
+                st.session_state["marketplaces"][name] = mp
+                log.info("Lazy-loaded %s from DuckDB", name)
+                loaded = True
+        except Exception as exc:
+            log.warning("DuckDB lazy load failed for %s: %s", name, exc)
+
+    if not loaded and backend in ("parquet", "dual"):
+        mp = MarketplaceData(name)
+        folder = DATA_DIR / name.replace(" ", "_")
+        if mp.load_from_disk(folder):
+            st.session_state["marketplaces"][name] = mp
+            log.info("Lazy-loaded %s from Parquet", name)
+            loaded = True
+
+    return loaded
+
+
 def init_state():
-    """Initialise all session state keys."""
+    """Initialise session state keys. Nu încarcă date marketplace — lazy load via load_marketplace_on_select()."""
     defaults = {
         "marketplaces":       {},   # name -> MarketplaceData
         "active_mp":          None,
@@ -164,39 +240,8 @@ def init_state():
     if not st.session_state["error_codes_config"]:
         st.session_state["error_codes_config"] = load_error_codes_config()
 
-    # Auto-load any previously saved marketplace data.
-    # Note: "eMAG HU" is NOT in PREDEFINED_MARKETPLACES — it lives in custom_mp_names
-    # (loaded from data/custom_marketplaces.json). This is unchanged from the current code.
-    # Both lists are iterated together so the logic below covers all known marketplaces.
-    backend = get_backend()
-    for mp_name in PREDEFINED_MARKETPLACES + st.session_state.get("custom_mp_names", []):
-        if mp_name in st.session_state["marketplaces"]:
-            continue
-
-        loaded = False
-
-        # ── Try DuckDB first (if backend is duckdb or dual) ──────────────────
-        if backend in ("duckdb", "dual"):
-            try:
-                from core import reference_store_duckdb as _ddb
-                mp_id = _ddb.marketplace_id_slug(mp_name)
-                if _ddb.is_available(mp_id):
-                    cats, chars, vals = _ddb.load_marketplace_data(mp_id)
-                    mp = MarketplaceData(mp_name)
-                    mp.load_from_dataframes(cats, chars, vals)
-                    st.session_state["marketplaces"][mp_name] = mp
-                    log.info("Loaded %s from DuckDB (backend=%s)", mp_name, backend)
-                    loaded = True
-            except Exception as exc:
-                log.warning("DuckDB load failed for %s: %s", mp_name, exc)
-
-        # ── Fallback to Parquet (if not loaded from DuckDB, or backend=parquet) ──
-        if not loaded and backend in ("parquet", "dual"):
-            mp = MarketplaceData(mp_name)
-            folder = DATA_DIR / mp_name.replace(" ", "_")
-            if mp.load_from_disk(folder):
-                st.session_state["marketplaces"][mp_name] = mp
-                log.info("Loaded %s from Parquet (fallback, backend=%s)", mp_name, backend)
+    # Marketplace data este încărcat lazy via load_marketplace_on_select()
+    # când utilizatorul selectează un marketplace — nu la startup.
 
 
 def get_marketplace(name: str) -> MarketplaceData | None:

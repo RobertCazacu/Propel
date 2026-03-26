@@ -5,7 +5,8 @@ from core.state import (
     add_custom_marketplace, PREDEFINED_MARKETPLACES,
     get_error_codes, set_error_codes,
     clear_marketplace_data, remove_custom_marketplace,
-    get_backend,
+    get_backend, load_marketplace_on_select, is_marketplace_available,
+    _cached_load_marketplace_data,
 )
 
 from core.loader import MarketplaceData
@@ -50,6 +51,8 @@ def _do_save_unified(selected: str, cat_src, char_src, val_src, source_type: str
                 mp_new.load_from_dataframes(cats2, chars2, vals2)
                 st.session_state["marketplaces"][selected] = mp_new
                 st.session_state.pop(f"_reload_{selected}", None)
+                # Invalidează cache-ul după import nou
+                _cached_load_marketplace_data.clear()
 
                 summary = duckdb_store.get_import_summary(run_id)
                 issues  = duckdb_store.get_issues(run_id)
@@ -133,6 +136,8 @@ def render():
     if not selected:
         return
 
+    # Lazy-load marketplace data la selecție (cached — rapid dacă deja încărcat)
+    load_marketplace_on_select(selected)
     mp = get_marketplace(selected)
 
     # ── Badge DuckDB pilot ─────────────────────────────────────────────────────

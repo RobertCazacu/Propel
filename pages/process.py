@@ -3,7 +3,7 @@ import io
 import time
 import re
 import math
-from core.state import all_marketplace_names, get_marketplace, get_error_codes, get_all_processable_codes
+from core.state import all_marketplace_names, get_marketplace, get_error_codes, get_all_processable_codes, is_marketplace_available, load_marketplace_on_select
 from core.offers_parser import extract_products, get_error_code
 from core.processor import process_product, validate_existing, explain_missing_chars
 from core.app_logger import get_logger
@@ -515,7 +515,7 @@ def render():
 
     # ── Step 1: Select marketplace ────────────────────────────────────────────
     mp_names = all_marketplace_names()
-    loaded   = [n for n in mp_names if get_marketplace(n) and get_marketplace(n).is_loaded()]
+    loaded   = [n for n in mp_names if is_marketplace_available(n)]
 
     if not loaded:
         st.warning("⚠️ Niciun marketplace configurat. Mergi la **⚙️ Setup Marketplace** mai întâi.")
@@ -523,6 +523,7 @@ def render():
 
     st.subheader("1️⃣ Selectează marketplace")
     selected_mp = st.selectbox("Marketplace", loaded, key="proc_mp")
+    load_marketplace_on_select(selected_mp)
     mp = get_marketplace(selected_mp)
     _rules_key = f"{TITLE_CATEGORY_RULES_KEY}_{selected_mp}"  # reguli separate per marketplace
 
