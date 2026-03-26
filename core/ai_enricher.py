@@ -16,7 +16,7 @@ import unicodedata
 from pathlib import Path
 from core.app_logger import get_logger
 from core.llm_router import get_router
-from core.ai_logger import log_category_batch, log_char_enrichment
+from core.ai_logger import log_category_batch, log_char_enrichment, write_run_to_duckdb
 from core.reference_store_duckdb import get_product_knowledge, upsert_product_knowledge
 from core.schema_builder import SchemaBuilder, build_json_schema
 
@@ -714,6 +714,29 @@ def enrich_with_ai(
             validated=validated,
             duration_ms=duration_ms,
             max_tokens=max_tok,
+        )
+    except Exception:
+        pass
+
+    # ── DuckDB telemetry ───────────────────────────────────────────────────────
+    try:
+        import uuid as _uuid
+        router = get_router()
+        write_run_to_duckdb(
+            run_id=str(_uuid.uuid4()),
+            ean=ean,
+            offer_id=str(existing.get("_offer_id", "")),
+            marketplace=marketplace,
+            model_used=str(getattr(router._provider, "_model", "unknown")),
+            tokens_input=0,   # nu e expus de provider
+            tokens_output=0,
+            cost_usd=0.0,
+            fields_requested=len(missing_options),
+            fields_accepted=len(validated),
+            fields_rejected=len(suggested) - len(validated),
+            retry_count=0,
+            fallback_used=False,
+            duration_ms=duration_ms,
         )
     except Exception:
         pass
