@@ -79,6 +79,29 @@ class LLMRouter:
         """Verifică dacă providerul activ e configururat și accesibil."""
         return self._provider.is_available()
 
+    def complete_structured(
+        self,
+        prompt: str,
+        schema: dict,
+        system: str | None = None,
+    ) -> dict | None:
+        """Delegă complete_structured la providerul activ.
+
+        Returnează dict conform schemei sau None dacă providerul nu suportă
+        structured output sau apelul eșuează — fără crash garantat.
+        """
+        try:
+            return self._provider.complete_structured(prompt, schema, system=system)
+        except Exception as exc:
+            log.warning("complete_structured failed (provider=%s): %s", self._provider.name, exc)
+            return None
+
+    def supports_structured(self) -> bool:
+        """Returnează True dacă providerul activ are complete_structured nativ (nu fallback)."""
+        return hasattr(self._provider, "complete_structured") and \
+               type(self._provider).complete_structured is not \
+               __import__("core.providers.base", fromlist=["BaseLLMProvider"]).BaseLLMProvider.complete_structured
+
     def switch_provider(self, name: str) -> None:
         """Schimbă providerul la runtime fără restart."""
         old = self._provider.name

@@ -181,6 +181,35 @@ def render():
                 col3.metric("Avg Cost/Offer", f"${summary[2] or 0:.5f}")
                 col4.metric("Retry Rate", f"{summary[3] or 0:.1f}%")
 
+                # ── Structured output KPIs ─────────────────────────────────
+                try:
+                    s_summary = con.execute("""
+                        SELECT
+                            SUM(CAST(structured_attempted AS INTEGER))  AS attempted,
+                            SUM(CAST(structured_success   AS INTEGER))  AS success,
+                            SUM(CAST(structured_fallback_used AS INTEGER)) AS fallback,
+                            ROUND(AVG(CASE WHEN structured_attempted THEN structured_latency_ms END), 0) AS avg_lat,
+                            MODE(CASE WHEN structured_attempted AND structured_model_used != ''
+                                      THEN structured_model_used END) AS top_model
+                        FROM ai_run_log
+                        WHERE structured_mode != 'off'
+                    """).fetchone()
+
+                    if s_summary and s_summary[0] and s_summary[0] > 0:
+                        st.markdown("#### 🧩 Structured Output")
+                        sc1, sc2, sc3, sc4 = st.columns(4)
+                        sc1.metric("Attempted", f"{s_summary[0]:,}")
+                        sc2.metric("Success", f"{s_summary[1]:,}",
+                                   delta=f"{s_summary[1]/s_summary[0]*100:.0f}%" if s_summary[0] else None)
+                        sc3.metric("Fallback la text", f"{s_summary[2]:,}")
+                        sc4.metric("Avg latency", f"{int(s_summary[3] or 0)} ms")
+                        if s_summary[4]:
+                            st.caption(f"Model structured: **{s_summary[4]}**")
+                    else:
+                        st.caption("🧩 Structured Output: nicio rulare cu structured activat încă.")
+                except Exception:
+                    pass  # coloane noi pot lipsi pe DB vechi
+
                 # ── Per marketplace ────────────────────────────────────────
                 st.markdown("#### Pe marketplace")
                 df_mp = con.execute("""

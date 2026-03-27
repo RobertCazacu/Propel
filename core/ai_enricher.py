@@ -8,7 +8,9 @@ Strategii de optimizare:
 4. AI doar pentru caracteristici obligatorii lipsa — skip daca regulile au acoperit tot
 """
 import json
+import os
 import re
+import random
 import hashlib
 import time
 import threading
@@ -19,6 +21,42 @@ from core.llm_router import get_router
 from core.ai_logger import log_category_batch, log_char_enrichment, write_run_to_duckdb
 from core.reference_store_duckdb import get_product_knowledge, upsert_product_knowledge
 from core.schema_builder import SchemaBuilder, build_json_schema
+
+
+# ── Structured output config ───────────────────────────────────────────────────
+
+def get_structured_config() -> dict:
+    """Citește config structured output din session_state (UI) sau env.
+
+    Returns dict cu cheile:
+      mode: 'off' | 'shadow' | 'on'
+      sample: float [0..1]
+      provider_only: bool
+    """
+    try:
+        import streamlit as st
+        cfg = st.session_state.get("structured_output_config", {})
+    except Exception:
+        cfg = {}
+
+    return {
+        "mode":          cfg.get("mode",          os.getenv("AI_STRUCTURED_MODE", "off")),
+        "sample":        float(cfg.get("sample",  os.getenv("AI_STRUCTURED_SAMPLE", "0.10"))),
+        "provider_only": cfg.get("provider_only", os.getenv("AI_STRUCTURED_PROVIDER_ONLY", "true").lower() == "true"),
+    }
+
+
+def _should_run_structured(cfg: dict, provider_name: str) -> bool:
+    """Decide dacă structured output trebuie rulat pentru această cerere."""
+    mode = cfg.get("mode", "off")
+    if mode == "off":
+        return False
+    # Verifică restricție provider
+    if cfg.get("provider_only", True) and provider_name != "anthropic":
+        return False
+    # Sampling
+    sample = float(cfg.get("sample", 0.10))
+    return random.random() < sample
 
 log = get_logger("marketplace.ai")
 
@@ -718,6 +756,90 @@ def enrich_with_ai(
     except Exception:
         pass
 
+    # ── Structured output (off / shadow / on) ──────────────────────────────────
+    _scfg = get_structured_config()
+    _smode = _scfg.get("mode", "off")
+    _s_attempted = False
+    _s_success = False
+    _s_fallback = False
+    _s_latency_ms = 0
+    _s_model = ""
+    _s_schema_fields = 0
+
+    try:
+        router = get_router()
+        if _should_run_structured(_scfg, router.provider_name):
+            _s_attempted = True
+            # Construiește schema pentru caracteristicile lipsă
+            char_list = [
+                {"name": k, "is_mandatory": k in (mandatory_chars or []), "values": sorted(v)}
+                for k, v in missing_options.items()
+            ]
+            sb = SchemaBuilder(max_total=20)
+            selected_chars = sb.select(char_list, "", _known_attrs)
+            schema = build_json_schema(selected_chars)
+            _s_schema_fields = len(selected_chars)
+
+            _s_t0 = time.perf_counter()
+            structured_result = router.complete_structured(
+                prompt if "prompt" in dir() else "",
+                schema,
+                system=system_prompt if "system_prompt" in dir() else None,
+            )
+            _s_latency_ms = round((time.perf_counter() - _s_t0) * 1000)
+            _s_model = str(getattr(router._provider, "_STRUCTURED_MODEL",
+                                   getattr(router._provider, "_model", "unknown")))
+
+            if structured_result and isinstance(structured_result, dict):
+                _s_success = True
+                if _smode == "on":
+                    # Structured devine primar — validăm și folosim rezultatul
+                    validated_structured = {}
+                    if data is not None:
+                        _ai_cat_id_s = data.category_id(category) if data is not None else None
+                        for ch_name, ch_val in structured_result.items():
+                            if not str(ch_val).strip():
+                                continue
+                            if _ai_cat_id_s is not None:
+                                mapped = data.find_valid(str(ch_val), _ai_cat_id_s, ch_name)
+                                if mapped is not None:
+                                    validated_structured[ch_name] = mapped
+                            elif ch_name in missing_options:
+                                vs = missing_options.get(ch_name, set())
+                                if not vs or str(ch_val) in vs:
+                                    validated_structured[ch_name] = str(ch_val)
+                    else:
+                        validated_structured = {
+                            k: str(v) for k, v in structured_result.items()
+                            if str(v).strip() and k in missing_options
+                        }
+
+                    if validated_structured:
+                        # Structured output valid — înlocuiește text validated
+                        validated = validated_structured
+                        log.info("Structured output ON — %d câmpuri validate pentru %r",
+                                 len(validated), title[:60])
+                    else:
+                        # Structured a returnat dar validarea a eșuat — fallback la text
+                        _s_fallback = True
+                        log.warning("Structured output ON — validare eșuată, fallback text pentru %r",
+                                    title[:60])
+                else:
+                    # shadow: log comparativ, NU afectează output final
+                    log.info(
+                        "Structured SHADOW pentru %r — structured=%s text=%s",
+                        title[:60],
+                        list(structured_result.keys()),
+                        list(validated.keys()),
+                    )
+            else:
+                # Structured a returnat None/empty — fallback la text deja calculat
+                _s_fallback = True
+                log.debug("Structured output None/gol pentru %r — text fallback activ", title[:60])
+    except Exception as _s_exc:
+        _s_fallback = True
+        log.warning("Structured output exc pentru %r: %s", title[:60], _s_exc)
+
     # ── DuckDB telemetry ───────────────────────────────────────────────────────
     try:
         import uuid as _uuid
@@ -737,6 +859,13 @@ def enrich_with_ai(
             retry_count=0,
             fallback_used=False,
             duration_ms=duration_ms,
+            structured_mode=_smode,
+            structured_attempted=_s_attempted,
+            structured_success=_s_success,
+            structured_fallback_used=_s_fallback,
+            structured_latency_ms=_s_latency_ms,
+            structured_model_used=_s_model,
+            schema_fields_count=_s_schema_fields,
         )
     except Exception:
         pass

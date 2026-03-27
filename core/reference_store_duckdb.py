@@ -156,6 +156,14 @@ _DDL_STATEMENTS = [
 _MIGRATIONS = [
     "ALTER TABLE characteristics ADD COLUMN IF NOT EXISTS emag_characteristic_id VARCHAR",
     "ALTER TABLE characteristics ADD COLUMN IF NOT EXISTS restrictive BOOLEAN DEFAULT TRUE",
+    # Structured output telemetry columns (added in structured-output rollout)
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_mode VARCHAR DEFAULT 'off'",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_attempted BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_success BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_fallback_used BOOLEAN DEFAULT FALSE",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_latency_ms INTEGER DEFAULT 0",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_model_used VARCHAR DEFAULT ''",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS schema_fields_count INTEGER DEFAULT 0",
 ]
 
 _UPSERT_MARKETPLACE = """
@@ -964,6 +972,14 @@ def write_ai_run_log(
     retry_count: int,
     fallback_used: bool,
     duration_ms: int,
+    # Structured output telemetry (optional, default off)
+    structured_mode: str = "off",
+    structured_attempted: bool = False,
+    structured_success: bool = False,
+    structured_fallback_used: bool = False,
+    structured_latency_ms: int = 0,
+    structured_model_used: str = "",
+    schema_fields_count: int = 0,
 ) -> None:
     """Scrie o intrare de telemetry în ai_run_log."""
     con = duckdb.connect(str(DB_PATH))
@@ -973,11 +989,17 @@ def write_ai_run_log(
                 (run_id, ean, offer_id, marketplace, model_used,
                  tokens_input, tokens_output, cost_usd,
                  fields_requested, fields_accepted, fields_rejected,
-                 retry_count, fallback_used, duration_ms)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 retry_count, fallback_used, duration_ms,
+                 structured_mode, structured_attempted, structured_success,
+                 structured_fallback_used, structured_latency_ms,
+                 structured_model_used, schema_fields_count)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [run_id, ean, offer_id, marketplace, model_used,
               tokens_input, tokens_output, cost_usd,
               fields_requested, fields_accepted, fields_rejected,
-              retry_count, fallback_used, duration_ms])
+              retry_count, fallback_used, duration_ms,
+              structured_mode, structured_attempted, structured_success,
+              structured_fallback_used, structured_latency_ms,
+              structured_model_used, schema_fields_count])
     finally:
         con.close()
