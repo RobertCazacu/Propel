@@ -322,6 +322,7 @@ def write_run_to_duckdb(
     structured_latency_ms: int = 0,
     structured_model_used: str = "",
     schema_fields_count: int = 0,
+    shadow_diff: dict | None = None,
 ) -> None:
     """Scrie telemetry în ai_run_log DuckDB. Silent fail dacă DuckDB nu e disponibil."""
     try:
@@ -341,6 +342,7 @@ def write_run_to_duckdb(
             structured_latency_ms=structured_latency_ms,
             structured_model_used=structured_model_used,
             schema_fields_count=schema_fields_count,
+            shadow_diff=shadow_diff,
         )
     except Exception:
         pass  # Telemetry nu blochează niciodată procesarea

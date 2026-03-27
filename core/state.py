@@ -56,7 +56,13 @@ def get_backend() -> str:
     Valid values: 'duckdb' (default), 'parquet', 'dual'.
     'dual' writes to both DuckDB and Parquet, reads from DuckDB.
     """
-    return os.environ.get("REFERENCE_BACKEND", "duckdb").lower()
+    backend = os.environ.get("REFERENCE_BACKEND", "duckdb").lower()
+    if backend == "parquet":
+        log.warning(
+            "DEPRECATION: REFERENCE_BACKEND=parquet este deprecat. "
+            "Migreaza la DuckDB folosind scripts/migrate_parquet_to_duckdb.py"
+        )
+    return backend
 
 
 PREDEFINED_MARKETPLACES = [

@@ -4,6 +4,7 @@ Detects values from product title + description using rule-based logic,
 validates against the marketplace valid-values list, and fills gaps.
 """
 import re
+import functools
 from bs4 import BeautifulSoup
 from typing import Optional
 from core.loader import MarketplaceData
@@ -12,9 +13,15 @@ from core.app_logger import get_logger
 log = get_logger("marketplace.processor")
 
 
+@functools.lru_cache(maxsize=512)
+def _compile_wb(kw: str):
+    """Cache compiled word-boundary patterns — keywords are finite (~200 unique)."""
+    return re.compile(r"\b" + re.escape(kw) + r"\b")
+
+
 def _wb(kw: str, text: str) -> bool:
     """Word-boundary match: prevents 'alb' matching 'album', 'rosu' matching 'caramiziu'."""
-    return bool(re.search(r"\b" + re.escape(kw) + r"\b", text))
+    return bool(_compile_wb(kw).search(text))
 
 
 def strip_html(html: str) -> str:
@@ -394,6 +401,10 @@ ALL_DETECTORS = [
     ("Материал:",            lambda t, d, mp, cid: detect_material(t, d, mp, cid, "Материал:")),
 ]
 
+# Module-level cache: cat_id -> tuple of (char_name, detector) applicable for that category.
+# Populated lazily on first call per cat_id — avoids repeated has_char() normalization lookups.
+_applicable_detectors_cache: dict[str, tuple] = {}
+
 
 def process_product(
     title: str,
@@ -424,11 +435,16 @@ def process_product(
     _char_log: list[dict] = []
 
     # ── Rule-based detection ──────────────────────────────────────────────────
-    for char_name, detector in ALL_DETECTORS:
+    # Cache applicable detectors per cat_id — has_char() called once per unique category,
+    # not once per product × detector (avoids 192k+ normalization calls for 8k products)
+    if cat_id not in _applicable_detectors_cache:
+        _applicable_detectors_cache[cat_id] = tuple(
+            (cn, det) for cn, det in ALL_DETECTORS if data.has_char(cat_id, cn)
+        )
+    applicable = _applicable_detectors_cache[cat_id]
+
+    for char_name, detector in applicable:
         if char_name in existing_chars and existing_chars[char_name]:
-            continue
-        # Skip detector daca acest camp nu apartine marketplace-ului curent
-        if not data.has_char(cat_id, char_name):
             continue
         try:
             val = detector(title, desc_clean, data, cat_id)

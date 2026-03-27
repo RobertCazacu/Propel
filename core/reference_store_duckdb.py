@@ -150,6 +150,14 @@ _DDL_STATEMENTS = [
         created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS process_runs (
+        run_id      VARCHAR NOT NULL,
+        marketplace VARCHAR NOT NULL,
+        run_ts      TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        results     JSON NOT NULL
+    )
+    """,
 ]
 
 # ── Schema migrations (backward-compatible, safe to run on existing DBs) ───────
@@ -164,6 +172,7 @@ _MIGRATIONS = [
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_latency_ms INTEGER DEFAULT 0",
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_model_used VARCHAR DEFAULT ''",
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS schema_fields_count INTEGER DEFAULT 0",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS shadow_diff JSON DEFAULT NULL",
 ]
 
 _UPSERT_MARKETPLACE = """
@@ -980,6 +989,7 @@ def write_ai_run_log(
     structured_latency_ms: int = 0,
     structured_model_used: str = "",
     schema_fields_count: int = 0,
+    shadow_diff: dict | None = None,
 ) -> None:
     """Scrie o intrare de telemetry în ai_run_log."""
     con = duckdb.connect(str(DB_PATH))
@@ -992,14 +1002,46 @@ def write_ai_run_log(
                  retry_count, fallback_used, duration_ms,
                  structured_mode, structured_attempted, structured_success,
                  structured_fallback_used, structured_latency_ms,
-                 structured_model_used, schema_fields_count)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 structured_model_used, schema_fields_count, shadow_diff)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, [run_id, ean, offer_id, marketplace, model_used,
               tokens_input, tokens_output, cost_usd,
               fields_requested, fields_accepted, fields_rejected,
               retry_count, fallback_used, duration_ms,
               structured_mode, structured_attempted, structured_success,
               structured_fallback_used, structured_latency_ms,
-              structured_model_used, schema_fields_count])
+              structured_model_used, schema_fields_count,
+              json.dumps(shadow_diff, default=str) if shadow_diff else None])
     finally:
         con.close()
+
+
+# ── Process run persistence ─────────────────────────────────────────────────────
+
+def save_process_run(results: list, marketplace: str, db_path: Path = DB_PATH) -> None:
+    """Persistă rezultatele procesării în DuckDB pentru recuperare la reload."""
+    run_id = str(uuid.uuid4())
+    try:
+        with duckdb.connect(str(db_path)) as con:
+            con.execute(
+                "INSERT INTO process_runs (run_id, marketplace, results) VALUES (?, ?, ?)",
+                [run_id, marketplace, json.dumps(results, ensure_ascii=False, default=str)]
+            )
+        log.debug("Saved process run %s (%d results) for %s", run_id, len(results), marketplace)
+    except Exception as exc:
+        log.warning("save_process_run failed: %s", exc)
+
+
+def load_last_process_run(marketplace: str, db_path: Path = DB_PATH) -> list:
+    """Încarcă cel mai recent run de procesare pentru un marketplace."""
+    try:
+        with duckdb.connect(str(db_path), read_only=True) as con:
+            row = con.execute(
+                "SELECT results FROM process_runs WHERE marketplace = ? ORDER BY run_ts DESC LIMIT 1",
+                [marketplace]
+            ).fetchone()
+        if row:
+            return json.loads(row[0])
+    except Exception as exc:
+        log.warning("load_last_process_run failed: %s", exc)
+    return []

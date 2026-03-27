@@ -15,6 +15,7 @@ import hashlib
 import time
 import threading
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from core.app_logger import get_logger
 from core.llm_router import get_router
@@ -389,18 +390,41 @@ def suggest_categories_batch(
     # Imparte in batch-uri de BATCH_SIZE
     chunks = [uncached[i:i + BATCH_SIZE] for i in range(0, len(uncached), BATCH_SIZE)]
     total = len(uncached)
-    processed = 0
+    completed_count = 0
+    merge_lock = threading.Lock()
 
-    for chunk_idx, chunk in enumerate(chunks):
-        if status_callback:
-            status_callback(
-                f"AI categorii: batch {chunk_idx + 1}/{len(chunks)} "
-                f"({processed}/{total} produse)..."
-            )
-        batch_res = _process_batch(chunk, category_list, marketplace, cache)
-        results.update(batch_res)
-        processed += len(chunk)
-        _save_cache(cache)  # salveaza dupa fiecare batch
+    if status_callback:
+        status_callback(
+            f"AI categorii: se procesează {len(chunks)} batch-uri în paralel (5 simultan)..."
+        )
+
+    def _run_chunk(args):
+        chunk_idx, chunk = args
+        # Fiecare thread primește un cache local — evită race conditions
+        local_cache: dict = {"category_map": {}, "char_map": {}, "learned_title_rules": [], "done_map": {}}
+        batch_res = _process_batch(chunk, category_list, marketplace, local_cache)
+        return chunk_idx, batch_res, local_cache
+
+    max_workers = min(5, len(chunks))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_run_chunk, (i, chunk)): i for i, chunk in enumerate(chunks)}
+        for future in as_completed(futures):
+            chunk_idx, batch_res, local_cache = future.result()
+            with merge_lock:
+                results.update(batch_res)
+                cache["category_map"].update(local_cache["category_map"])
+                for rule in local_cache.get("learned_title_rules", []):
+                    existing_kws = {r.get("keywords", r.get("prefix", "")) for r in cache["learned_title_rules"]}
+                    if rule.get("keywords") and rule["keywords"] not in existing_kws:
+                        cache["learned_title_rules"].append(rule)
+                completed_count += len(chunks[chunk_idx])
+                if status_callback:
+                    status_callback(
+                        f"AI categorii: {completed_count}/{total} produse "
+                        f"({chunk_idx + 1}/{len(chunks)} batch-uri)..."
+                    )
+
+    _save_cache(cache)  # o singura scriere la final in loc de N scrieri
 
     if status_callback:
         status_callback(f"AI categorii: gata ({total} produse procesate).")
@@ -518,16 +542,25 @@ def enrich_with_ai(
     data=None,           # Optional[MarketplaceData] — enables strict value validation
     ean: str | None = None,
     brand: str | None = None,
+    vision_chars: dict | None = None,
 ) -> tuple[dict, dict]:
     """
     Completeaza caracteristicile cu AI.
     Optimizare: verifica cache-ul mai intai, apeleaza API doar daca e necesar.
     Daca mandatory_chars e specificat, trimite AI doar caracteristicile obligatorii lipsa.
+    vision_chars: atribute deja detectate din imagine — AI le va considera ca existente.
 
     Returns:
         (validated, suggested_remapped) — validated = chars that passed validation;
         suggested_remapped = all AI suggestions (original keys, _reasoning excluded).
     """
+    # Injectează atributele detectate vizual ca deja-existente (AI nu le mai solicită)
+    if vision_chars:
+        existing = {**existing}
+        for k, v in vision_chars.items():
+            if k not in existing and v:
+                existing[k] = v
+
     # Filtreaza doar cele lipsa
     missing_options = {k: v for k, v in char_options.items() if not existing.get(k)}
 
@@ -765,6 +798,7 @@ def enrich_with_ai(
     _s_latency_ms = 0
     _s_model = ""
     _s_schema_fields = 0
+    _shadow_diff = None
 
     try:
         router = get_router()
@@ -826,11 +860,23 @@ def enrich_with_ai(
                                     title[:60])
                 else:
                     # shadow: log comparativ, NU afectează output final
+                    _shadow_diff = {
+                        "agree": sorted(set(structured_result.keys()) & set(validated.keys())),
+                        "only_structured": sorted(set(structured_result.keys()) - set(validated.keys())),
+                        "only_plain": sorted(set(validated.keys()) - set(structured_result.keys())),
+                        "value_conflicts": {
+                            k: {"structured": str(structured_result[k]), "plain": str(validated[k])}
+                            for k in set(structured_result.keys()) & set(validated.keys())
+                            if str(structured_result[k]).strip().lower() != str(validated[k]).strip().lower()
+                        },
+                    }
                     log.info(
-                        "Structured SHADOW pentru %r — structured=%s text=%s",
+                        "Structured SHADOW pentru %r — agree=%d only_s=%d only_p=%d conflicts=%d",
                         title[:60],
-                        list(structured_result.keys()),
-                        list(validated.keys()),
+                        len(_shadow_diff["agree"]),
+                        len(_shadow_diff["only_structured"]),
+                        len(_shadow_diff["only_plain"]),
+                        len(_shadow_diff["value_conflicts"]),
                     )
             else:
                 # Structured a returnat None/empty — fallback la text deja calculat
@@ -866,6 +912,7 @@ def enrich_with_ai(
             structured_latency_ms=_s_latency_ms,
             structured_model_used=_s_model,
             schema_fields_count=_s_schema_fields,
+            shadow_diff=_shadow_diff,
         )
     except Exception:
         pass

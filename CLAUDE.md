@@ -25,7 +25,6 @@
 ## Project Architecture
 
 - Follow Domain-Driven Design with bounded contexts
-- Keep files under 500 lines
 - Use typed interfaces for all public APIs
 - Prefer TDD London School (mock-first) for new code
 - Use event sourcing for state changes

@@ -411,6 +411,36 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                 )
                 result["image_analysis"] = img_result.to_dict()
                 img_log_result = img_result.to_dict()
+
+                # Fusion: dacă vision a returnat un hint de categorie, fusionăm cu cel text
+                if img_result.product_type_hint and img_result.product_type_confidence > 0:
+                    try:
+                        from core.vision.fusion import (
+                            fuse_category, action_to_confidence,
+                            TextCategoryResult, ImageCategoryResult,
+                        )
+                        _fusion = fuse_category(
+                            TextCategoryResult(
+                                candidate=final_cat,
+                                confidence=action_to_confidence(cat_action),
+                                source=cat_action,
+                            ),
+                            ImageCategoryResult(
+                                candidate=img_result.product_type_hint,
+                                confidence=img_result.product_type_confidence,
+                                source="vision_hint",
+                            ),
+                            rules={},
+                            run_logger=image_options.get("run_logger"),
+                            offer_id=str(prod.get("id", "")),
+                        )
+                        if _fusion.final_category and mp.category_id(_fusion.final_category):
+                            final_cat = _fusion.final_category
+                            result["new_category"] = final_cat
+                            result["fusion_reason"] = _fusion.reason
+                    except Exception:
+                        pass
+
                 # Only auto-fill if not suggestion_only mode
                 if not image_options.get("suggestion_only", False):
                     # Strict gate: only add image suggestions that exist in tables
@@ -492,10 +522,11 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
 
         results.append(result)
 
-        # Update progress
-        pct = int((i + 1) / total * 100)
-        progress_bar.progress(pct)
-        status_text.text(f"Procesare: {i+1}/{total} produse...")
+        # Update progress — throttled: every 50 products to avoid Streamlit DOM overhead
+        if i % 50 == 0 or i == total - 1:
+            pct = int((i + 1) / total * 100)
+            progress_bar.progress(pct)
+            status_text.text(f"Procesare: {i+1}/{total} produse...")
 
     if _run_logger:
         try:
@@ -861,6 +892,12 @@ def render():
 
         from core.state import save_dashboard_stats
         save_dashboard_stats(results)
+
+        try:
+            from core.reference_store_duckdb import save_process_run
+            save_process_run(results, selected_mp)
+        except Exception:
+            pass
 
         from core.logger import write_log
         file_name = st.session_state.get("offers_file_name", "necunoscut.xlsx")

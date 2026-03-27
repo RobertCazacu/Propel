@@ -145,7 +145,11 @@ def render():
     if backend in ("duckdb", "dual"):
         st.info(f"🦆 **Backend: DuckDB** (`REFERENCE_BACKEND={backend}`) — `data/reference_data.duckdb`")
     elif backend == "parquet":
-        st.warning("⚠️ **Backend: Parquet** (`REFERENCE_BACKEND=parquet`) — date stocate local ca fișiere.")
+        st.warning(
+            "⚠️ **Backend Parquet este deprecat.** "
+            "Migreaza la DuckDB cu `scripts/migrate_parquet_to_duckdb.py` "
+            "și setează `REFERENCE_BACKEND=duckdb` în `.env`."
+        )
 
     if mp and mp.is_loaded():
         stats = mp.stats()
