@@ -207,9 +207,31 @@ def _audit_products(products: list, mp) -> dict:
     }
 
 
+def _prevent_sleep():
+    """Previne sleep/standby Windows pe durata procesarii. Returneaza functia de reset."""
+    try:
+        import ctypes
+        ES_CONTINUOUS        = 0x80000000
+        ES_SYSTEM_REQUIRED   = 0x00000001
+        ES_AWAYMODE_REQUIRED = 0x00000040
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+        )
+        log.info("Sleep prevention activat — PC-ul nu va intra in standby pe durata procesarii.")
+        def _reset():
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            log.info("Sleep prevention dezactivat.")
+        return _reset
+    except Exception as e:
+        log.debug("Sleep prevention indisponibil: %s", e)
+        return lambda: None
+
+
 def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, marketplace="", image_options=None):
     from core.ai_logger import start_run as _ai_start_run
     _ai_start_run(marketplace)
+
+    _reset_sleep = _prevent_sleep()
 
     # ── Vision run logger (optional) ──────────────────────────────────────────
     _run_logger = None
@@ -617,6 +639,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         except Exception:
             pass
 
+    _reset_sleep()  # reactivează sleep-ul normal după procesare
     return results
 
 
@@ -1005,4 +1028,51 @@ def render():
         col4.metric("Valori invalide șterse", n_cleared)
         col5.metric("Necesită review manual", n_manual)
 
-        st.info("Mergi la **📊 Results** pentru a revizui și descărca fișierul.")
+        # ── Auto-save export la finalizare ────────────────────────────────────
+        _file_bytes = st.session_state.get("offers_file_buf")
+        _products   = st.session_state.get("offers_products", [])
+        _file_name  = st.session_state.get("offers_file_name", "offers.xlsx")
+        _base_name  = _file_name.rsplit(".", 1)[0]
+
+        try:
+            import time as _time
+            from datetime import datetime as _dt
+            from pathlib import Path as _Path
+            from core.exporter import export_model_format
+
+            _exports_dir = _Path(__file__).parent.parent / "data" / "exports"
+            _exports_dir.mkdir(parents=True, exist_ok=True)
+
+            # Curăță fișierele mai vechi de 24h
+            _cutoff = _time.time() - 24 * 3600
+            for _f in _exports_dir.glob("*.xlsx"):
+                try:
+                    if _f.stat().st_mtime < _cutoff:
+                        _f.unlink()
+                except Exception:
+                    pass
+
+            _auto_bytes = export_model_format(
+                io.BytesIO(_file_bytes) if _file_bytes else None,
+                results,
+                _products,
+            )
+            _ts = _dt.now().strftime("%Y-%m-%d_%H-%M-%S")
+            _mp_slug = selected_mp.replace(" ", "_") if selected_mp else "export"
+            _auto_fname = f"{_base_name}_model.xlsx"
+            _save_path = _exports_dir / f"{_ts}_{_mp_slug}_{_auto_fname}"
+            _save_path.write_bytes(_auto_bytes)
+
+            st.markdown("---")
+            st.download_button(
+                f"⬇️ Descarcă {_auto_fname}",
+                data=_auto_bytes,
+                file_name=_auto_fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+            st.caption(f"💾 Salvat automat în: `{_save_path}`")
+        except Exception as _e:
+            st.warning(f"⚠️ Auto-save eșuat: {_e}")
+            st.info("Mergi la **📊 Results** pentru a descărca fișierul.")
