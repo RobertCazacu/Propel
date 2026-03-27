@@ -138,22 +138,49 @@ def _done_key(title: str, category: str, marketplace: str = "") -> str:
     return hashlib.md5(f"done|{marketplace}|{title.strip().lower()}|{category}".encode()).hexdigest()
 
 
-_MAX_AI_RETRIES = 2
+_MAX_AI_RETRIES = 4
+_RATE_LIMIT_BASE_SLEEP = 10  # secunde — backoff initial pentru 429
 
 
 def _complete_with_retry(prompt: str, max_tok: int, system: str, temperature: float) -> str:
-    """Calls router.complete with up to _MAX_AI_RETRIES retries on transient errors."""
+    """Calls router.complete with up to _MAX_AI_RETRIES retries.
+
+    Handling:
+    - 429 RateLimitError → exponential backoff (10s, 20s, 40s, 80s)
+    - TimeoutError / ConnectionError → retry imediat (max 2×)
+    """
     router = get_router()
     last_exc: Exception = Exception("unknown")
+    rate_sleep = _RATE_LIMIT_BASE_SLEEP
+
     for attempt in range(_MAX_AI_RETRIES + 1):
         try:
             return router.complete(prompt, max_tok, system=system, temperature=temperature)
-        except (TimeoutError, ConnectionError) as exc:
+        except Exception as exc:
             last_exc = exc
-            if attempt < _MAX_AI_RETRIES:
+            exc_str = str(type(exc).__name__)
+            is_rate_limit = (
+                "RateLimitError" in exc_str
+                or "rate_limit" in str(exc).lower()
+                or "429" in str(exc)
+                or "overloaded" in str(exc).lower()
+            )
+            if is_rate_limit and attempt < _MAX_AI_RETRIES:
+                # Jitter: ±50% din sleep pentru a evita thundering herd cu workeri paraleli
+                jitter = random.uniform(0, rate_sleep * 0.5)
+                actual_sleep = rate_sleep + jitter
+                log.warning(
+                    "Rate limit API (attempt %d/%d) — backoff %.0fs...",
+                    attempt + 1, _MAX_AI_RETRIES + 1, actual_sleep,
+                )
+                time.sleep(actual_sleep)
+                rate_sleep = min(rate_sleep * 2, 120)  # max 2 minute sleep
+            elif isinstance(exc, (TimeoutError, ConnectionError)) and attempt < _MAX_AI_RETRIES:
                 log.warning("AI call failed (attempt %d/%d): %s — retrying...",
                             attempt + 1, _MAX_AI_RETRIES + 1, exc)
-                time.sleep(1)
+                time.sleep(2)
+            else:
+                raise
     raise last_exc
 
 
@@ -286,6 +313,22 @@ def _process_batch(batch: list[dict], category_list: list[str],
     rejected = 0
     t_start = time.perf_counter()
     router = get_router()
+
+    # Index normalizat pentru match rapid (lowercase strip) — util pt. categorii non-ASCII (BG, HU)
+    import difflib as _difflib
+    _cat_norm_index = {c.strip().lower(): c for c in category_list}
+
+    def _match_category(ai_cat: str):
+        """Incearca match exact → normalizat → fuzzy. Returneaza categoria din lista sau None."""
+        if ai_cat in category_list:
+            return ai_cat
+        norm_key = ai_cat.strip().lower()
+        if norm_key in _cat_norm_index:
+            return _cat_norm_index[norm_key]
+        # Fuzzy fallback (cutoff 0.88 — previne false positives)
+        close = _difflib.get_close_matches(ai_cat, category_list, n=1, cutoff=0.88)
+        return close[0] if close else None
+
     try:
         raw = _complete_with_retry(prompt, max_tok, system_prompt, 0.2)
         duration_ms = round((time.perf_counter() - t_start) * 1000)
@@ -296,11 +339,14 @@ def _process_batch(batch: list[dict], category_list: list[str],
 
         for i, prod in enumerate(batch, 1):
             pid = prod["id"]
-            cat = suggested.get(str(i))
-            if cat and cat in category_list:
-                batch_results[pid] = cat
+            ai_cat = suggested.get(str(i))
+            matched_cat = _match_category(ai_cat) if ai_cat else None
+            if matched_cat:
+                if matched_cat != ai_cat:
+                    log.debug("AI batch categorie fuzzy-matched %r → %r (prod %s)", ai_cat, matched_cat, pid)
+                batch_results[pid] = matched_cat
                 accepted += 1
-                cache["category_map"][_title_key(prod["title"], marketplace)] = cat
+                cache["category_map"][_title_key(prod["title"], marketplace)] = matched_cat
                 # Auto-invata regula
                 title_base = prod["title"].rsplit(" - ", 1)[0].strip()
                 words = [w.lower() for w in re.split(r"[\s\-]+", title_base)
@@ -314,13 +360,13 @@ def _process_batch(batch: list[dict], category_list: list[str],
                     cache["learned_title_rules"].append({
                         "keywords": kw_string,
                         "exclude": "",
-                        "category": cat,
+                        "category": matched_cat,
                     })
             else:
-                if cat:
+                if ai_cat:
                     log.warning(
                         "AI a sugerat categorie invalida %r pentru prod %s (%r)",
-                        cat, pid, prod["title"][:60],
+                        ai_cat, pid, prod["title"][:60],
                     )
                 batch_results[pid] = None
                 rejected += 1
@@ -395,7 +441,7 @@ def suggest_categories_batch(
 
     if status_callback:
         status_callback(
-            f"AI categorii: se procesează {len(chunks)} batch-uri în paralel (5 simultan)..."
+            f"AI categorii: se procesează {len(chunks)} batch-uri în paralel (2 simultan)..."
         )
 
     def _run_chunk(args):
@@ -405,7 +451,8 @@ def suggest_categories_batch(
         batch_res = _process_batch(chunk, category_list, marketplace, local_cache)
         return chunk_idx, batch_res, local_cache
 
-    max_workers = min(5, len(chunks))
+    # 2 workeri paraleli (redus de la 5) — evita thundering herd pe rate limit
+    max_workers = min(2, len(chunks))
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(_run_chunk, (i, chunk)): i for i, chunk in enumerate(chunks)}
         for future in as_completed(futures):
