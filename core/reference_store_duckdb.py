@@ -9,6 +9,7 @@ Marketplace-uri active: eMAG HU, Allegro.
 import json
 import re
 import uuid
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -17,6 +18,9 @@ import duckdb
 import pandas as pd
 
 from core.app_logger import get_logger
+
+# Lock global — serializes all write connections on Windows (single-writer constraint)
+_WRITE_LOCK = threading.Lock()
 
 log = get_logger("marketplace.duckdb")
 
@@ -113,7 +117,7 @@ _DDL_STATEMENTS = [
         ean               VARCHAR,
         brand             VARCHAR,
         normalized_title  VARCHAR NOT NULL,
-        marketplace       VARCHAR NOT NULL,
+        marketplace_id    VARCHAR NOT NULL,
         offer_id          VARCHAR NOT NULL,
         category          VARCHAR NOT NULL,
         final_attributes  VARCHAR NOT NULL,
@@ -122,14 +126,6 @@ _DDL_STATEMENTS = [
         created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
-    """,
-    """
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_ean
-        ON product_knowledge(ean)
-    """,
-    """
-    CREATE INDEX IF NOT EXISTS idx_pk_brand_title
-        ON product_knowledge(brand, normalized_title)
     """,
     """
     CREATE TABLE IF NOT EXISTS ai_run_log (
@@ -173,6 +169,23 @@ _MIGRATIONS = [
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS structured_model_used VARCHAR DEFAULT ''",
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS schema_fields_count INTEGER DEFAULT 0",
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS shadow_diff JSON DEFAULT NULL",
+    # product_knowledge: migrate marketplace column → marketplace_id + compound unique key
+    "DROP INDEX IF EXISTS idx_pk_ean",
+    "DROP INDEX IF EXISTS idx_pk_brand_title",
+    "ALTER TABLE product_knowledge RENAME COLUMN marketplace TO marketplace_id",
+    # Normalise existing records: convert display names to slugs
+    "UPDATE product_knowledge SET marketplace_id = 'emag_hu' WHERE marketplace_id = 'eMAG HU'",
+    "UPDATE product_knowledge SET marketplace_id = 'allegro' WHERE marketplace_id = 'Allegro'",
+    "UPDATE product_knowledge SET marketplace_id = 'emag_romania' WHERE marketplace_id = 'eMAG Romania'",
+    "UPDATE product_knowledge SET marketplace_id = 'trendyol' WHERE marketplace_id = 'Trendyol'",
+    "UPDATE product_knowledge SET marketplace_id = 'fashiondays' WHERE marketplace_id = 'FashionDays'",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_pk_ean_mp ON product_knowledge(ean, marketplace_id)",
+    "CREATE INDEX IF NOT EXISTS idx_pk_brand_title_mp ON product_knowledge(brand, normalized_title, marketplace_id)",
+    # Vision fusion telemetry (added in prompt-pipeline-v2)
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS vision_signal VARCHAR DEFAULT NULL",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS vision_confidence DOUBLE DEFAULT NULL",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS fusion_action VARCHAR DEFAULT NULL",
+    "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS conflict_flag BOOLEAN DEFAULT FALSE",
 ]
 
 _UPSERT_MARKETPLACE = """
@@ -870,7 +883,7 @@ def upsert_product_knowledge(
     ean: str | None,
     brand: str,
     normalized_title: str,
-    marketplace: str,
+    marketplace_id: str,
     offer_id: str,
     category: str,
     final_attributes: dict,
@@ -879,46 +892,47 @@ def upsert_product_knowledge(
 ) -> None:
     """Insert sau update în product_knowledge.
 
-    Cheia de matching: EAN (dacă există) sau brand+normalized_title.
+    Cheia de matching: (EAN, marketplace_id) dacă EAN există, altfel brand+normalized_title+marketplace_id.
     DOAR valorile validate (care au trecut char_validator) trebuie salvate.
     """
     attrs_json = json.dumps(final_attributes, ensure_ascii=False)
-    con = duckdb.connect(str(DB_PATH))
-    try:
-        if ean:
-            con.execute("""
-                INSERT INTO product_knowledge
-                    (ean, brand, normalized_title, marketplace, offer_id,
-                     category, final_attributes, confidence, run_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT (ean) DO UPDATE SET
-                    brand             = excluded.brand,
-                    normalized_title  = excluded.normalized_title,
-                    marketplace       = excluded.marketplace,
-                    offer_id          = excluded.offer_id,
-                    category          = excluded.category,
-                    final_attributes  = excluded.final_attributes,
-                    confidence        = excluded.confidence,
-                    run_id            = excluded.run_id,
-                    updated_at        = now()
-            """, [ean, brand, normalized_title, marketplace, offer_id,
-                  category, attrs_json, confidence, run_id])
-        else:
-            con.execute("""
-                DELETE FROM product_knowledge
-                WHERE ean IS NULL
-                  AND brand = ?
-                  AND normalized_title = ?
-            """, [brand, normalized_title])
-            con.execute("""
-                INSERT INTO product_knowledge
-                    (ean, brand, normalized_title, marketplace, offer_id,
-                     category, final_attributes, confidence, run_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, [None, brand, normalized_title, marketplace, offer_id,
-                  category, attrs_json, confidence, run_id])
-    finally:
-        con.close()
+    with _WRITE_LOCK:
+        con = duckdb.connect(str(DB_PATH))
+        try:
+            if ean:
+                con.execute("""
+                    INSERT INTO product_knowledge
+                        (ean, brand, normalized_title, marketplace_id, offer_id,
+                         category, final_attributes, confidence, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (ean, marketplace_id) DO UPDATE SET
+                        brand             = excluded.brand,
+                        normalized_title  = excluded.normalized_title,
+                        offer_id          = excluded.offer_id,
+                        category          = excluded.category,
+                        final_attributes  = excluded.final_attributes,
+                        confidence        = excluded.confidence,
+                        run_id            = excluded.run_id,
+                        updated_at        = now()
+                """, [ean, brand, normalized_title, marketplace_id, offer_id,
+                      category, attrs_json, confidence, run_id])
+            else:
+                con.execute("""
+                    DELETE FROM product_knowledge
+                    WHERE ean IS NULL
+                      AND brand = ?
+                      AND normalized_title = ?
+                      AND marketplace_id = ?
+                """, [brand, normalized_title, marketplace_id])
+                con.execute("""
+                    INSERT INTO product_knowledge
+                        (ean, brand, normalized_title, marketplace_id, offer_id,
+                         category, final_attributes, confidence, run_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, [None, brand, normalized_title, marketplace_id, offer_id,
+                      category, attrs_json, confidence, run_id])
+        finally:
+            con.close()
 
 
 def get_product_knowledge(
@@ -926,35 +940,36 @@ def get_product_knowledge(
     ean: str | None = None,
     brand: str | None = None,
     normalized_title: str | None = None,
+    marketplace_id: str | None = None,
 ) -> dict | None:
-    """Caută în knowledge store. Prioritate: EAN > brand+title.
+    """Caută în knowledge store. Prioritate: (EAN, marketplace_id) > brand+title+marketplace_id.
 
     Returnează dict cu toate câmpurile sau None dacă nu există.
     final_attributes este deja decodat ca dict.
     """
     con = duckdb.connect(str(DB_PATH), read_only=True)
     try:
-        if ean:
+        if ean and marketplace_id:
             row = con.execute("""
-                SELECT ean, brand, normalized_title, marketplace, offer_id,
+                SELECT ean, brand, normalized_title, marketplace_id, offer_id,
                        category, final_attributes, confidence, run_id, updated_at
-                FROM product_knowledge WHERE ean = ? LIMIT 1
-            """, [ean]).fetchone()
-        elif brand and normalized_title:
+                FROM product_knowledge WHERE ean = ? AND marketplace_id = ? LIMIT 1
+            """, [ean, marketplace_id]).fetchone()
+        elif brand and normalized_title and marketplace_id:
             row = con.execute("""
-                SELECT ean, brand, normalized_title, marketplace, offer_id,
+                SELECT ean, brand, normalized_title, marketplace_id, offer_id,
                        category, final_attributes, confidence, run_id, updated_at
                 FROM product_knowledge
-                WHERE ean IS NULL AND brand = ? AND normalized_title = ?
+                WHERE ean IS NULL AND brand = ? AND normalized_title = ? AND marketplace_id = ?
                 LIMIT 1
-            """, [brand, normalized_title]).fetchone()
+            """, [brand, normalized_title, marketplace_id]).fetchone()
         else:
             return None
 
         if row is None:
             return None
 
-        cols = ["ean", "brand", "normalized_title", "marketplace", "offer_id",
+        cols = ["ean", "brand", "normalized_title", "marketplace_id", "offer_id",
                 "category", "final_attributes", "confidence", "run_id", "updated_at"]
         result = dict(zip(cols, row))
         result["final_attributes"] = json.loads(result["final_attributes"])

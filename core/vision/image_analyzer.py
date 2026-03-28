@@ -26,7 +26,7 @@ from core.vision.color_analyzer import (
     analyze_colors, ColorResult, find_multicolor_value, pick_best_accepted_color,
     _rgb_to_family,
 )
-from core.vision.visual_rules import get_category_rules, load_rules, ensure_rules_file
+from core.vision.visual_rules import get_category_rules, load_rules, ensure_rules_file, is_vision_eligible
 
 log = get_logger("marketplace.vision.analyzer")
 
@@ -65,6 +65,10 @@ class ImageAnalysisResult:
     product_type_confidence: float  = 0.0
     used_for_category_support: bool = False
 
+    # Structured vision extraction (cloud only, feature-flagged)
+    vision_extracted_attrs: dict = field(default_factory=dict)   # validated attrs from cloud
+    vision_extraction_error: str = ""
+
     # Output
     suggested_attributes: dict  = field(default_factory=dict)
     used_for_attribute_fill: bool = False
@@ -97,6 +101,8 @@ class ImageAnalysisResult:
             "product_type_confidence":    self.product_type_confidence,
             "used_for_category_support":  self.used_for_category_support,
             "used_for_attribute_fill":    self.used_for_attribute_fill,
+            "vision_extracted_attrs":     self.vision_extracted_attrs,
+            "vision_extraction_error":    self.vision_extraction_error,
             "suggested_attributes":       self.suggested_attributes,
             "needs_review":               self.needs_review,
             "review_reason":              self.review_reason,
@@ -168,6 +174,11 @@ def analyze_product_image(
     suggestion_only: bool = False,
     save_debug: bool = False,
     run_logger=None,           # VisionRunLogger | None
+    # ── Structured vision extraction (cloud only, off by default) ─────────────
+    enable_structured_vision: bool = False,   # feature flag — default OFF
+    cloud_vision_provider=None,               # OpenAIVisionProvider | None
+    data=None,                                # MarketplaceData | None
+    cat_id=None,                              # category id for validation
 ) -> ImageAnalysisResult:
     """
     Main entry point for image-based attribute extraction.
@@ -189,7 +200,7 @@ def analyze_product_image(
             run_logger.inc("skipped")
         return result
 
-    any_enabled = enable_color or enable_product_hint or enable_yolo or enable_clip
+    any_enabled = enable_color or enable_product_hint or enable_yolo or enable_clip or enable_structured_vision
     if not any_enabled:
         result.skipped_reason = "Image analysis disabled"
         log.debug("[Vision] Skip — analiza dezactivata offer=%s", offer_id)
@@ -212,6 +223,7 @@ def analyze_product_image(
     min_prod_conf        = cat_rules.get("min_product_confidence", 0.65)
     effective_yolo_conf  = cat_rules.get("min_yolo_confidence", yolo_conf)
     effective_clip_conf  = cat_rules.get("min_clip_confidence", clip_conf)
+    effective_yolo_allowlist = cat_rules.get("yolo_label_allowlist", [])
     effective_suggestion = suggestion_only or cat_rules.get("suggestion_only", False)
 
     if run_logger:
@@ -222,6 +234,7 @@ def analyze_product_image(
                 "category": category, "marketplace": marketplace,
                 "enable_color": enable_color, "enable_yolo": enable_yolo,
                 "enable_clip": enable_clip, "enable_product_hint": enable_product_hint,
+                "enable_structured_vision": enable_structured_vision,
                 "yolo_model": yolo_model, "clip_model": clip_model,
                 "yolo_conf": effective_yolo_conf, "clip_conf": effective_clip_conf,
                 "suggestion_only": effective_suggestion, "save_debug": save_debug,
@@ -269,6 +282,7 @@ def analyze_product_image(
 
             yolo_res = detect_objects(
                 img, model_name=yolo_model, conf_threshold=effective_yolo_conf,
+                label_allowlist=effective_yolo_allowlist or None,
                 run_logger=run_logger, offer_id=offer_id, image_url=image_url,
             )
             result.yolo_fallback_used = yolo_res.fallback_used
@@ -385,6 +399,88 @@ def analyze_product_image(
             log.error("[Vision] CLIP error offer=%s: %s", offer_id, e, exc_info=True)
             if run_logger:
                 run_logger.log("clip", "exception", offer_id=offer_id,
+                               image_url=image_url, status="error", level="ERROR",
+                               data={"error": str(e)[:300]})
+
+    # ── Structured cloud vision extraction (feature-flagged, off by default) ──
+    if enable_structured_vision and cloud_vision_provider is not None and data is not None and cat_id is not None:
+        try:
+            from core.vision.vision_attr_extractor import extract_attrs_cloud
+            from core.vision.fusion_attrs import fuse_all_attributes
+
+            rules_for_fusion = load_rules()
+
+            # Build eligible_attrs: {char_name: set_of_valid_values} for vision-eligible only
+            all_chars_for_cat = data.valid_values_all(cat_id) if hasattr(data, "valid_values_all") else {}
+            eligible_attrs = {
+                ch: vals
+                for ch, vals in all_chars_for_cat.items()
+                if is_vision_eligible(ch, rules_for_fusion)
+            }
+
+            if eligible_attrs:
+                t_vis = time.perf_counter()
+                vis_result = extract_attrs_cloud(
+                    img=working_img,
+                    category=category,
+                    marketplace=marketplace,
+                    eligible_attrs=eligible_attrs,
+                    existing_chars=existing_chars,
+                    data=data,
+                    cat_id=cat_id,
+                    vision_provider=cloud_vision_provider,
+                    yolo_label=result.detected_object,
+                    clip_label=result.clip_best_label,
+                )
+                vis_ms = round((time.perf_counter() - t_vis) * 1000)
+                result.vision_extracted_attrs = vis_result.extracted_attrs
+                if vis_result.error:
+                    result.vision_extraction_error = vis_result.error
+
+                if vis_result.success and vis_result.extracted_attrs:
+                    # Build vision_attrs signal dict for fusion
+                    vision_signals = {
+                        ch: (val, 0.80, "vision_llm_cloud")
+                        for ch, val in vis_result.extracted_attrs.items()
+                    }
+                    fusion_results = fuse_all_attributes(
+                        text_chars=existing_chars,
+                        vision_attrs=vision_signals,
+                        rules=rules_for_fusion,
+                        data=data,
+                        cat_id=cat_id,
+                    )
+                    for ch, fr in fusion_results.items():
+                        if fr.action == "use_vision" and fr.final_value:
+                            result.suggested_attributes[ch] = fr.final_value
+                            result.used_for_attribute_fill = True
+                        elif fr.action == "conflict_review":
+                            result.needs_review = True
+                            result.review_reason = (
+                                (result.review_reason + " | " if result.review_reason else "")
+                                + fr.reason
+                            )
+
+                if run_logger:
+                    run_logger.log(
+                        "structured_vision", "extraction_done",
+                        offer_id=offer_id, image_url=image_url,
+                        status="ok" if vis_result.success else "error",
+                        duration_ms=vis_ms, level="INFO" if vis_result.success else "WARNING",
+                        data={
+                            "provider": vis_result.provider_used,
+                            "attrs_requested": vis_result.attrs_requested,
+                            "attrs_accepted": vis_result.attrs_accepted,
+                            "extracted": vis_result.extracted_attrs,
+                            "error": vis_result.error or None,
+                        },
+                    )
+
+        except Exception as e:
+            log.error("[Vision] Structured extraction error offer=%s: %s", offer_id, e, exc_info=True)
+            result.vision_extraction_error = str(e)[:200]
+            if run_logger:
+                run_logger.log("structured_vision", "exception", offer_id=offer_id,
                                image_url=image_url, status="error", level="ERROR",
                                data={"error": str(e)[:300]})
 

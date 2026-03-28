@@ -20,7 +20,7 @@ from pathlib import Path
 from core.app_logger import get_logger
 from core.llm_router import get_router
 from core.ai_logger import log_category_batch, log_char_enrichment, write_run_to_duckdb
-from core.reference_store_duckdb import get_product_knowledge, upsert_product_knowledge
+from core.reference_store_duckdb import get_product_knowledge, upsert_product_knowledge, marketplace_id_slug
 from core.schema_builder import SchemaBuilder, build_json_schema
 
 
@@ -232,35 +232,89 @@ _MP_ALIASES: list[tuple[list[str], str]] = [
 
 
 def _build_char_system_prompt(marketplace: str) -> str:
-    """Prompt de sistem static pentru enrichment caracteristici — nu conține date de produs."""
+    """Prompt de sistem static pentru enrichment caracteristici.
+
+    Înlocuiește vechiul prompt cu _reasoning (tokeni irosiți).
+    Noul câmp _src capturează semnalul cheie folosit — util pentru audit log.
+    """
     return (
-        f"Ești un expert în clasificarea produselor pe marketplace-uri.\n"
-        f"Marketplace activ: {_mp_ctx(marketplace)}\n\n"
-        "REGULI STRICTE:\n"
-        "1. Răspunde EXCLUSIV cu JSON valid: {\"Nume caracteristica\": \"valoare\", ...}\n"
-        "2. Primul câmp TREBUIE să fie \"_reasoning\": o propoziție scurtă care explică alegerile.\n"
-        "3. Pentru câmpuri cu listă de valori: folosești EXACT o valoare din lista permisă.\n"
-        "4. Pentru câmpuri libere: folosești valorile în limba locală a marketplace-ului.\n"
-        "5. Câmpurile marcate [OBLIGATORIU] se completează cu prioritate maximă.\n"
-        "6. Dacă nu poți determina o valoare, omite acea caracteristică.\n"
-        "7. Zero text în afara JSON-ului. Fără markdown, fără explicații extra."
+        f"Ești un expert în catalogul de produse pentru marketplace-uri.\n"
+        f"Marketplace: {_mp_ctx(marketplace)}\n\n"
+
+        "MISIUNEA TA: completează caracteristicile lipsă extragând informații din semnalele "
+        "produsului (titlu, brand, descriere, metadata).\n\n"
+
+        "FORMAT RĂSPUNS — JSON strict, fără text în afara lui:\n"
+        '{"_src": "<semnal cheie>", "Caracteristica": "valoare", ...}\n'
+        "  _src = semnalul principal folosit, ex: \"titlu:Dri-FIT→Poliester\" sau \"brand:Nike→Alergare\"\n\n"
+
+        "REGULI (în ordinea asta):\n"
+        "R1. Câmpuri marcate [OBLIGATORIU] → completezi cu prioritate maximă, indiferent de dificultate.\n"
+        "R2. Câmpuri cu listă de valori → copiezi EXACT o valoare din lista dată "
+        "(respecti majuscule, diacritice, spații).\n"
+        "R3. Câmpuri freeform (fără listă) → valoarea în limba marketplace-ului, concisă.\n"
+        "R4. Brand knowledge: Nike/Adidas/Puma=sport, Dri-FIT/Climalite/Climacool=Poliester, "
+        "Fleece/Polar=Fleece, Jordan=Baschet, Air Max/React/Zoom=pantofi alergare, "
+        "Merino=Lana, DWR=rezistent apa.\n"
+        "R5. Dacă nu poți determina cu certitudine → OMITE câmpul (nu ghici).\n"
+        "R6. Nu inventa valori în afara listei pentru câmpuri restrictive.\n"
+        "R7. Zero text în afara JSON-ului. Fără markdown, fără explicații.\n\n"
+
+        "IERARHIA SEMNALELOR (cel mai fiabil primul):\n"
+        "  1. Titlu produs\n"
+        "  2. Brand + model cunoscut\n"
+        "  3. Descriere\n"
+        "  4. Metadata (EAN, greutate, garanție)\n"
+        "  5. Date cross-marketplace (la finalul promptului dacă există)"
     )
 
 
 def _build_batch_system_prompt(marketplace: str, category_list: list[str]) -> str:
-    """Prompt de sistem static pentru clasificare batch categorii."""
-    cats_list = "\n".join(category_list)
+    """Prompt de sistem pentru clasificare batch categorii.
+
+    Îmbunătățiri față de v1:
+    - Few-shot examples pentru ancorare comportament
+    - Reguli disambiguation pentru titluri ambigue
+    - Keywords gen în 5 limbi (RO/HU/BG/PL/EN)
+    """
+    cats_list = "\n".join(f"  {c}" for c in category_list)
+    mp_ctx = _mp_ctx(marketplace)
+
     return (
-        f"Ești un expert în clasificarea produselor pe marketplace-uri.\n"
-        f"Marketplace activ: {_mp_ctx(marketplace)}\n\n"
-        "CATEGORII DISPONIBILE (copiază EXACT, fără modificări):\n"
+        f"Ești un expert în catalogul de produse pentru marketplace-uri.\n"
+        f"Marketplace: {mp_ctx}\n\n"
+
+        "CATEGORII DISPONIBILE:\n"
         f"{cats_list}\n\n"
-        "REGULI STRICTE:\n"
-        "1. Răspunde EXCLUSIV cu JSON: {\"1\":\"Categorie\",\"2\":\"Categorie\",...}\n"
-        "2. Copiezi EXACT numele categoriei din lista de mai sus.\n"
-        "3. Titlurile produselor pot fi în orice limbă — clasifici după tipul produsului, nu după limbă.\n"
-        "4. Dacă nicio categorie nu se potrivește, pui null pentru acel produs.\n"
-        "5. Zero text în afara JSON-ului."
+
+        "REGULĂ UNICĂ — răspunzi EXCLUSIV cu JSON:\n"
+        '{"1": "Categorie exacta", "2": "Categorie exacta", "3": null, ...}\n\n'
+
+        "REGULI:\n"
+        "1. Copiezi EXACT numele categoriei din lista de mai sus (majuscule, diacritice).\n"
+        "2. Titlul poate fi în orice limbă — clasifici după TIPUL produsului, nu după limbă.\n"
+        "3. Categorie ambiguă (gen neclar) → alege genul indicat în titlu; dacă lipsește → bărbați.\n"
+        "4. Nicio categorie potrivită → null.\n"
+        "5. Zero text în afara JSON-ului.\n\n"
+
+        "SEMNALE GEN:\n"
+        "  Bărbați: men, barbati, férfi, мъже, mężczyźni, homme, masculin, herren\n"
+        "  Femei: women, femei, női, жени, kobiety, femme, femenino, damen\n"
+        "  Copii: kids, copii, gyerek, деца, dzieci, enfants, kinder, junior\n\n"
+
+        "SEMNALE TIP PRODUS:\n"
+        "  hoodie/sweatshirt → hanorac | jacket/geaca → geaca\n"
+        "  tights/leggings/colanti → colanti | shorts/sort → pantaloni scurti\n"
+        "  sneakers/shoes/pantofi → pantofi | t-shirt/tricou/tee → tricou\n"
+        "  backpack/rucsac → rucsacuri | cap/sapca/hat → sapca\n\n"
+
+        "EXEMPLE:\n"
+        '  "Nike Dri-FIT T-Shirt Men" → Tricouri sport barbati\n'
+        '  "Adidas Essentials Hoodie Femei" → Hanorace sport femei\n'
+        '  "Jordan Sneakers Kids" → Pantofi sport copii\n'
+        '  "Rucsac Nike 20L" → Rucsacuri sport\n'
+        '  "Minge fotbal Adidas" → Mingi fotbal\n'
+        '  "Sosete Nike 3-pack" → Sosete sport'
     )
 
 
@@ -490,31 +544,20 @@ def _build_prompt(title: str, description: str, category: str,
     """
     Construiește promptul pentru AI enrichment.
 
-    mandatory_set: set de display-names (cu ":" deja stripuit) ale câmpurilor obligatorii.
-    product_meta: câmpuri extra din fișierul de oferte (ean, sku, weight, warranty, brand).
+    Îmbunătățiri față de v1:
+    - Descriere 700 chars (era 400)
+    - 20 câmpuri max (era 15), 25 valori (era 20)
+    - Obligatorii garantat primele
+    - existing_chars condensat (key="val" nu JSON întreg)
+    - Instrucțiune finală clară
     """
     mandatory_set = mandatory_set or set()
     meta = product_meta or {}
 
-    # Separa campurile cu lista de valori de cele freeform; obligatorii primele
-    options_lines = []
-    freeform_lines = []
-    for ch_name, values in list(char_options.items())[:15]:
-        req = " [OBLIGATORIU]" if ch_name in mandatory_set else ""
-        if values:
-            options_lines.append(
-                f'  "{ch_name}"{req}: {json.dumps(sorted(values)[:20], ensure_ascii=False)}'
-            )
-        else:
-            freeform_lines.append(f'  "{ch_name}"{req}')
-
-    # Curăță descrierea: elimină HTML rezidual, colapsează whitespace, trunchiază
-    desc_clean = re.sub(r"<[^>]+>", " ", description or "")
-    desc_clean = re.sub(r"\s+", " ", desc_clean).strip()[:400]
-
     # Brand: prioritate meta > existing chars
     brand = (
-        str(meta["brand"]).strip() if meta.get("brand") and str(meta["brand"]).strip() not in ("", "nan")
+        str(meta["brand"]).strip()
+        if meta.get("brand") and str(meta["brand"]).strip() not in ("", "nan")
         else next(
             (str(v).strip() for k, v in existing.items()
              if k.lower().rstrip(":").strip() in _BRAND_KEYS and v and str(v).strip()),
@@ -522,38 +565,73 @@ def _build_prompt(title: str, description: str, category: str,
         )
     )
 
-    # Filtrează cheile interne (prefixate cu "_") din afișarea existing
-    existing_display = {k: v for k, v in existing.items() if not k.startswith("_")}
+    # Descriere curățată — 700 chars (era 400)
+    desc_clean = re.sub(r"<[^>]+>", " ", description or "")
+    desc_clean = re.sub(r"\s+", " ", desc_clean).strip()[:700]
 
-    prompt = f"Marketplace: {_mp_ctx(marketplace)}\n"
-    prompt += f"Produs: {title}\n"
+    # Existing: doar cheile cu valori, fără chei interne "_"
+    existing_display = {k: v for k, v in existing.items()
+                        if not k.startswith("_") and v}
+
+    # Câmpuri: obligatorii primele, opționale la final
+    # Max: 12 obligatorii + 8 opționale = 20 total (era 15 fără ordine garantată)
+    mandatory_lines = []
+    optional_lines = []
+
+    for ch_name, values in char_options.items():
+        req_tag = " [OBLIGATORIU]" if ch_name in mandatory_set else ""
+        if values:
+            vals_sample = json.dumps(sorted(values)[:25], ensure_ascii=False)
+            line = f'  "{ch_name}"{req_tag}: {vals_sample}'
+        else:
+            line = f'  "{ch_name}"{req_tag}: <text liber>'
+
+        if ch_name in mandatory_set:
+            mandatory_lines.append(line)
+        else:
+            optional_lines.append(line)
+
+    all_lines = mandatory_lines[:12] + optional_lines[:8]
+
+    # Construiește prompt-ul
+    parts = [f"PRODUS: {title}"]
+
     if brand:
-        prompt += f"Brand: {brand}\n"
-    # Extra metadata signals for the model
-    for meta_key, label in (("ean", "EAN"), ("sku", "SKU"), ("weight", "Greutate"), ("warranty", "Garanție")):
-        val = meta.get(meta_key)
+        parts.append(f"BRAND: {brand}")
+
+    # Metadata pe un rând (economie de tokeni)
+    meta_parts = []
+    for key, label in (("ean", "EAN"), ("sku", "SKU"),
+                       ("weight", "Greutate(g)"), ("warranty", "Garantie")):
+        val = meta.get(key)
         if val and str(val).strip() not in ("", "nan"):
-            prompt += f"{label}: {str(val).strip()}\n"
-    prompt += (
-        f"Categorie: {category}\n"
-        f"Descriere: {desc_clean}\n"
-        f"Completate deja: {json.dumps(existing_display, ensure_ascii=False)}\n\n"
+            meta_parts.append(f"{label}:{str(val).strip()}")
+    if meta_parts:
+        parts.append("META: " + " | ".join(meta_parts))
+
+    parts.append(f"CATEGORIE: {category}")
+
+    if desc_clean:
+        parts.append(f"DESCRIERE: {desc_clean}")
+
+    if existing_display:
+        # Condensat: key="val" în loc de JSON întreg
+        filled = ", ".join(
+            f'{k}="{v}"' for k, v in list(existing_display.items())[:8]
+        )
+        parts.append(f"COMPLETATE DEJA: {filled}")
+
+    parts.append("")
+    parts.append("CAMPURI DE COMPLETAT:")
+    parts.extend(all_lines)
+    parts.append("")
+    parts.append(
+        "Completează în JSON. Obligatorii mai întâi. "
+        "Valori EXACTE din lista pentru câmpuri restrictive. "
+        "Omite câmpul dacă nu ești sigur."
     )
 
-    if options_lines:
-        prompt += (
-            "Completeaza caracteristicile urmatoare alegand EXACT o valoare din lista permisa:\n"
-            + "\n".join(options_lines) + "\n\n"
-        )
-
-    if freeform_lines:
-        prompt += (
-            "Completeaza si aceste campuri libere (orice valoare potrivita, ex: '41 EU', culoare, material):\n"
-            + "\n".join(freeform_lines) + "\n\n"
-        )
-
-    prompt += 'Completează caracteristicile lipsă. Câmpurile marcate [OBLIGATORIU] au prioritate maximă.'
-    return prompt
+    return "\n".join(parts)
 
 
 def _parse_json(text: str) -> dict:
@@ -634,7 +712,8 @@ def enrich_with_ai(
 
     # ── Knowledge store lookup ──────────────────────────────────────────────────
     _norm_title = _normalize_title(title)
-    _known = get_product_knowledge(ean=ean, brand=brand, normalized_title=_norm_title) if (ean or brand) else None
+    _mp_id = marketplace_id_slug(marketplace) if marketplace else ""
+    _known = get_product_knowledge(ean=ean, brand=brand, normalized_title=_norm_title, marketplace_id=_mp_id) if (ean or brand) and _mp_id else None
     _known_attrs = _known["final_attributes"] if _known else {}
 
     if _known_attrs:
@@ -798,7 +877,7 @@ def enrich_with_ai(
                         ean=ean,
                         brand=brand or "",
                         normalized_title=_norm_title,
-                        marketplace=marketplace,
+                        marketplace_id=_mp_id,
                         offer_id=str(existing.get("_offer_id", "")),
                         category=str(category),
                         final_attributes=validated,

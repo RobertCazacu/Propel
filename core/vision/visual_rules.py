@@ -50,7 +50,20 @@ DEFAULT_RULES: dict = {
 
         # ── YOLO settings ────────────────────────────────────────────────────
         # Minimum YOLO detection confidence to accept a detection
-        "min_yolo_confidence": 0.35,
+        "min_yolo_confidence": 0.50,
+
+        # Only accept YOLO detections whose label is in this list.
+        # Empty list = no filtering (accept all COCO labels).
+        # Default excludes sport-equipment labels (surfboard, skateboard…)
+        # that frequently fire as false positives on clothing/footwear images.
+        "yolo_label_allowlist": [
+            "person", "backpack", "handbag", "suitcase", "tie", "umbrella",
+            "chair", "couch", "bed", "dining table", "potted plant",
+            "clock", "vase", "teddy bear",
+            "cell phone", "laptop", "keyboard", "tv", "remote",
+            "bottle", "cup", "bowl", "book", "scissors",
+            "toothbrush", "hair drier",
+        ],
 
         # ── CLIP settings ────────────────────────────────────────────────────
         # Minimum CLIP score to trust a label as valid
@@ -83,6 +96,113 @@ DEFAULT_RULES: dict = {
 
         # If True: automatically enable color detection when mandatory color char is missing
         "auto_enable_color_if_mandatory": True,
+
+        # ── Attribute fusion policy ──────────────────────────────────────────
+        # Per-attribute rules for text vs vision fusion.
+        # vision_eligible: False = skip vision entirely for this attribute
+        # override_text_if_filled: ALWAYS False (conservative default)
+        # min_vision_confidence: external threshold (NOT model-reported confidence)
+        #   Primary gate = data.find_valid(). This is a soft pre-filter only.
+        # conflict_action: "prefer_text" | "review"
+        # allowed_sources: which vision extraction methods can fill this attr
+        "attribute_fusion_policy": {
+            # ── Color fields (all marketplaces) ──────────────────────────────
+            "Culoare de baza": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.60,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["color_algorithm"],
+            },
+            "Culoare:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.60,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["color_algorithm"],
+            },
+            "Szín:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.60,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["color_algorithm"],
+            },
+            "Цвят:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.60,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["color_algorithm"],
+            },
+            # ── Visual attributes (cloud vision only) ─────────────────────
+            "Imprimeu:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.70,
+                "conflict_action": "review",
+                "allowed_sources": ["vision_llm_cloud"],
+            },
+            "Lungime maneca:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.65,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["vision_llm_cloud"],
+            },
+            "Tip produs:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.75,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["vision_llm_cloud"],
+            },
+            "Stil:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.70,
+                "conflict_action": "review",
+                "allowed_sources": ["vision_llm_cloud"],
+            },
+            "Sistem inchidere:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.75,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["vision_llm_cloud"],
+            },
+            "Tip inchidere:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.75,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["vision_llm_cloud"],
+            },
+            "Pentru:": {
+                "vision_eligible": True,
+                "override_text_if_filled": False,
+                "min_vision_confidence": 0.80,
+                "conflict_action": "prefer_text",
+                "allowed_sources": ["vision_llm_cloud"],
+            },
+            # ── NON-visual (never use vision for these) ───────────────────
+            "Material:": {
+                "vision_eligible": False,
+                "reason": "Material cannot be reliably determined visually",
+            },
+            "Anyag:": {"vision_eligible": False, "reason": "same — HU"},
+            "Материал:": {"vision_eligible": False, "reason": "same — BG"},
+            "Sezon:": {
+                "vision_eligible": False,
+                "reason": "Season cannot be reliably determined visually",
+            },
+            "Marime:": {"vision_eligible": False, "reason": "Size not visual"},
+            "Méret:": {"vision_eligible": False, "reason": "Size not visual — HU"},
+            "Размер:": {"vision_eligible": False, "reason": "Size not visual — BG"},
+            "Sport:": {"vision_eligible": False, "reason": "Sport context is in text, not image"},
+            "Varsta:": {"vision_eligible": False, "reason": "Age not visual"},
+            "Instructiuni ingrijire:": {"vision_eligible": False, "reason": "Not visual"},
+        },
     },
     "categories": {
         # Per-category overrides — example (uncomment to activate):
@@ -137,3 +257,33 @@ def get_category_rules(category_name: str, rules: dict = None) -> dict:
     defaults   = {**DEFAULT_RULES["default"], **rules.get("default", {})}
     overrides  = rules.get("categories", {}).get(category_name, {})
     return {**defaults, **overrides}
+
+
+def get_attr_fusion_policy(attr_name: str, rules: dict = None) -> dict:
+    """
+    Return the fusion policy for a specific attribute name.
+    Falls back to {"vision_eligible": False} if not found.
+
+    Uses exact match first, then case-insensitive. This avoids fragile
+    substring matching that would break for multilingual attr names (HU/BG).
+    """
+    if rules is None:
+        rules = load_rules()
+    policy_table = rules.get("default", {}).get("attribute_fusion_policy", {})
+
+    # Exact match
+    if attr_name in policy_table:
+        return policy_table[attr_name]
+
+    # Case-insensitive fallback
+    normalized = attr_name.strip().casefold()
+    for key, val in policy_table.items():
+        if key.strip().casefold() == normalized:
+            return val
+
+    return {"vision_eligible": False, "reason": "not in policy table"}
+
+
+def is_vision_eligible(attr_name: str, rules: dict = None) -> bool:
+    """Quick check: can vision fill this attribute?"""
+    return get_attr_fusion_policy(attr_name, rules).get("vision_eligible", False)
