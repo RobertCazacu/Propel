@@ -4,6 +4,7 @@ Detects values from product title + description using rule-based logic,
 validates against the marketplace valid-values list, and fills gaps.
 """
 import re
+import functools
 from bs4 import BeautifulSoup
 from typing import Optional
 from core.loader import MarketplaceData
@@ -12,9 +13,15 @@ from core.app_logger import get_logger
 log = get_logger("marketplace.processor")
 
 
+@functools.lru_cache(maxsize=512)
+def _compile_wb(kw: str):
+    """Cache compiled word-boundary patterns — keywords are finite (~200 unique)."""
+    return re.compile(r"\b" + re.escape(kw) + r"\b")
+
+
 def _wb(kw: str, text: str) -> bool:
     """Word-boundary match: prevents 'alb' matching 'album', 'rosu' matching 'caramiziu'."""
-    return bool(re.search(r"\b" + re.escape(kw) + r"\b", text))
+    return bool(_compile_wb(kw).search(text))
 
 
 def strip_html(html: str) -> str:
@@ -394,6 +401,10 @@ ALL_DETECTORS = [
     ("Материал:",            lambda t, d, mp, cid: detect_material(t, d, mp, cid, "Материал:")),
 ]
 
+# Module-level cache: cat_id -> tuple of (char_name, detector) applicable for that category.
+# Populated lazily on first call per cat_id — avoids repeated has_char() normalization lookups.
+_applicable_detectors_cache: dict[str, tuple] = {}
+
 
 def process_product(
     title: str,
@@ -421,19 +432,34 @@ def process_product(
 
     desc_clean = strip_html(description)
     results = {}
+    _char_log: list[dict] = []
 
     # ── Rule-based detection ──────────────────────────────────────────────────
-    for char_name, detector in ALL_DETECTORS:
+    # Cache applicable detectors per cat_id — has_char() called once per unique category,
+    # not once per product × detector (avoids 192k+ normalization calls for 8k products)
+    if cat_id not in _applicable_detectors_cache:
+        _applicable_detectors_cache[cat_id] = tuple(
+            (cn, det) for cn, det in ALL_DETECTORS if data.has_char(cat_id, cn)
+        )
+    applicable = _applicable_detectors_cache[cat_id]
+
+    for char_name, detector in applicable:
         if char_name in existing_chars and existing_chars[char_name]:
-            continue
-        # Skip detector daca acest camp nu apartine marketplace-ului curent
-        if not data.has_char(cat_id, char_name):
             continue
         try:
             val = detector(title, desc_clean, data, cat_id)
             if val:
                 results[char_name] = val
                 log.debug("Rule detect [%s] = %r  (titlu: %s)", char_name, val, title[:60])
+                _char_log.append({
+                    "char_name":           char_name,
+                    "char_canonical":      data.canonical_char_name(cat_id, char_name) or char_name,
+                    "source":              "rule",
+                    "value_input":         val,
+                    "value_mapped":        val,
+                    "allowed_values_count": len(data.valid_values(cat_id, char_name)),
+                    "validation_pass":     True,
+                })
         except Exception as exc:
             log.warning("Exceptie in detector %r pentru %r: %s", char_name, title[:60], exc)
 
@@ -466,7 +492,7 @@ def process_product(
                         for ch, vals in data._valid_values.get(cat_id, {}).items()
                         if not combined_existing.get(ch) and len(vals) <= 40
                     }
-                    ai_fills = enrich_with_ai(
+                    ai_fills, ai_suggested = enrich_with_ai(
                         title=title,
                         description=desc_clean,
                         category=cat_name,
@@ -476,11 +502,33 @@ def process_product(
                         mandatory_chars=mandatory_missing,
                         marketplace=marketplace,
                         product_meta=product_meta,
+                        data=data,
                     )
+                    _cat_vals = data._valid_values.get(cat_id, {})
                     for k, v in ai_fills.items():
                         if k not in results:
                             results[k] = v
                             log.debug("AI detect [%s] = %r  (titlu: %s)", k, v, title[:60])
+                        _char_log.append({
+                            "char_name":           k,
+                            "char_canonical":      data.canonical_char_name(cat_id, k) or k,
+                            "source":              "ai",
+                            "value_input":         str(v),
+                            "value_mapped":        str(v),
+                            "allowed_values_count": len(_cat_vals.get(k, set())),
+                            "validation_pass":     True,
+                        })
+                    for k, v in ai_suggested.items():
+                        if k not in ai_fills:
+                            _char_log.append({
+                                "char_name":           k,
+                                "char_canonical":      data.canonical_char_name(cat_id, k),
+                                "source":              "ai",
+                                "value_input":         str(v),
+                                "value_mapped":        None,
+                                "allowed_values_count": len(_cat_vals.get(k, set())),
+                                "validation_pass":     False,
+                            })
                     still_missing = [c for c in mandatory_missing if not results.get(c) and not combined_existing.get(c)]
                     if still_missing:
                         log.warning(
@@ -489,6 +537,39 @@ def process_product(
                         )
         except Exception as exc:
             log.error("Exceptie in AI enrichment pentru %r: %s", title[:60], exc, exc_info=True)
+
+    # ── Post-validation gate — safety net before returning ───────────────────
+    # Ensures every (char, value) pair in results is valid per characteristics/values tables.
+    # Rule detectors already return find_valid-validated values; AI uses strict mode above.
+    # This gate catches any edge-cases and canonicalises key names to characteristics display form.
+    if results:
+        try:
+            from core.char_validator import validate_new_chars_strict
+            validated_results, gate_audit = validate_new_chars_strict(
+                results, cat_id, data, source="gate"
+            )
+            gate_rejected = [e for e in gate_audit if not e["accept"]]
+            for entry in gate_rejected:
+                log.warning(
+                    "Post-gate rejection: char=%r value=%r reason=%s",
+                    entry["char_input"], entry["value_input"], entry["reason"],
+                )
+            results = validated_results
+        except Exception as exc:
+            log.warning("Post-gate exceptie (non-fatal): %s", exc)
+
+    if _char_log:
+        try:
+            from core.ai_logger import log_char_source_detail
+            log_char_source_detail(
+                offer_id=offer_id,
+                marketplace=marketplace,
+                title=title,
+                category=cat_name,
+                char_entries=_char_log,
+            )
+        except Exception:
+            pass
 
     return results
 

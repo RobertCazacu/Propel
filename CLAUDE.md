@@ -8,6 +8,7 @@
 - NEVER proactively create documentation files (*.md) or README files unless explicitly requested
 - NEVER save working files, text/mds, or tests to the root folder
 - Never continuously check status after spawning a swarm — wait for results
+- When a plan from `docs/superpowers/plans/` is fully implemented, ALWAYS move it to `docs/superpowers/plans/done/`
 - ALWAYS read a file before editing it
 - NEVER commit secrets, credentials, or .env files
 
@@ -24,7 +25,6 @@
 ## Project Architecture
 
 - Follow Domain-Driven Design with bounded contexts
-- Keep files under 500 lines
 - Use typed interfaces for all public APIs
 - Prefer TDD London School (mock-first) for new code
 - Use event sourcing for state changes
@@ -186,3 +186,16 @@ npx @claude-flow/cli@latest doctor --fix
 
 - Documentation: https://github.com/ruvnet/claude-flow
 - Issues: https://github.com/ruvnet/claude-flow/issues
+
+## Auto-Swarm Rule
+Whenever a task has 5+ independent subtasks, automatically suggest:
+npx ruflo swarm init --topology hierarchical --max-agents 5
+and spawn specialized agents before starting work.
+
+## File Hygiene Rules
+- NEVER create temporary files in the project root
+- Use /tmp/ or a dedicated .scratch/ folder for any temporary work files
+- Delete all temporary files immediately after use
+- Never create files named after Python types (str, dict, bool, set, tuple, etc.)
+- Never leave files without extensions in the project root
+- After every task, verify no junk files were left behind

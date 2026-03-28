@@ -26,3 +26,29 @@ class BaseLLMProvider(ABC):
         Override în providerii care necesită verificare activă.
         """
         return True
+
+    def complete_structured(
+        self,
+        prompt: str,
+        schema: dict,
+        system: str | None = None,
+    ) -> dict | None:
+        """Completare cu structured output conform JSON Schema.
+
+        Returnează dict conform schemei sau None dacă modelul nu poate genera.
+        Implementarea implicită face fallback la complete() + json.loads.
+        Override în provideri care suportă tool_use nativ.
+        """
+        import json
+        system_msg = system or "Returnează DOAR JSON valid, fără text suplimentar."
+        raw = self.complete(prompt, max_tokens=500, system=system_msg)
+        try:
+            # Curăță markdown code blocks dacă există
+            text = raw.strip()
+            if text.startswith("```"):
+                text = text.split("```")[1]
+                if text.startswith("json"):
+                    text = text[4:]
+            return json.loads(text.strip())
+        except Exception:
+            return None

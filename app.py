@@ -8,7 +8,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from core.state import init_state, all_marketplace_names, get_marketplace
+from core.state import init_state, all_marketplace_names, get_marketplace, is_marketplace_available
 
 st.set_page_config(
     page_title="Marketplace Processor",
@@ -63,13 +63,13 @@ with st.sidebar:
     st.markdown("---")
 
     mp_names = all_marketplace_names()
-    loaded   = [n for n in mp_names if get_marketplace(n) and get_marketplace(n).is_loaded()]
+    loaded   = [n for n in mp_names if is_marketplace_available(n)]
 
     # Show marketplace status
     for name in mp_names:
         mp = get_marketplace(name)
-        is_loaded = mp and mp.is_loaded()
-        badge = '<span class="badge badge-green">✓ Loaded</span>' if is_loaded else '<span class="badge badge-gray">○ Empty</span>'
+        available = (mp and mp.is_loaded()) or is_marketplace_available(name)
+        badge = '<span class="badge badge-green">✓ Loaded</span>' if available else '<span class="badge badge-gray">○ Empty</span>'
         st.markdown(f"**{name}** {badge}", unsafe_allow_html=True)
 
     st.markdown("---")

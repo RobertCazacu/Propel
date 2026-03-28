@@ -286,6 +286,115 @@ def render():
 
         st.markdown("")  # spacer
 
+    # ── Structured AI Output ───────────────────────────────────────────────────
+    st.markdown("---")
+    _s_cfg = st.session_state.get("structured_output_config", {
+        "mode": "off", "sample": 0.10, "provider_only": True,
+    })
+
+    # Badge per mode
+    _mode_badge = {
+        "off":    ("<span style='background:#33333344;color:#94a3b8;font-size:11px;"
+                   "font-weight:700;padding:2px 10px;border-radius:10px'>OFF</span>"),
+        "shadow": ("<span style='background:#1e3a5f;color:#3b82f6;font-size:11px;"
+                   "font-weight:700;padding:2px 10px;border-radius:10px'>SHADOW</span>"),
+        "on":     ("<span style='background:#16a34a22;color:#22c55e;font-size:11px;"
+                   "font-weight:700;padding:2px 10px;border-radius:10px'>ON</span>"),
+    }
+    _cur_mode = _s_cfg.get("mode", "off")
+
+    st.markdown(
+        f"<div style='background:#1e2130;border:1px solid #2d3250;border-radius:8px;"
+        f"padding:16px 20px;margin-bottom:4px'>"
+        f"<div style='display:flex;align-items:center;gap:10px;margin-bottom:4px'>"
+        f"<span style='font-size:18px'>🧩</span>"
+        f"<span style='font-size:16px;font-weight:700;color:#f1f5f9'>Structured AI Output</span>"
+        f"&nbsp;{_mode_badge.get(_cur_mode, '')}"
+        f"</div>"
+        f"<span style='color:#64748b;font-size:12px'>"
+        f"Reduce erorile de format folosind JSON schema dinamică</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("Configurează Structured Output", expanded=False):
+        # Avertisment dacă providerul activ nu suportă structured nativ
+        try:
+            _router = get_router()
+            _prov_supports = _router.provider_name == "anthropic"
+            if not _prov_supports and _s_cfg.get("provider_only", True):
+                st.info(
+                    f"ℹ️ Providerul activ (**{_router.provider_name}**) nu are structured output nativ. "
+                    f"Se va folosi fallback text automat când e activat.",
+                    icon=None,
+                )
+        except Exception:
+            pass
+
+        # Mode selector
+        _mode_options = ["off", "shadow", "on"]
+        _mode_labels = [
+            "Off — dezactivat (recomandat pentru stabilitate)",
+            "Shadow — testare paralelă, output din text flow",
+            "On — structured devine primar, text ca fallback",
+        ]
+        _mode_idx = _mode_options.index(_cur_mode) if _cur_mode in _mode_options else 0
+        new_mode = st.radio(
+            "Mod funcționare",
+            _mode_options,
+            format_func=lambda m: _mode_labels[_mode_options.index(m)],
+            index=_mode_idx,
+            horizontal=False,
+            key="struct_mode_radio",
+        )
+
+        # Slider sampling — vizibil doar la shadow/on
+        new_sample = _s_cfg.get("sample", 0.10)
+        if new_mode in ("shadow", "on"):
+            new_sample = st.slider(
+                "Sampling — % cereri care folosesc structured",
+                min_value=0, max_value=100,
+                value=int(_s_cfg.get("sample", 0.10) * 100),
+                step=5,
+                format="%d%%",
+                key="struct_sample_slider",
+                help="10% = 1 din 10 cereri AI va folosi structured output",
+            ) / 100.0
+
+        # Toggle provider only
+        new_provider_only = st.toggle(
+            "Anthropic-only (structured exclusiv când provider=anthropic)",
+            value=_s_cfg.get("provider_only", True),
+            key="struct_provider_only",
+            help="Alți provideri folosesc fallback text automat dacă nu suportă tool_use nativ",
+        )
+
+        col_save_s, col_reset_s = st.columns([3, 1])
+        with col_save_s:
+            if st.button("✅ Aplică setările", key="struct_apply", use_container_width=True):
+                st.session_state["structured_output_config"] = {
+                    "mode":          new_mode,
+                    "sample":        new_sample,
+                    "provider_only": new_provider_only,
+                }
+                st.success(f"Structured Output setat: **{new_mode.upper()}** · {int(new_sample*100)}% sampling")
+                st.rerun()
+        with col_reset_s:
+            if st.button("↩ Reset", key="struct_reset", use_container_width=True):
+                st.session_state["structured_output_config"] = {
+                    "mode": "off", "sample": 0.10, "provider_only": True,
+                }
+                st.rerun()
+
+        with st.expander("Cum funcționează", expanded=False):
+            st.markdown("""
+- **Off** — tot fluxul AI funcționează ca înainte (text + parse manual JSON).
+- **Shadow** — structured output rulează în paralel logic, dar outputul final vine din fluxul text. Util pentru a compara rezultatele fără risc.
+- **On** — structured output devine calea principală; dacă eșuează, fallback automat la text.
+- **JSON Schema** — trimite modelului lista de valori permise direct în schemă; modelul nu poate răspunde cu valori invalide.
+- **Fallback garantat** — indiferent de mod, validarea strictă existentă rămâne activă pe orice rezultat.
+""")
+
     # ── Info box ───────────────────────────────────────────────────────────────
     st.markdown("---")
     with st.expander("ℹ️ Cum funcționează switchul de provider"):

@@ -8,18 +8,77 @@ Strategii de optimizare:
 4. AI doar pentru caracteristici obligatorii lipsa — skip daca regulile au acoperit tot
 """
 import json
+import os
 import re
+import random
 import hashlib
 import time
 import threading
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from core.app_logger import get_logger
 from core.llm_router import get_router
-from core.ai_logger import log_category_batch, log_char_enrichment
+from core.ai_logger import log_category_batch, log_char_enrichment, write_run_to_duckdb
+from core.reference_store_duckdb import get_product_knowledge, upsert_product_knowledge
+from core.schema_builder import SchemaBuilder, build_json_schema
+
+
+# ── Structured output config ───────────────────────────────────────────────────
+
+def get_structured_config() -> dict:
+    """Citește config structured output din session_state (UI) sau env.
+
+    Returns dict cu cheile:
+      mode: 'off' | 'shadow' | 'on'
+      sample: float [0..1]
+      provider_only: bool
+    """
+    try:
+        import streamlit as st
+        cfg = st.session_state.get("structured_output_config", {})
+    except Exception:
+        cfg = {}
+
+    return {
+        "mode":          cfg.get("mode",          os.getenv("AI_STRUCTURED_MODE", "off")),
+        "sample":        float(cfg.get("sample",  os.getenv("AI_STRUCTURED_SAMPLE", "0.10"))),
+        "provider_only": cfg.get("provider_only", os.getenv("AI_STRUCTURED_PROVIDER_ONLY", "true").lower() == "true"),
+    }
+
+
+def _should_run_structured(cfg: dict, provider_name: str) -> bool:
+    """Decide dacă structured output trebuie rulat pentru această cerere."""
+    mode = cfg.get("mode", "off")
+    if mode == "off":
+        return False
+    # Verifică restricție provider
+    if cfg.get("provider_only", True) and provider_name != "anthropic":
+        return False
+    # Sampling
+    sample = float(cfg.get("sample", 0.10))
+    return random.random() < sample
 
 log = get_logger("marketplace.ai")
 
 CACHE_PATH = Path(__file__).parent.parent / "data" / "ai_cache.json"
+
+
+def _normalize_title(title: str) -> str:
+    """Normalizează titlul pentru knowledge store matching.
+
+    'Samsung Galaxy S24 128GB Negru!' → 'samsung galaxy s24 128gb negru'
+    """
+    # Lowercase
+    s = title.lower().strip()
+    # Remove diacritice
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    # Remove punctuatie, păstrează alfanumeric și spații
+    s = re.sub(r"[^\w\s]", " ", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 _cache_lock = threading.Lock()
 
 # Load .env if present
@@ -79,22 +138,49 @@ def _done_key(title: str, category: str, marketplace: str = "") -> str:
     return hashlib.md5(f"done|{marketplace}|{title.strip().lower()}|{category}".encode()).hexdigest()
 
 
-_MAX_AI_RETRIES = 2
+_MAX_AI_RETRIES = 4
+_RATE_LIMIT_BASE_SLEEP = 10  # secunde — backoff initial pentru 429
 
 
 def _complete_with_retry(prompt: str, max_tok: int, system: str, temperature: float) -> str:
-    """Calls router.complete with up to _MAX_AI_RETRIES retries on transient errors."""
+    """Calls router.complete with up to _MAX_AI_RETRIES retries.
+
+    Handling:
+    - 429 RateLimitError → exponential backoff (10s, 20s, 40s, 80s)
+    - TimeoutError / ConnectionError → retry imediat (max 2×)
+    """
     router = get_router()
     last_exc: Exception = Exception("unknown")
+    rate_sleep = _RATE_LIMIT_BASE_SLEEP
+
     for attempt in range(_MAX_AI_RETRIES + 1):
         try:
             return router.complete(prompt, max_tok, system=system, temperature=temperature)
-        except (TimeoutError, ConnectionError) as exc:
+        except Exception as exc:
             last_exc = exc
-            if attempt < _MAX_AI_RETRIES:
+            exc_str = str(type(exc).__name__)
+            is_rate_limit = (
+                "RateLimitError" in exc_str
+                or "rate_limit" in str(exc).lower()
+                or "429" in str(exc)
+                or "overloaded" in str(exc).lower()
+            )
+            if is_rate_limit and attempt < _MAX_AI_RETRIES:
+                # Jitter: ±50% din sleep pentru a evita thundering herd cu workeri paraleli
+                jitter = random.uniform(0, rate_sleep * 0.5)
+                actual_sleep = rate_sleep + jitter
+                log.warning(
+                    "Rate limit API (attempt %d/%d) — backoff %.0fs...",
+                    attempt + 1, _MAX_AI_RETRIES + 1, actual_sleep,
+                )
+                time.sleep(actual_sleep)
+                rate_sleep = min(rate_sleep * 2, 120)  # max 2 minute sleep
+            elif isinstance(exc, (TimeoutError, ConnectionError)) and attempt < _MAX_AI_RETRIES:
                 log.warning("AI call failed (attempt %d/%d): %s — retrying...",
                             attempt + 1, _MAX_AI_RETRIES + 1, exc)
-                time.sleep(1)
+                time.sleep(2)
+            else:
+                raise
     raise last_exc
 
 
@@ -227,6 +313,22 @@ def _process_batch(batch: list[dict], category_list: list[str],
     rejected = 0
     t_start = time.perf_counter()
     router = get_router()
+
+    # Index normalizat pentru match rapid (lowercase strip) — util pt. categorii non-ASCII (BG, HU)
+    import difflib as _difflib
+    _cat_norm_index = {c.strip().lower(): c for c in category_list}
+
+    def _match_category(ai_cat: str):
+        """Incearca match exact → normalizat → fuzzy. Returneaza categoria din lista sau None."""
+        if ai_cat in category_list:
+            return ai_cat
+        norm_key = ai_cat.strip().lower()
+        if norm_key in _cat_norm_index:
+            return _cat_norm_index[norm_key]
+        # Fuzzy fallback (cutoff 0.88 — previne false positives)
+        close = _difflib.get_close_matches(ai_cat, category_list, n=1, cutoff=0.88)
+        return close[0] if close else None
+
     try:
         raw = _complete_with_retry(prompt, max_tok, system_prompt, 0.2)
         duration_ms = round((time.perf_counter() - t_start) * 1000)
@@ -237,11 +339,14 @@ def _process_batch(batch: list[dict], category_list: list[str],
 
         for i, prod in enumerate(batch, 1):
             pid = prod["id"]
-            cat = suggested.get(str(i))
-            if cat and cat in category_list:
-                batch_results[pid] = cat
+            ai_cat = suggested.get(str(i))
+            matched_cat = _match_category(ai_cat) if ai_cat else None
+            if matched_cat:
+                if matched_cat != ai_cat:
+                    log.debug("AI batch categorie fuzzy-matched %r → %r (prod %s)", ai_cat, matched_cat, pid)
+                batch_results[pid] = matched_cat
                 accepted += 1
-                cache["category_map"][_title_key(prod["title"], marketplace)] = cat
+                cache["category_map"][_title_key(prod["title"], marketplace)] = matched_cat
                 # Auto-invata regula
                 title_base = prod["title"].rsplit(" - ", 1)[0].strip()
                 words = [w.lower() for w in re.split(r"[\s\-]+", title_base)
@@ -255,13 +360,13 @@ def _process_batch(batch: list[dict], category_list: list[str],
                     cache["learned_title_rules"].append({
                         "keywords": kw_string,
                         "exclude": "",
-                        "category": cat,
+                        "category": matched_cat,
                     })
             else:
-                if cat:
+                if ai_cat:
                     log.warning(
                         "AI a sugerat categorie invalida %r pentru prod %s (%r)",
-                        cat, pid, prod["title"][:60],
+                        ai_cat, pid, prod["title"][:60],
                     )
                 batch_results[pid] = None
                 rejected += 1
@@ -331,18 +436,42 @@ def suggest_categories_batch(
     # Imparte in batch-uri de BATCH_SIZE
     chunks = [uncached[i:i + BATCH_SIZE] for i in range(0, len(uncached), BATCH_SIZE)]
     total = len(uncached)
-    processed = 0
+    completed_count = 0
+    merge_lock = threading.Lock()
 
-    for chunk_idx, chunk in enumerate(chunks):
-        if status_callback:
-            status_callback(
-                f"AI categorii: batch {chunk_idx + 1}/{len(chunks)} "
-                f"({processed}/{total} produse)..."
-            )
-        batch_res = _process_batch(chunk, category_list, marketplace, cache)
-        results.update(batch_res)
-        processed += len(chunk)
-        _save_cache(cache)  # salveaza dupa fiecare batch
+    if status_callback:
+        status_callback(
+            f"AI categorii: se procesează {len(chunks)} batch-uri în paralel (2 simultan)..."
+        )
+
+    def _run_chunk(args):
+        chunk_idx, chunk = args
+        # Fiecare thread primește un cache local — evită race conditions
+        local_cache: dict = {"category_map": {}, "char_map": {}, "learned_title_rules": [], "done_map": {}}
+        batch_res = _process_batch(chunk, category_list, marketplace, local_cache)
+        return chunk_idx, batch_res, local_cache
+
+    # 2 workeri paraleli (redus de la 5) — evita thundering herd pe rate limit
+    max_workers = min(2, len(chunks))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_run_chunk, (i, chunk)): i for i, chunk in enumerate(chunks)}
+        for future in as_completed(futures):
+            chunk_idx, batch_res, local_cache = future.result()
+            with merge_lock:
+                results.update(batch_res)
+                cache["category_map"].update(local_cache["category_map"])
+                for rule in local_cache.get("learned_title_rules", []):
+                    existing_kws = {r.get("keywords", r.get("prefix", "")) for r in cache["learned_title_rules"]}
+                    if rule.get("keywords") and rule["keywords"] not in existing_kws:
+                        cache["learned_title_rules"].append(rule)
+                completed_count += len(chunks[chunk_idx])
+                if status_callback:
+                    status_callback(
+                        f"AI categorii: {completed_count}/{total} produse "
+                        f"({chunk_idx + 1}/{len(chunks)} batch-uri)..."
+                    )
+
+    _save_cache(cache)  # o singura scriere la final in loc de N scrieri
 
     if status_callback:
         status_callback(f"AI categorii: gata ({total} produse procesate).")
@@ -457,35 +586,59 @@ def enrich_with_ai(
     mandatory_chars: list = None,
     marketplace: str = "",
     product_meta: dict = None,
-) -> dict:
+    data=None,           # Optional[MarketplaceData] — enables strict value validation
+    ean: str | None = None,
+    brand: str | None = None,
+    vision_chars: dict | None = None,
+) -> tuple[dict, dict]:
     """
     Completeaza caracteristicile cu AI.
     Optimizare: verifica cache-ul mai intai, apeleaza API doar daca e necesar.
     Daca mandatory_chars e specificat, trimite AI doar caracteristicile obligatorii lipsa.
+    vision_chars: atribute deja detectate din imagine — AI le va considera ca existente.
+
+    Returns:
+        (validated, suggested_remapped) — validated = chars that passed validation;
+        suggested_remapped = all AI suggestions (original keys, _reasoning excluded).
     """
+    # Injectează atributele detectate vizual ca deja-existente (AI nu le mai solicită)
+    if vision_chars:
+        existing = {**existing}
+        for k, v in vision_chars.items():
+            if k not in existing and v:
+                existing[k] = v
+
     # Filtreaza doar cele lipsa
-    missing_options = {k: v for k, v in char_options.items() if k not in existing}
+    missing_options = {k: v for k, v in char_options.items() if not existing.get(k)}
 
     # Adauga caracteristicile obligatorii fara lista de valori (campuri freeform)
     if mandatory_chars:
         for ch in mandatory_chars:
-            if ch not in existing and ch not in missing_options:
+            if not existing.get(ch) and ch not in missing_options:
                 # Camp freeform — AI poate pune orice valoare
                 missing_options[ch] = set()
 
     if not missing_options:
-        return {}
+        return {}, {}
 
     # Daca avem lista de mandatory, prioritizeaza-le
     if mandatory_chars:
         mandatory_missing = {k: v for k, v in missing_options.items() if k in mandatory_chars}
         # Daca nu lipseste niciun mandatory, skip AI
         if not mandatory_missing:
-            return {}
+            return {}, {}
         # Trimite doar mandatory lipsa (plus cateva optionale ca context)
         optional_extra = {k: v for k, v in missing_options.items()
                          if k not in mandatory_chars and len(mandatory_missing) < 8}
         missing_options = {**mandatory_missing, **dict(list(optional_extra.items())[:5])}
+
+    # ── Knowledge store lookup ──────────────────────────────────────────────────
+    _norm_title = _normalize_title(title)
+    _known = get_product_knowledge(ean=ean, brand=brand, normalized_title=_norm_title) if (ean or brand) else None
+    _known_attrs = _known["final_attributes"] if _known else {}
+
+    if _known_attrs:
+        log.debug("Knowledge store hit: %d atribute cunoscute pentru '%s'", len(_known_attrs), title[:50])
 
     # Verifica cache
     cache = _load_cache()
@@ -495,7 +648,7 @@ def enrich_with_ai(
     done_set = set(cache.get("done_map", {}).get(dk, []))
     if mandatory_chars and done_set and set(mandatory_chars) <= done_set:
         log.debug("Skip AI (done_map hit) pentru %r", title[:60])
-        return {}
+        return {}, {}
 
     h = _char_key(title, category, marketplace, tuple(missing_options.keys()))
     if h in cache["char_map"]:
@@ -507,7 +660,7 @@ def enrich_with_ai(
                 if not vs or str(v).strip() in vs:
                     validated_cached[k] = v
         if validated_cached:
-            return validated_cached
+            return validated_cached, {}
 
     # Strip trailing ":" din char names inainte de trimitere la AI (EasySales pattern).
     # AI-ul va raspunde cu chei fara ":" — le remapam inapoi dupa parsare.
@@ -542,29 +695,87 @@ def enrich_with_ai(
         # Setul de display-names obligatorii (cu ":" deja stripuit) pentru marcare în prompt
         mandatory_display_set = {k.rstrip(":") for k in (mandatory_chars or [])}
         prompt = _build_prompt(title, description, category, existing, missing_options_display, marketplace, mandatory_display_set, product_meta)
+        if _known_attrs:
+            known_context = "\n".join(f"  {k}: {v}" for k, v in _known_attrs.items())
+            prompt += f"\n\nDate cunoscute din alte marketplace-uri (verificate):\n{known_context}"
         system_prompt = _build_char_system_prompt(marketplace)
         raw = _complete_with_retry(prompt, max_tok, system_prompt, 0.2)
         duration_ms = round((time.perf_counter() - t_start) * 1000)
         log.debug("AI char raw response: %s", raw[:300])
         suggested = _parse_json(raw)
 
+        # Resolve category id once for strict path
+        _ai_cat_id = data.category_id(category) if data is not None else None
+
         for ch_display, ch_val in suggested.items():
             # Remapeaza cheia inapoi la numele original (cu ":" daca era)
             ch_name = stripped_to_orig.get(ch_display, ch_display)
-            valid_set = valid_values_for_cat.get(ch_name, set())
             val_str = str(ch_val).strip()
-            if not valid_set:
-                if val_str:
-                    validated[ch_name] = ch_val
-                    log.debug("AI char freeform acceptat [%s] = %r", ch_name, ch_val)
-            elif val_str in valid_set:
-                validated[ch_name] = ch_val
-                log.debug("AI char acceptat [%s] = %r", ch_name, ch_val)
+            if not val_str:
+                continue
+
+            if data is not None and _ai_cat_id is not None:
+                # ── Strict path: use data.find_valid (handles canonicalization,
+                #    numeric EU formats, diacritics normalization, fuzzy) ─────
+                mapped = data.find_valid(val_str, _ai_cat_id, ch_name)
+                if mapped is not None:
+                    validated[ch_name] = mapped
+                    log.debug("AI char acceptat [%s] = %r → %r", ch_name, ch_val, mapped)
+                else:
+                    vs = data.valid_values(_ai_cat_id, ch_name)
+                    restrictive = data.is_restrictive(_ai_cat_id, ch_name)
+                    if not vs:
+                        # Try marketplace-level fallback (same char in other categories)
+                        fb = data.marketplace_fallback_values(ch_name)
+                        if fb:
+                            fb_mapped = data._find_in_set(val_str, fb)
+                            if fb_mapped is not None:
+                                validated[ch_name] = fb_mapped
+                                log.debug("AI char fallback-acceptat [%s] = %r → %r",
+                                          ch_name, ch_val, fb_mapped)
+                            elif not restrictive:
+                                # Non-restrictive: accept AI value as freeform
+                                validated[ch_name] = val_str
+                                log.debug("AI char freeform-acceptat [%s] = %r", ch_name, ch_val)
+                            else:
+                                log.warning(
+                                    "AI char respins [%s] = %r — fara match in fallback (%d vals)",
+                                    ch_name, ch_val, len(fb),
+                                )
+                        elif not restrictive:
+                            # Non-restrictive and no values defined: accept as freeform
+                            validated[ch_name] = val_str
+                            log.debug("AI char freeform-acceptat [%s] = %r (no values defined)", ch_name, ch_val)
+                        else:
+                            log.warning(
+                                "AI char respins [%s] = %r — nicio valoare definita, niciun fallback",
+                                ch_name, ch_val,
+                            )
+                    elif not restrictive:
+                        # Non-restrictive: accept AI value even if not in the table
+                        validated[ch_name] = val_str
+                        log.debug("AI char freeform-acceptat [%s] = %r (non-restrictive)", ch_name, ch_val)
+                    else:
+                        log.warning(
+                            "AI char respins [%s] = %r — nu e in lista de valori permise (%d valori)",
+                            ch_name, ch_val, len(vs),
+                        )
             else:
-                log.warning(
-                    "AI char respins [%s] = %r — nu e in lista de valori permise (%d valori)",
-                    ch_name, ch_val, len(valid_set),
-                )
+                # ── Legacy path (no data object): direct set lookup ──────────
+                valid_set = valid_values_for_cat.get(ch_name, set())
+                if not valid_set:
+                    log.warning(
+                        "AI char respins freeform [%s] = %r — fara valori permise (no data object)",
+                        ch_name, ch_val,
+                    )
+                elif val_str in valid_set:
+                    validated[ch_name] = ch_val
+                    log.debug("AI char acceptat [%s] = %r", ch_name, ch_val)
+                else:
+                    log.warning(
+                        "AI char respins [%s] = %r — nu e in lista de valori permise (%d valori)",
+                        ch_name, ch_val, len(valid_set),
+                    )
 
         if validated:
             log.info("AI char enrichment OK pentru %r — validate: %s", title[:60], list(validated.keys()))
@@ -578,6 +789,24 @@ def enrich_with_ai(
                 if newly_done:
                     log.debug("Done-map updated pentru %r — obligatorii rezolvate: %s", title[:60], sorted(newly_done))
             _save_cache(cache)
+
+            # ── Save to knowledge store (doar atribute validate) ─────────────
+            if ean or brand:
+                import uuid as _uuid
+                try:
+                    upsert_product_knowledge(
+                        ean=ean,
+                        brand=brand or "",
+                        normalized_title=_norm_title,
+                        marketplace=marketplace,
+                        offer_id=str(existing.get("_offer_id", "")),
+                        category=str(category),
+                        final_attributes=validated,
+                        confidence=round(len(validated) / max(len(missing_options), 1), 2),
+                        run_id=str(_uuid.uuid4()),
+                    )
+                except Exception as e:
+                    log.warning("Nu s-a putut salva în knowledge store: %s", e)
         else:
             log.warning("AI char enrichment — niciun camp validat pentru %r (raw: %s)", title[:60], raw[:200])
 
@@ -607,7 +836,141 @@ def enrich_with_ai(
     except Exception:
         pass
 
-    return validated
+    # ── Structured output (off / shadow / on) ──────────────────────────────────
+    _scfg = get_structured_config()
+    _smode = _scfg.get("mode", "off")
+    _s_attempted = False
+    _s_success = False
+    _s_fallback = False
+    _s_latency_ms = 0
+    _s_model = ""
+    _s_schema_fields = 0
+    _shadow_diff = None
+
+    try:
+        router = get_router()
+        if _should_run_structured(_scfg, router.provider_name):
+            _s_attempted = True
+            # Construiește schema pentru caracteristicile lipsă
+            char_list = [
+                {"name": k, "is_mandatory": k in (mandatory_chars or []), "values": sorted(v)}
+                for k, v in missing_options.items()
+            ]
+            sb = SchemaBuilder(max_total=20)
+            selected_chars = sb.select(char_list, "", _known_attrs)
+            schema = build_json_schema(selected_chars)
+            _s_schema_fields = len(selected_chars)
+
+            _s_t0 = time.perf_counter()
+            structured_result = router.complete_structured(
+                prompt if "prompt" in dir() else "",
+                schema,
+                system=system_prompt if "system_prompt" in dir() else None,
+            )
+            _s_latency_ms = round((time.perf_counter() - _s_t0) * 1000)
+            _s_model = str(getattr(router._provider, "_STRUCTURED_MODEL",
+                                   getattr(router._provider, "_model", "unknown")))
+
+            if structured_result and isinstance(structured_result, dict):
+                _s_success = True
+                if _smode == "on":
+                    # Structured devine primar — validăm și folosim rezultatul
+                    validated_structured = {}
+                    if data is not None:
+                        _ai_cat_id_s = data.category_id(category) if data is not None else None
+                        for ch_name, ch_val in structured_result.items():
+                            if not str(ch_val).strip():
+                                continue
+                            if _ai_cat_id_s is not None:
+                                mapped = data.find_valid(str(ch_val), _ai_cat_id_s, ch_name)
+                                if mapped is not None:
+                                    validated_structured[ch_name] = mapped
+                            elif ch_name in missing_options:
+                                vs = missing_options.get(ch_name, set())
+                                if not vs or str(ch_val) in vs:
+                                    validated_structured[ch_name] = str(ch_val)
+                    else:
+                        validated_structured = {
+                            k: str(v) for k, v in structured_result.items()
+                            if str(v).strip() and k in missing_options
+                        }
+
+                    if validated_structured:
+                        # Structured output valid — înlocuiește text validated
+                        validated = validated_structured
+                        log.info("Structured output ON — %d câmpuri validate pentru %r",
+                                 len(validated), title[:60])
+                    else:
+                        # Structured a returnat dar validarea a eșuat — fallback la text
+                        _s_fallback = True
+                        log.warning("Structured output ON — validare eșuată, fallback text pentru %r",
+                                    title[:60])
+                else:
+                    # shadow: log comparativ, NU afectează output final
+                    _shadow_diff = {
+                        "agree": sorted(set(structured_result.keys()) & set(validated.keys())),
+                        "only_structured": sorted(set(structured_result.keys()) - set(validated.keys())),
+                        "only_plain": sorted(set(validated.keys()) - set(structured_result.keys())),
+                        "value_conflicts": {
+                            k: {"structured": str(structured_result[k]), "plain": str(validated[k])}
+                            for k in set(structured_result.keys()) & set(validated.keys())
+                            if str(structured_result[k]).strip().lower() != str(validated[k]).strip().lower()
+                        },
+                    }
+                    log.info(
+                        "Structured SHADOW pentru %r — agree=%d only_s=%d only_p=%d conflicts=%d",
+                        title[:60],
+                        len(_shadow_diff["agree"]),
+                        len(_shadow_diff["only_structured"]),
+                        len(_shadow_diff["only_plain"]),
+                        len(_shadow_diff["value_conflicts"]),
+                    )
+            else:
+                # Structured a returnat None/empty — fallback la text deja calculat
+                _s_fallback = True
+                log.debug("Structured output None/gol pentru %r — text fallback activ", title[:60])
+    except Exception as _s_exc:
+        _s_fallback = True
+        log.warning("Structured output exc pentru %r: %s", title[:60], _s_exc)
+
+    # ── DuckDB telemetry ───────────────────────────────────────────────────────
+    try:
+        import uuid as _uuid
+        router = get_router()
+        write_run_to_duckdb(
+            run_id=str(_uuid.uuid4()),
+            ean=ean,
+            offer_id=str(existing.get("_offer_id", "")),
+            marketplace=marketplace,
+            model_used=str(getattr(router._provider, "_model", "unknown")),
+            tokens_input=0,   # nu e expus de provider
+            tokens_output=0,
+            cost_usd=0.0,
+            fields_requested=len(missing_options),
+            fields_accepted=len(validated),
+            fields_rejected=len(suggested) - len(validated),
+            retry_count=0,
+            fallback_used=False,
+            duration_ms=duration_ms,
+            structured_mode=_smode,
+            structured_attempted=_s_attempted,
+            structured_success=_s_success,
+            structured_fallback_used=_s_fallback,
+            structured_latency_ms=_s_latency_ms,
+            structured_model_used=_s_model,
+            schema_fields_count=_s_schema_fields,
+            shadow_diff=_shadow_diff,
+        )
+    except Exception:
+        pass
+
+    # Build remapped suggested dict (original keys, _reasoning excluded) for caller
+    suggested_remapped = {
+        stripped_to_orig.get(k, k): v
+        for k, v in suggested.items()
+        if k != "_reasoning"
+    }
+    return validated, suggested_remapped
 
 
 def test_connection() -> tuple[bool, str]:

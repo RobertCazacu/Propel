@@ -2,6 +2,7 @@
 Global state helpers for the Streamlit app.
 Manages per-marketplace data objects and processing results.
 """
+import os
 import streamlit as st
 import json
 from pathlib import Path
@@ -48,6 +49,22 @@ def save_dashboard_stats(results: list):
     except Exception:
         pass
 
+def get_backend() -> str:
+    """Return the configured storage backend.
+
+    Reads REFERENCE_BACKEND environment variable.
+    Valid values: 'duckdb' (default), 'parquet', 'dual'.
+    'dual' writes to both DuckDB and Parquet, reads from DuckDB.
+    """
+    backend = os.environ.get("REFERENCE_BACKEND", "duckdb").lower()
+    if backend == "parquet":
+        log.warning(
+            "DEPRECATION: REFERENCE_BACKEND=parquet este deprecat. "
+            "Migreaza la DuckDB folosind scripts/migrate_parquet_to_duckdb.py"
+        )
+    return backend
+
+
 PREDEFINED_MARKETPLACES = [
     "eMAG Romania",
     "Trendyol",
@@ -55,8 +72,9 @@ PREDEFINED_MARKETPLACES = [
     "FashionDays",
 ]
 
-# Marketplace-uri care folosesc DuckDB ca backend de stocare (pilot controlat)
-DUCKDB_MARKETPLACES = {"eMAG HU", "Allegro"}
+# DEPRECATED: all marketplaces now use DuckDB when REFERENCE_BACKEND=duckdb (default).
+# Kept for backward compatibility with any import that references this symbol.
+DUCKDB_MARKETPLACES: set = set()
 
 # ── Error code configuration per marketplace ───────────────────────────────────
 # Each marketplace defines which error codes should be processed.
@@ -128,8 +146,84 @@ def get_all_processable_codes(marketplace: str) -> set:
     """Returns the set of error codes that should be processed for this marketplace."""
     return set(get_error_codes(marketplace)["processable_codes"])
 
+@st.cache_data(ttl=60)
+def _cached_is_available(mp_id: str) -> bool:
+    """Verificare rapidă (cached 60s) dacă un marketplace are date în DuckDB."""
+    try:
+        from core import reference_store_duckdb as _ddb
+        return _ddb.is_available(mp_id)
+    except Exception:
+        return False
+
+
+@st.cache_data(ttl=600)
+def _cached_load_marketplace_data(mp_id: str):
+    """Încarcă datele marketplace din DuckDB (cached 10 min).
+    Returnează (cats, chars, vals) ca DataFrames.
+    """
+    from core import reference_store_duckdb as _ddb
+    return _ddb.load_marketplace_data(mp_id)
+
+
+def is_marketplace_available(name: str) -> bool:
+    """Verificare rapidă (fără load complet) dacă un marketplace are date.
+
+    Folosit în sidebar și selectbox-uri pentru a afișa status fără să încarce
+    categorii/caracteristici/valori în memorie.
+    """
+    backend = get_backend()
+    if backend in ("duckdb", "dual"):
+        try:
+            from core import reference_store_duckdb as _ddb
+            mp_id = _ddb.marketplace_id_slug(name)
+            return _cached_is_available(mp_id)
+        except Exception:
+            return False
+    # Parquet: verificare rapidă pe disk
+    folder = DATA_DIR / name.replace(" ", "_")
+    return (folder / "categories.parquet").exists()
+
+
+def load_marketplace_on_select(name: str) -> bool:
+    """Încarcă datele complete ale unui marketplace la selecție.
+
+    Dacă e deja în session_state, returnează imediat (fără re-load).
+    Altfel, încarcă din DuckDB (cu cache) sau Parquet și stochează în session_state.
+    """
+    if st.session_state.get("marketplaces", {}).get(name) and \
+       st.session_state["marketplaces"][name].is_loaded():
+        return True
+
+    backend = get_backend()
+    loaded = False
+
+    if backend in ("duckdb", "dual"):
+        try:
+            from core import reference_store_duckdb as _ddb
+            mp_id = _ddb.marketplace_id_slug(name)
+            if _cached_is_available(mp_id):
+                cats, chars, vals = _cached_load_marketplace_data(mp_id)
+                mp = MarketplaceData(name)
+                mp.load_from_dataframes(cats, chars, vals)
+                st.session_state["marketplaces"][name] = mp
+                log.info("Lazy-loaded %s from DuckDB", name)
+                loaded = True
+        except Exception as exc:
+            log.warning("DuckDB lazy load failed for %s: %s", name, exc)
+
+    if not loaded and backend in ("parquet", "dual"):
+        mp = MarketplaceData(name)
+        folder = DATA_DIR / name.replace(" ", "_")
+        if mp.load_from_disk(folder):
+            st.session_state["marketplaces"][name] = mp
+            log.info("Lazy-loaded %s from Parquet", name)
+            loaded = True
+
+    return loaded
+
+
 def init_state():
-    """Initialise all session state keys."""
+    """Initialise session state keys. Nu încarcă date marketplace — lazy load via load_marketplace_on_select()."""
     defaults = {
         "marketplaces":       {},   # name -> MarketplaceData
         "active_mp":          None,
@@ -152,26 +246,8 @@ def init_state():
     if not st.session_state["error_codes_config"]:
         st.session_state["error_codes_config"] = load_error_codes_config()
 
-    # Auto-load any previously saved marketplace data
-    for mp_name in PREDEFINED_MARKETPLACES + st.session_state.get("custom_mp_names", []):
-        if mp_name not in st.session_state["marketplaces"]:
-            if mp_name in DUCKDB_MARKETPLACES:
-                try:
-                    from core import reference_store_duckdb as _duckdb_store
-                    mp_id = _duckdb_store.DUCKDB_ID_MAP.get(mp_name)
-                    if mp_id and _duckdb_store.is_available(mp_id):
-                        cats, chars, vals = _duckdb_store.load_marketplace_data(mp_id)
-                        mp = MarketplaceData(mp_name)
-                        mp.load_from_dataframes(cats, chars, vals)
-                        st.session_state["marketplaces"][mp_name] = mp
-                        log.info("Loaded %s from DuckDB", mp_name)
-                except Exception as exc:
-                    log.warning("DuckDB load failed for %s: %s", mp_name, exc)
-                continue  # nu face load_from_disk parquet
-            mp = MarketplaceData(mp_name)
-            folder = DATA_DIR / mp_name.replace(" ", "_")
-            if mp.load_from_disk(folder):
-                st.session_state["marketplaces"][mp_name] = mp
+    # Marketplace data este încărcat lazy via load_marketplace_on_select()
+    # când utilizatorul selectează un marketplace — nu la startup.
 
 
 def get_marketplace(name: str) -> MarketplaceData | None:
@@ -179,6 +255,14 @@ def get_marketplace(name: str) -> MarketplaceData | None:
 
 
 def set_marketplace(name: str, mp: MarketplaceData):
+    """Store a MarketplaceData in session state and persist to Parquet.
+
+    .. deprecated::
+        In REFERENCE_BACKEND=duckdb mode, persistence is handled by
+        ``_do_save_unified`` in ``pages/setup.py`` via DuckDB import pipeline.
+        This function still writes Parquet for REFERENCE_BACKEND=parquet|dual.
+        Do not call this function when using the DuckDB backend.
+    """
     st.session_state["marketplaces"][name] = mp
     # Persist to disk
     folder = DATA_DIR / name.replace(" ", "_")
@@ -195,3 +279,36 @@ def add_custom_marketplace(name: str):
         names.append(name)
         st.session_state["custom_mp_names"] = names
         save_custom_marketplaces(names)
+
+
+def clear_marketplace_data(name: str):
+    """Șterge datele (categorii, caracteristici, valori) pentru un marketplace, fără a-l elimina din listă."""
+    import shutil
+    # Curăță session state
+    st.session_state.get("marketplaces", {}).pop(name, None)
+    # Șterge fișierele parquet de pe disk
+    folder = DATA_DIR / name.replace(" ", "_")
+    if folder.exists():
+        shutil.rmtree(folder)
+    # Always attempt DuckDB clear (no-op if marketplace doesn't exist in DB)
+    try:
+        from core import reference_store_duckdb as _ddb
+        mp_id = _ddb.marketplace_id_slug(name)
+        _ddb.clear_marketplace_data(mp_id)
+    except Exception as exc:
+        log.warning("Eroare la ștergerea DuckDB pentru %s: %s", name, exc)
+    log.info("Date șterse pentru marketplace '%s'", name)
+
+
+def remove_custom_marketplace(name: str) -> bool:
+    """Elimină complet un marketplace custom (date + intrare din listă). Nu funcționează pe cele predefinite."""
+    if name in PREDEFINED_MARKETPLACES:
+        return False
+    clear_marketplace_data(name)
+    names = st.session_state.get("custom_mp_names", [])
+    if name in names:
+        names.remove(name)
+        st.session_state["custom_mp_names"] = names
+        save_custom_marketplaces(names)
+    log.info("Marketplace '%s' eliminat complet", name)
+    return True

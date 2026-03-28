@@ -1,5 +1,5 @@
 import streamlit as st
-from core.state import all_marketplace_names, get_marketplace, load_dashboard_stats
+from core.state import all_marketplace_names, get_marketplace, load_dashboard_stats, is_marketplace_available
 
 
 def render():
@@ -8,7 +8,7 @@ def render():
     st.markdown("---")
 
     mp_names = all_marketplace_names()
-    loaded   = [n for n in mp_names if get_marketplace(n) and get_marketplace(n).is_loaded()]
+    loaded   = [n for n in mp_names if is_marketplace_available(n)]
 
     # ── Metrici cumulative (persistente pe disk) ───────────────────────────────
     stats        = load_dashboard_stats()

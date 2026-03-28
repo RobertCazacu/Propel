@@ -18,14 +18,22 @@ Takes an offer export file from a marketplace platform and automatically fixes:
 
 ## Features
 
-- **Multi-marketplace support** — each marketplace has its own reference data (categories, characteristics, allowed values) stored in Parquet format
-- **Rule-based category mapping** — keyword rules with AND logic, exclude terms, and specificity ordering
-- **AI batch classification** — up to 60 products classified per API call; auto-learns rules from AI decisions
+- **Multi-marketplace support** — each marketplace has its own reference data (categories, characteristics, allowed values) stored in **DuckDB**
+- **Rule-based category mapping** — keyword rules with AND logic, exclude terms, and specificity ordering; auto-learned from AI decisions
+- **Fast rule pre-processing** — rules validated and sorted O(N_rules) once per run instead of O(N_products × N_rules)
+- **AI batch classification** — up to 60 products classified per API call; fuzzy matching accepts near-identical category names (non-ASCII BG/HU supported)
 - **AI characteristic enrichment** — fills mandatory missing fields; respects each marketplace's language (Romanian, Hungarian, Bulgarian, Polish, etc.)
+- **Cross-marketplace knowledge store** — validated attributes from any marketplace saved in DuckDB `product_knowledge` table; re-used on subsequent runs at zero cost
+- **AI structured output** — `complete_structured()` with JSON schema (off / shadow / on rollout modes)
+- **Vision pipeline** — image-based attribute extraction using color detection, YOLO object detection, CLIP semantic validation, and vision LLM (Ollama llava-phi3)
 - **Multi-provider LLM** — swap between Anthropic, Ollama, Gemini, Groq or Mistral from the UI or `.env`, no restart needed
 - **Pre-processing cost estimate** — shows estimated token usage and USD cost before processing starts
 - **Persistent AI cache** — processed products are cached; re-runs cost zero tokens
+- **Auto-save export** — corrected Excel file generated and saved automatically after processing; download button appears immediately
+- **Sleep prevention** — blocks Windows standby/hibernate during processing via `SetThreadExecutionState`; resets automatically when done
+- **Rate limit resilience** — exponential backoff with jitter prevents thundering herd; 2 parallel batch workers
 - **Color-coded Excel export** — each type of change has a distinct color
+- **DuckDB telemetry** — every AI run logged to `ai_run_log` table with token counts, latency, structured output metrics
 - **Public access** — Cloudflare Tunnel + Telegram bot notification on startup
 
 ---
@@ -40,9 +48,11 @@ marketplace_tool/
 ├── requirements.txt
 │
 ├── core/
-│   ├── ai_enricher.py              # AI enrichment with persistent cache; delegates to LLMRouter
+│   ├── ai_enricher.py              # AI enrichment with cache, knowledge store, structured output
 │   ├── llm_router.py               # Singleton LLM router — single access point for all AI calls
-│   ├── loader.py                   # Loads categories / characteristics / values from Parquet
+│   ├── loader.py                   # Loads categories / characteristics / values from DuckDB
+│   ├── reference_store_duckdb.py   # DuckDB DDL + CRUD: marketplaces, product_knowledge, ai_run_log
+│   ├── schema_builder.py           # SchemaBuilder — selects mandatory + top-N chars for structured output
 │   ├── processor.py                # Rule-based + AI processing pipeline
 │   ├── offers_parser.py            # Parses marketplace offer export files
 │   ├── exporter.py                 # Generates color-coded Excel output
@@ -50,17 +60,20 @@ marketplace_tool/
 │   ├── templates.py                # Excel template generators for reference files
 │   ├── app_logger.py               # Centralized logger
 │   ├── logger.py                   # Processing logs with 7-day auto-cleanup
-│   ├── ai_logger.py                # AI request/response logger (24h retention)
+│   ├── ai_logger.py                # AI request/response logger + write_run_to_duckdb telemetry
 │   ├── vision/
 │   │   ├── __init__.py             # Exports analyze_product_image, ImageAnalysisResult
-│   │   ├── image_analyzer.py       # Main orchestrator for image-based attribute extraction
+│   │   ├── image_analyzer.py       # Main orchestrator: color + YOLO + CLIP + vision LLM fusion
 │   │   ├── color_analyzer.py       # Algorithmic color detection (PIL quantize, HSV classification)
 │   │   ├── image_fetcher.py        # Image downloader with local cache (data/image_cache/)
 │   │   ├── visual_provider.py      # Vision model providers (Ollama llava-phi3, Mock)
-│   │   └── visual_rules.py         # JSON rules engine (data/visual_rules.json)
+│   │   ├── visual_rules.py         # JSON rules engine (data/visual_rules.json)
+│   │   ├── yolo_detector.py        # YOLO object detection + crop pipeline
+│   │   ├── clip_validator.py       # CLIP semantic category validation
+│   │   └── vision_logger.py        # Per-run image analysis log
 │   └── providers/
 │       ├── base.py                 # Abstract BaseLLMProvider
-│       ├── anthropic_provider.py   # Anthropic Claude (SDK)
+│       ├── anthropic_provider.py   # Anthropic Claude (SDK) — complete() + complete_structured()
 │       ├── ollama_provider.py      # Ollama local models (REST)
 │       ├── gemini_provider.py      # Google Gemini (REST)
 │       ├── groq_provider.py        # Groq (REST, OpenAI-compatible)
@@ -68,25 +81,18 @@ marketplace_tool/
 │
 ├── pages/
 │   ├── dashboard.py                # Metrics dashboard + run history
-│   ├── setup.py                    # Load marketplace reference files
-│   ├── process.py                  # Process offers (rules + AI)
-│   ├── results.py                  # View results + export Excel
-│   ├── diagnostic.py               # System diagnostic
+│   ├── setup.py                    # Load marketplace reference files into DuckDB
+│   ├── process.py                  # Process offers (rules + AI + image); auto-saves export
+│   ├── results.py                  # View results + export Excel (format original / model import)
+│   ├── diagnostic.py               # System diagnostic + AI Metrics tab (DuckDB telemetry)
 │   └── llm_providers.py            # AI provider management (switch, configure, test)
 │
 └── data/
-    ├── eMAG_Romania/
-    │   ├── categories.parquet
-    │   ├── characteristics.parquet
-    │   └── values.parquet
-    ├── eMAG_HU/                    # eMAG Hungary
-    ├── eMAG_BG/                    # eMAG Bulgaria
-    ├── Trendyol/
-    ├── FashionDays/
-    ├── FashionDays_BG/
+    ├── reference_data.duckdb       # All marketplace reference data + knowledge store + telemetry
     ├── ai_cache.json               # Persistent AI cache (gitignored)
     ├── dashboard_stats.json        # Cumulative statistics (gitignored)
     ├── visual_rules.json           # Image analysis rules (color thresholds, per-category overrides)
+    ├── exports/                    # Auto-saved processed Excel files, 24h retention (gitignored)
     ├── logs/                       # Processing logs, 7-day retention (gitignored)
     ├── ai_logs/                    # AI request/response logs, 24h retention (gitignored)
     └── image_cache/                # Downloaded product images, persistent (gitignored)
@@ -122,7 +128,7 @@ App opens at `http://localhost:8501`.
    - **Categories** (`emag_categories.xlsx`) — columns: `id`, `name`, `parent_id`
    - **Characteristics** (`emag_characteristics.xlsx`) — columns: `id`, `category_id`, `name`, `mandatory`
    - **Allowed values** (`characteristic_values.xlsx`) — columns: `emag_characteristic_id`, `value`
-4. Click **Save** — data is stored as Parquet locally, no need to re-upload
+4. Click **Save** — data is stored in DuckDB (`data/reference_data.duckdb`), no need to re-upload
 
 ### Step 2 — Configure AI Provider (optional)
 
@@ -138,14 +144,15 @@ Without an AI provider the tool still works using rules only.
 2. Select the configured marketplace (active marketplace banner shows stats)
 3. Upload the offer export file from the marketplace platform
 4. (Optional) Add or edit category mapping rules
-5. Expand **AI Cost Estimate** to preview token usage and USD cost
-6. Click **Start processing for [Marketplace]**
+5. (Optional) Enable image analysis (color detection, YOLO, CLIP)
+6. Expand **AI Cost Estimate** to preview token usage and USD cost
+7. Click **Start processing for [Marketplace]**
 
-### Step 4 — Results & Export
+When processing finishes the corrected Excel file is **generated and saved automatically** — a download button appears immediately, no need to navigate to Results.
 
-1. Go to **📊 Results**
-2. Review the processed products
-3. Click **Generate corrected Excel** and download
+### Step 4 — Results & Export (optional)
+
+Go to **📊 Results** for detailed review, filtering, and alternative export formats (original format or model import format).
 
 ---
 
@@ -169,7 +176,7 @@ The app supports 5 AI providers with a unified interface. All providers accept t
 
 | Provider | Default model | Notes |
 |---|---|---|
-| **anthropic** | `claude-haiku-4-5-20251001` | Recommended — best quality/cost ratio |
+| **anthropic** | `claude-haiku-4-5-20251001` | Recommended — best quality/cost ratio; supports structured output |
 | **ollama** | `qwen2.5:14b` | Free, runs locally — requires `ollama serve` |
 | **gemini** | `gemini-2.0-flash` | Google — free tier available |
 | **groq** | `llama-3.3-70b-versatile` | Free with rate limits, very fast |
@@ -202,9 +209,29 @@ The AI prompt automatically includes the correct language context per marketplac
 | Allegro | Polish |
 | Trendyol / Decathlon / Pepita / FashionDays | neutral |
 
+### Structured output (Anthropic only)
+
+The tool supports JSON schema-constrained responses via `complete_structured()`:
+
+| Mode | Behavior |
+|---|---|
+| `off` | Plain text enrichment only (default) |
+| `shadow` | Both paths run; results compared but not used |
+| `on` | Structured output replaces plain text; falls back on failure |
+
+Configure from **⚙️ Setup** → Structured Output toggle, or via env:
+```env
+AI_STRUCTURED_MODE=shadow
+AI_STRUCTURED_SAMPLE=0.10
+```
+
+### Cross-marketplace knowledge store
+
+Validated attributes are stored in `product_knowledge` (DuckDB) keyed by EAN + brand + normalized title. On subsequent runs, AI is skipped for known products — zero cost.
+
 ### AI Request/Response Logging
 
-Every AI call is saved to `data/ai_logs/YYYY-MM-DD.json` (auto-deleted after 24h).
+Every AI call is saved to `data/ai_logs/YYYY-MM-DD.json` (auto-deleted after 24h) and to the `ai_run_log` DuckDB table (permanent telemetry).
 
 Each entry contains:
 
@@ -217,13 +244,11 @@ Each entry contains:
 | `duration_ms` | Response time in milliseconds |
 | `request.offer_id(s)` | Offer ID(s) involved |
 | `request.prompt` | Full prompt sent to the AI |
-| `request.products` / `request.missing_characteristics` | Full input data |
 | `response.raw` | Raw text response from the AI |
-| `response.parsed` | Parsed JSON from the response |
 | `results` | Final accepted values per offer |
 | `stats.accepted` / `stats.rejected` | Count of accepted/rejected values |
 
-Log files location: `data/ai_logs/` (gitignored — local only).
+View telemetry in **🔧 Diagnostic** → AI Metrics tab.
 
 ### Token optimizations
 
@@ -231,6 +256,7 @@ Log files location: `data/ai_logs/` (gitignored — local only).
 |---|---|
 | Batch classification (N products = 1 API call) | ~97% |
 | Persistent cache (seen product = 0 tokens) | 100% on re-runs |
+| Knowledge store (known EAN/brand = 0 tokens) | 100% cross-marketplace |
 | AI only for missing mandatory fields | ~50% |
 | Auto-learned rules from AI decisions | 100% over time |
 
@@ -261,7 +287,23 @@ Rules are evaluated before AI — matching a rule costs zero tokens.
 | `category` | Exact category name from the marketplace reference data |
 
 Rules with more keywords are checked first (more specific = higher priority).
+Rules are pre-processed once per run (O(N_rules)) rather than per product — significant speedup for large batches.
 Backward-compatible with old format: `{"prefix": "...", "category": "..."}`.
+
+---
+
+## Image analysis
+
+Optional per-product image analysis via the **🖼️ Image Analysis** section in Process Offers:
+
+| Option | Description |
+|---|---|
+| Color detection | Algorithmic color extraction (PIL quantize, HSV families) — no ML required |
+| YOLO object detection | Crops the main product object before color/vision analysis |
+| CLIP semantic validation | Validates that detected category matches image content |
+| Vision LLM hint | Ollama llava-phi3 suggests product type from image |
+
+Image results are merged into `new_chars` without overwriting text-based enrichment. Supports `first_only`, `best_confidence`, and `aggregate_vote` strategies when multiple images are present.
 
 ---
 
@@ -289,8 +331,8 @@ STREAMLIT_PORT=8501                  # optional, default 8501
 ```powershell
 $action = New-ScheduledTaskAction `
     -Execute "python" `
-    -Argument "C:\Users\manue\Desktop\marketplace_tool\start_all.py" `
-    -WorkingDirectory "C:\Users\manue\Desktop\marketplace_tool"
+    -Argument "C:\path\to\marketplace_tool\start_all.py" `
+    -WorkingDirectory "C:\path\to\marketplace_tool"
 
 $trigger = New-ScheduledTaskTrigger -AtLogon
 
@@ -309,7 +351,6 @@ Register-ScheduledTask `
 ```
 
 > **Note:** The Cloudflare URL changes on every restart — you receive the new URL on Telegram automatically.
-> Keep the PC awake: `powercfg /change standby-timeout-ac 0` (PowerShell as Admin).
 
 ---
 
@@ -328,6 +369,8 @@ Register-ScheduledTask `
 | `GROQ_MODEL` | No | `llama-3.3-70b-versatile` | Groq model |
 | `MISTRAL_API_KEY` | If using Mistral | — | Mistral API key |
 | `MISTRAL_MODEL` | No | `mistral-small-latest` | Mistral model |
+| `AI_STRUCTURED_MODE` | No | `off` | Structured output mode: `off` / `shadow` / `on` |
+| `AI_STRUCTURED_SAMPLE` | No | `0.10` | Fraction of requests to run structured output on |
 | `TELEGRAM_TOKEN` | No | — | Telegram bot token |
 | `TELEGRAM_CHAT_ID` | No | — | Telegram chat ID |
 | `STREAMLIT_PORT` | No | `8501` | Streamlit port |
@@ -343,53 +386,74 @@ streamlit run app.py
 # Full start (Streamlit + Tunnel + Telegram notification)
 python start_all.py
 
-# One-time values.xlsx → Parquet conversion
-python fix_values_parquet.py
-
-# Check a Parquet file
-python -c "import pandas as pd; df=pd.read_parquet('data/eMAG_Romania/values.parquet'); print(df.shape)"
+# Migrate existing Parquet data to DuckDB
+python scripts/migrate_parquet_to_duckdb.py
 ```
 
 ---
 
 ## Changelog
 
+### v8 — 2026-03-27
+
+- **Auto-save export** — corrected Excel (format model import) generated and saved automatically after processing completes; download button appears immediately on Process Offers page; no need to navigate to Results
+- **Sleep prevention** — `_prevent_sleep()` calls `SetThreadExecutionState(ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED)` during processing; Windows cannot enter standby or hibernate; reset automatically when processing finishes
+- **Fast rule pre-processing** — `_preprocess_rules()` validates categories, sorts, and pre-computes keywords O(N_rules) once before any per-product loop; eliminates O(N_products × N_rules) `category_id()` + `difflib` calls; ~1000× fewer lookups for typical batches
+- **Rate limit jitter** — exponential backoff now adds ±50% random jitter per worker; prevents thundering herd when multiple batch workers hit rate limit simultaneously
+- **Parallel batch workers reduced 5 → 2** — less simultaneous API pressure; combined with jitter, rate limit retries drop significantly
+- **Fuzzy category matching** — `_match_category()` in `_process_batch`: exact → normalized (lowercase/strip) → `difflib` with cutoff 0.88; resolves non-ASCII category mismatches (Bulgarian, Hungarian) where AI response differs by 1–2 characters
+
+### v7 — 2026-03-24
+
+- **AI structured output** — `complete_structured()` added to `AnthropicProvider` using `tool_use` pattern; `SchemaBuilder` selects mandatory + top-N optional characteristics and builds JSON schema; three rollout modes: `off` (default), `shadow` (compare only), `on` (replace text path); UI toggle in Process Offers; configurable via `AI_STRUCTURED_MODE` / `AI_STRUCTURED_SAMPLE` env vars
+- **Cross-marketplace knowledge store** — `product_knowledge` DuckDB table stores validated attributes keyed by EAN + brand + normalized title; `get_product_knowledge()` / `upsert_product_knowledge()` in `reference_store_duckdb.py`; `enrich_with_ai()` reads known attributes as AI context and saves validated results back
+- **DuckDB telemetry** — `ai_run_log` table added; `write_run_to_duckdb()` called from `enrich_with_ai()` after every enrichment; stores tokens, cost, latency, structured output fields, shadow diff
+- **Diagnostic → AI Metrics tab** — queries `ai_run_log` for per-marketplace stats, acceptance rates, structured output comparison
+- **AI prompt metadata context** — EAN, SKU, weight, warranty from offer file included in enrichment prompts; improves quality for products with incomplete titles
+- **`done_map` cache** — tracks which mandatory characteristics have been resolved per product; skips AI entirely when all mandatory fields already done
+
+### v6 — 2026-03-23
+
+- **DuckDB migration complete** — all marketplaces migrated from Parquet to DuckDB (`data/reference_data.duckdb`); `REFERENCE_BACKEND` flag removed (DuckDB is the only backend); `migrate_parquet_to_duckdb.py` utility for one-time migration
+- **Bulk insert + vectorized validation** — values table import rewritten with bulk DuckDB insert; 1 million rows: 35 min → 6 seconds
+- **`characteristic_id` stable key** — characteristics indexed by numeric ID in addition to name; resolves ambiguity when two characteristics share display names across categories
+- **Restrictive flag** — characteristics marked as restrictive (fixed value list) vs non-restrictive (freeform); AI freeform values accepted for non-restrictive fields without list validation
+- **Fuzzy characteristic matching** — `find_valid()` in `MarketplaceData` tries: exact → normalized → numeric EU format → diacritics normalization → difflib fuzzy; reduces AI rejection rate for minor spelling variants
+- **Marketplace fallback values** — `marketplace_fallback_values()` aggregates valid values for a characteristic across all categories; used when category-level values are missing
+- **Auto-save exports** — `_auto_save_export()` in `results.py` saves generated Excel to `data/exports/` with timestamp + marketplace slug; auto-cleans files older than 24h
+- **Local path + CSV input** — Setup page accepts local file paths and CSV files in addition to `.xlsx` upload; useful for large marketplace files
+- **Tests** — universal marketplace tests covering numeric + alphanumeric IDs, DuckDB isolation, end-to-end pipeline
+
 ### v5 — 2026-03-22
 
 - **Image-based color detection** — new `core/vision/` package; analyzes product images algorithmically (Pillow + PIL quantize, no ML required)
   - `image_fetcher.py` — downloads + caches images by URL hash in `data/image_cache/`
-  - `color_analyzer.py` — corner-based background removal, PIL FASTOCTREE quantize, neutral avoidance, HSV color family classification (Negru, Alb, Gri, Rosu, Albastru, Verde, Mov, Roz, Portocaliu, Galben, Maro, Bej, Turcoaz, Visiniu, Kaki, Bleumarin, Multicolor), white-product shortcut for Photoroom images
+  - `color_analyzer.py` — corner-based background removal, PIL FASTOCTREE quantize, neutral avoidance, HSV color family classification, white-product shortcut for Photoroom images
   - `visual_provider.py` — optional Ollama vision model integration (`llava-phi3`) for product type hints
   - `visual_rules.py` — JSON-based rules engine (`data/visual_rules.json`), per-category overrides
   - `image_analyzer.py` — main orchestrator; merges image results into `new_chars` without modifying existing text-based flow
-- **Image analysis UI** — two checkboxes in Process Offers: "Detectează culoarea din imagine" and "Folosește imaginea pentru îmbunătățirea categoriei"
-- **Image analysis logging** — `log_image_analysis()` added to `ai_logger.py`; every image analysis (success or failure) logged as `image_analysis` type entry in daily AI log
+- **YOLO + CLIP pipeline** — `yolo_detector.py` for object detection + crop; `clip_validator.py` for semantic category validation; fusion strategy (first_only / best_confidence / aggregate_vote)
+- **Image analysis UI** — checkboxes in Process Offers: color detection, YOLO, CLIP, vision LLM; advanced settings expander
+- **Image analysis logging** — `log_image_analysis()` added to `ai_logger.py`; every image analysis logged as `image_analysis` type entry
 - **Fix: marketplace language context** — `_mp_ctx()` rewritten with `_MP_ALIASES` list supporting full permissive matching: `BG`, `bg`, `Bulgaria`, `BGN`, `HU`, `Hungary`, `Ungaria`, `HUF`, `PL`, `Polonia`, `Allegro`, `FashionDays BG/HU`, etc.
-- **Fix: white product detection** — Photoroom images on white background now correctly detected as "Alb" instead of "Rosu" or "Bej"
+- **Fix: white product detection** — Photoroom images on white background correctly detected as "Alb"
 - **Fix: comma-separated image URLs** — `Imagini` column may contain multiple URLs; only first URL used for analysis
-- **Fix: `Imagini` column alias** — added `"imagini"` and `"image src"` to `offers_parser.py` image URL aliases
-- **`requirements.txt`** — added `Pillow>=10.0.0`, `requests>=2.28.0`, `numpy>=1.24.0`
-- **`.gitignore`** — added `data/image_cache/`
 
 ### v4 — 2026-03-22
 
 - **AI Request/Response Logger** — every AI call saved to `data/ai_logs/YYYY-MM-DD.json` with 24h retention; captures full prompt, raw response, parsed result, duration_ms, offer_id, provider, model, accepted/rejected counts
 - `core/ai_logger.py` — new module: `log_category_batch()`, `log_char_enrichment()`, `AICallTimer`, `list_ai_log_files()`, `read_ai_log()`; auto-cleanup on every write
-- `ai_enricher.py` — integrated timing (`time.perf_counter`) and logging calls after each `get_router().complete()`
-- `processor.py` — `process_product()` accepts `offer_id` parameter, passed through to `enrich_with_ai` → logger
-- `pages/process.py` — passes `offer_id` to `process_product()`
-- `.gitignore` — added `data/ai_logs/`
+- `ai_enricher.py` — integrated timing and logging after each API call
+- `processor.py` — `process_product()` accepts `offer_id` parameter
 
 ### v3 — 2026-03-21
 
-- **Fix: eMAG HU / BG used Romanian context in AI** — `_mp_ctx()` substring matching sorted by key length descending; added explicit `emag_hu` (Hungarian) and `emag_bg` (Bulgarian) entries; freeform prompt updated to use marketplace local language
-- **UI: Active marketplace banner** in Process Offers — shows name, category count, characteristic count, value count after marketplace selection
-- **AI cost estimator** — pre-processing estimate of token batches, characteristic calls, and USD cost
-- **Multi-provider LLM architecture** — `core/providers/` with abstract `BaseLLMProvider` + 5 providers; `core/llm_router.py` singleton with `get_router()`, `switch_provider()`, `reset_router()`
-- **`ai_enricher.py` refactored** — removed direct Anthropic dependency; all calls go through `get_router().complete()`
-- **LLM Providers page** — full UI for configuring, switching and testing all providers; writes directly to `.env`
-- **`start_all.py` secured** — Telegram credentials moved from hardcoded to `.env`
-- **`.gitignore` and `.env.example` added**
+- **Fix: eMAG HU / BG used Romanian context in AI** — `_mp_ctx()` rewritten with alias-based matching
+- **UI: Active marketplace banner** in Process Offers — shows name + stats
+- **AI cost estimator** — pre-processing estimate of token batches and USD cost
+- **Multi-provider LLM architecture** — `core/providers/` with abstract `BaseLLMProvider` + 5 providers; `core/llm_router.py` singleton
+- **LLM Providers page** — full UI for configuring, switching and testing all providers
+- **`start_all.py` secured** — Telegram credentials moved to `.env`
 
 ### v2 — 2026-03-20
 

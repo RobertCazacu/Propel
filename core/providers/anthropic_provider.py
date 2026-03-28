@@ -35,3 +35,42 @@ class AnthropicProvider(BaseLLMProvider):
             kwargs["temperature"] = temperature
         msg = self._client.messages.create(**kwargs)
         return msg.content[0].text
+
+    _STRUCTURED_MODEL = "claude-sonnet-4-6"
+
+    def complete_structured(
+        self,
+        prompt: str,
+        schema: dict,
+        system: str | None = None,
+    ) -> dict | None:
+        """Structured output via Anthropic tool_use.
+
+        Forțează modelul să returneze JSON conform schemei.
+        Folosește claude-sonnet-4-6 indiferent de modelul default al providerului.
+
+        Returns:
+            dict conform schemei sau None dacă nu s-a obținut tool_use block.
+        """
+        tool_def = {
+            "name": "fill_characteristics",
+            "description": "Completează caracteristicile produsului cu valori corecte.",
+            "input_schema": schema,
+        }
+        kwargs = dict(
+            model=self._STRUCTURED_MODEL,
+            max_tokens=1024,
+            tools=[tool_def],
+            tool_choice={"type": "tool", "name": "fill_characteristics"},
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if system:
+            kwargs["system"] = system
+
+        msg = self._client.messages.create(**kwargs)
+
+        for block in msg.content:
+            if getattr(block, "type", None) == "tool_use":
+                return block.input  # dict deja, nu string
+
+        return None

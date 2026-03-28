@@ -3,7 +3,9 @@ import io
 import time
 import re
 import math
-from core.state import all_marketplace_names, get_marketplace, get_error_codes, get_all_processable_codes
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from core.state import all_marketplace_names, get_marketplace, get_error_codes, get_all_processable_codes, is_marketplace_available, load_marketplace_on_select
 from core.offers_parser import extract_products, get_error_code
 from core.processor import process_product, validate_existing, explain_missing_chars
 from core.app_logger import get_logger
@@ -32,13 +34,40 @@ def _rule_keywords(rule: dict) -> list[str]:
     return [k.strip().lower() for k in re.split(r"[,\s]+", raw) if k.strip()]
 
 
-def _resolve_category(title: str, current_cat: str, mp, rules: list) -> tuple[str, str]:
+def _preprocess_rules(rules: list, mp) -> list:
+    """Pre-procesează regulile o singură dată: validează categoriile, pre-sortează și pre-calculează keywords.
+
+    Apelat ÎNAINTE de orice buclă per-produs pentru a evita O(N_produse * N_reguli) overhead.
+    Returneaza lista sortată de reguli valide cu '_kws' și '_exclude' pre-calculate.
+    """
+    valid = []
+    seen_kw = set()
+    for r in rules:
+        cat = r.get("category", "")
+        kws = _rule_keywords(r)
+        if not cat or not kws:
+            continue
+        if not mp.category_id(cat):
+            continue
+        kw_str = ",".join(sorted(kws))
+        if kw_str in seen_kw:
+            continue  # deduplicare
+        seen_kw.add(kw_str)
+        exclude = [k.strip().lower() for k in r.get("exclude", "").split(",") if k.strip()]
+        valid.append({**r, "_kws": kws, "_exclude": exclude})
+    return sorted(valid, key=lambda r: -len(r["_kws"]))
+
+
+def _resolve_category(title: str, current_cat: str, mp, rules: list,
+                      _fast_rules: list | None = None) -> tuple[str, str]:
     """
     Returns (final_category, action) where action is one of:
     'ok', 'assigned', 'corrected', 'unknown'
 
     Matching logic: ALL keywords trebuie sa apara oriunde in titlu (case-insensitive).
     Regulile cu mai multe keywords sunt verificate primele (mai specifice).
+
+    _fast_rules: pre-processed rules from _preprocess_rules() — skips sort/validate overhead.
     """
     # Pasul 1 — categoria curenta exista in marketplace-ul activ
     if current_cat and mp.category_id(current_cat):
@@ -48,22 +77,27 @@ def _resolve_category(title: str, current_cat: str, mp, rules: list) -> tuple[st
     # o ignoram complet si determinam din titlu cu regulile MP-ului curent
     title_lower = title.lower()
 
-    # Sorteaza: mai multe keywords = mai specific = prioritate mai mare
-    sorted_rules = sorted(rules, key=lambda r: -len(_rule_keywords(r)))
-
-    for rule in sorted_rules:
-        cat      = rule.get("category", "")
-        keywords = _rule_keywords(rule)
-        exclude  = [k.strip().lower() for k in rule.get("exclude", "").split(",") if k.strip()]
-
-        if not keywords or not cat:
-            continue
-        # Verifica ca si categoria din regula exista in MP-ul curent
-        if not mp.category_id(cat):
-            continue
-        if all(kw in title_lower for kw in keywords):
-            if not any(ex in title_lower for ex in exclude):
-                return cat, "assigned"
+    if _fast_rules is not None:
+        # Cale rapida: reguli pre-sortate, pre-validate, keywords pre-calculate
+        for rule in _fast_rules:
+            keywords = rule["_kws"]
+            if all(kw in title_lower for kw in keywords):
+                if not any(ex in title_lower for ex in rule["_exclude"]):
+                    return rule["category"], "assigned"
+    else:
+        # Cale lenta (backward-compat): sortare si validare per-apel
+        sorted_rules = sorted(rules, key=lambda r: -len(_rule_keywords(r)))
+        for rule in sorted_rules:
+            cat      = rule.get("category", "")
+            keywords = _rule_keywords(rule)
+            exclude  = [k.strip().lower() for k in rule.get("exclude", "").split(",") if k.strip()]
+            if not keywords or not cat:
+                continue
+            if not mp.category_id(cat):
+                continue
+            if all(kw in title_lower for kw in keywords):
+                if not any(ex in title_lower for ex in exclude):
+                    return cat, "assigned"
 
     log.debug(
         "_resolve_category UNKNOWN: titlu=%r, cat_curenta=%r, reguli=%d, niciuna nu se potriveste",
@@ -79,11 +113,12 @@ def _estimate_ai_cost(to_process: list, mp, rules: list) -> dict:
     - Char AI: produse cu categorii valabile dar cu caracteristici obligatorii lipsă → per-product calls
     """
     # Memoize _resolve_category — evita apeluri duble per produs
+    _fast_rules_est = _preprocess_rules(rules, mp)
     _resolve_cache: dict = {}
     def _resolve_cached(title: str, cat: str):
         key = (title, cat)
         if key not in _resolve_cache:
-            _resolve_cache[key] = _resolve_category(title, cat, mp, rules)
+            _resolve_cache[key] = _resolve_category(title, cat, mp, rules, _fast_rules=_fast_rules_est)
         return _resolve_cache[key]
 
     # ── Category AI ──────────────────────────────────────────────────────────
@@ -172,9 +207,42 @@ def _audit_products(products: list, mp) -> dict:
     }
 
 
+def _prevent_sleep():
+    """Previne sleep/standby Windows pe durata procesarii. Returneaza functia de reset."""
+    try:
+        import ctypes
+        ES_CONTINUOUS        = 0x80000000
+        ES_SYSTEM_REQUIRED   = 0x00000001
+        ES_AWAYMODE_REQUIRED = 0x00000040
+        ctypes.windll.kernel32.SetThreadExecutionState(
+            ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_AWAYMODE_REQUIRED
+        )
+        log.info("Sleep prevention activat — PC-ul nu va intra in standby pe durata procesarii.")
+        def _reset():
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            log.info("Sleep prevention dezactivat.")
+        return _reset
+    except Exception as e:
+        log.debug("Sleep prevention indisponibil: %s", e)
+        return lambda: None
+
+
 def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, marketplace="", image_options=None):
     from core.ai_logger import start_run as _ai_start_run
     _ai_start_run(marketplace)
+
+    _reset_sleep = _prevent_sleep()
+
+    # ── Vision run logger (optional) ──────────────────────────────────────────
+    _run_logger = None
+    if image_options and any(image_options.get(k) for k in ("enable_color", "enable_product_hint", "enable_yolo", "enable_clip")):
+        try:
+            from core.vision.vision_logger import new_run_logger
+            _run_logger = new_run_logger(marketplace)
+        except Exception:
+            pass
+    if image_options is not None:
+        image_options = {**image_options, "run_logger": _run_logger}
 
     results = []
     total = len(products)
@@ -217,17 +285,31 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
             )
 
     if n_valid_cat == 0 and n_processable > 0:
-        log.warning(
-            "[%s] Niciun produs nu are o categorie valida pentru acest marketplace. "
-            "Reguli: %d. AI: %s. Fara reguli sau AI activ, categoriile NU pot fi determinate automat.",
-            marketplace, len(rules), use_ai,
-        )
+        if use_ai:
+            log.info(
+                "[%s] Niciun produs nu are o categorie valida — AI activ, "
+                "categoriile vor fi determinate automat prin batch AI. Reguli: %d.",
+                marketplace, len(rules),
+            )
+        else:
+            log.warning(
+                "[%s] Niciun produs nu are o categorie valida pentru acest marketplace. "
+                "Reguli: %d. AI dezactivat — categoriile NU pot fi determinate automat.",
+                marketplace, len(rules),
+            )
+
+    # Pre-procesare reguli o singura data (O(N_reguli)) — folosita in toata functia
+    _fast_rules = _preprocess_rules(rules, mp)
 
     # ── Pre-procesare batch categorie (1 apel API pentru toate produsele fara categorie) ─
     if use_ai:
         try:
             from core.ai_enricher import suggest_categories_batch, get_learned_rules, is_configured
-            if is_configured():
+            _ai_ok = is_configured()
+            if not _ai_ok:
+                st.warning("⚠️ AI dezactivat — ANTHROPIC_API_KEY lipsește sau e invalidă în .env. Categoriile nu vor fi determinate automat.")
+                log.warning("[%s] is_configured() = False — API key lipseste sau invalida.", marketplace)
+            if _ai_ok:
                 # Adauga regulile invatate automat din rulari anterioare
                 learned = get_learned_rules()
                 existing_kws = {r.get("keywords", r.get("prefix", "")) for r in rules}
@@ -235,6 +317,10 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                     kw = r.get("keywords", r.get("prefix", ""))
                     if kw and kw not in existing_kws:
                         rules = rules + [r]
+
+                # Re-pre-procesare reguli dupa adaugarea celor invatate
+                _fast_rules = _preprocess_rules(rules, mp)
+                log.info("[%s] Pre-procesare reguli (cu invatate): %d → %d valide", marketplace, len(rules), len(_fast_rules))
 
                 # Colecteaza produsele care au nevoie de AI pentru categorie
                 needs_ai_cat = []
@@ -245,7 +331,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                     cat = str(prod.get("category") or "")
                     title = str(prod.get("name") or "")
                     # Verifica daca categoria e deja rezolvabila fara AI
-                    _, cat_action = _resolve_category(title, cat, mp, rules)
+                    _, cat_action = _resolve_category(title, cat, mp, rules, _fast_rules=_fast_rules)
                     if cat_action == "unknown":
                         needs_ai_cat.append({
                             "id": prod.get("id") or title,
@@ -254,25 +340,45 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                         })
 
                 if needs_ai_cat:
+                    _n_cat_batches = max(1, math.ceil(len(needs_ai_cat) / 60))
+                    _cat_cb_count  = [0]
+                    status_text.text(
+                        f"⏳ Faza 1/2 — AI categorii: {len(needs_ai_cat)} produse"
+                        f" → {_n_cat_batches} batch-uri (5 paralel)..."
+                    )
+                    progress_bar.progress(1)
+
+                    def _cat_status_cb(msg):
+                        _cat_cb_count[0] += 1
+                        pct = min(38, max(1, int(_cat_cb_count[0] / _n_cat_batches * 40)))
+                        progress_bar.progress(pct)
+                        status_text.text(f"⏳ Faza 1/2 — {msg}")
+
                     ai_cat_map = suggest_categories_batch(
                         needs_ai_cat,
                         mp.category_list(),
                         marketplace=marketplace,
-                        status_callback=lambda msg: status_text.text(msg),
+                        status_callback=_cat_status_cb,
                     )
+                    progress_bar.progress(40)
+                    status_text.text(f"✅ Faza 1/2 completă — {len(needs_ai_cat)} categorii determinate.")
                     # Injecteaza categoriile in produse
                     for prod in products:
                         pid = prod.get("id") or str(prod.get("name") or "")
                         if pid in ai_cat_map and ai_cat_map[pid]:
                             prod["_ai_category"] = ai_cat_map[pid]
         except Exception as e:
-            status_text.text(f"Avertisment batch AI: {e}")
+            log.error("Exceptie batch AI categorii: %s", e, exc_info=True)
+            st.error(f"❌ Eroare AI categorii: {e}")
+            status_text.text(f"⚠️ AI categorii eșuat: {e}")
 
     # Bad values patterns to clear
     SIZE_INTL = {"S INTL", "M INTL", "L INTL", "XL INTL", "XXL INTL",
                  "XS INTL", "2XL INTL", "10XL INTL", "3XL INTL"}
 
-    for i, prod in enumerate(products):
+    # ── Per-product worker (runs in ThreadPoolExecutor) ───────────────────────
+    def _process_one(i_prod):
+        i, prod = i_prod
         title   = str(prod.get("name") or "")
         desc    = str(prod.get("description") or "")
         cat     = str(prod.get("category") or "")
@@ -294,11 +400,10 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         }
 
         if err_code not in processable_codes:
-            results.append(result)
-            continue
+            return i, result
 
         # ── Fix category ──────────────────────────────────────────────────────
-        final_cat, cat_action = _resolve_category(title, cat, mp, rules)
+        final_cat, cat_action = _resolve_category(title, cat, mp, rules, _fast_rules=_fast_rules)
 
         if cat_action == "assigned":
             result["action"]       = "cat_assigned"
@@ -333,8 +438,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
 
             if not final_cat or not mp.category_id(final_cat):
                 result["needs_manual"] = True
-                results.append(result)
-                continue
+                return i, result
 
         cat_id = mp.category_id(final_cat)
 
@@ -363,7 +467,13 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         result["new_chars"] = new_chars
 
         # ── Image analysis hook (optional, backward-compatible) ───────────────
-        if image_options and (image_options.get("enable_color") or image_options.get("enable_product_hint")):
+        _img_any = image_options and (
+            image_options.get("enable_color")
+            or image_options.get("enable_product_hint")
+            or image_options.get("enable_yolo")
+            or image_options.get("enable_clip")
+        )
+        if _img_any:
             # Take only the first URL (column may contain comma-separated list)
             raw_urls = str(prod.get("image_url") or "")
             image_url = raw_urls.split(",")[0].strip()
@@ -382,14 +492,94 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                     enable_product_hint=image_options.get("enable_product_hint", False),
                     vision_provider=image_options.get("vision_provider"),
                     sku=str(prod.get("id", "")),
+                    enable_yolo=image_options.get("enable_yolo", False),
+                    enable_clip=image_options.get("enable_clip", False),
+                    yolo_model=image_options.get("yolo_model", "yolov8n.pt"),
+                    clip_model=image_options.get("clip_model", "ViT-B-32"),
+                    yolo_conf=image_options.get("yolo_conf", 0.35),
+                    clip_conf=image_options.get("clip_conf", 0.25),
+                    suggestion_only=image_options.get("suggestion_only", False),
+                    save_debug=image_options.get("save_debug", False),
+                    run_logger=image_options.get("run_logger"),
                 )
                 result["image_analysis"] = img_result.to_dict()
                 img_log_result = img_result.to_dict()
-                all_filled = {**existing, **new_chars}
-                for char_name, val in img_result.suggested_attributes.items():
-                    if not all_filled.get(char_name):
-                        new_chars[char_name] = val
-                result["new_chars"] = new_chars
+
+                # Fusion: dacă vision a returnat un hint de categorie, fusionăm cu cel text
+                if img_result.product_type_hint and img_result.product_type_confidence > 0:
+                    try:
+                        from core.vision.fusion import (
+                            fuse_category, action_to_confidence,
+                            TextCategoryResult, ImageCategoryResult,
+                        )
+                        _fusion = fuse_category(
+                            TextCategoryResult(
+                                candidate=final_cat,
+                                confidence=action_to_confidence(cat_action),
+                                source=cat_action,
+                            ),
+                            ImageCategoryResult(
+                                candidate=img_result.product_type_hint,
+                                confidence=img_result.product_type_confidence,
+                                source="vision_hint",
+                            ),
+                            rules={},
+                            run_logger=image_options.get("run_logger"),
+                            offer_id=str(prod.get("id", "")),
+                        )
+                        if _fusion.final_category and mp.category_id(_fusion.final_category):
+                            final_cat = _fusion.final_category
+                            result["new_category"] = final_cat
+                            result["fusion_reason"] = _fusion.reason
+                    except Exception:
+                        pass
+
+                # Only auto-fill if not suggestion_only mode
+                if not image_options.get("suggestion_only", False):
+                    # Strict gate: only add image suggestions that exist in tables
+                    from core.char_validator import validate_new_chars_strict
+                    img_validated, img_audit = validate_new_chars_strict(
+                        img_result.suggested_attributes, cat_id, mp, source="image"
+                    )
+                    all_filled = {**existing, **new_chars}
+                    for char_name, val in img_validated.items():
+                        if not all_filled.get(char_name):
+                            new_chars[char_name] = val
+
+                    # Rejected image suggestions → chars_reasons + needs_manual flag
+                    img_rejected = [e for e in img_audit if not e["accept"]]
+                    if img_rejected:
+                        result.setdefault("chars_reasons", []).extend(img_rejected)
+
+                    # Structured log for all image chars (accepted + rejected)
+                    if img_audit:
+                        try:
+                            from core.ai_logger import log_char_source_detail
+                            log_char_source_detail(
+                                offer_id=str(prod.get("id", "")),
+                                marketplace=marketplace,
+                                title=title,
+                                category=final_cat,
+                                char_entries=[
+                                    {
+                                        "char_name":           e["char_input"],
+                                        "char_canonical":      e["char_canonical"],
+                                        "source":              "image",
+                                        "value_input":         e["value_input"],
+                                        "value_mapped":        e["value_mapped"],
+                                        "allowed_values_count": len(
+                                            mp._valid_values.get(cat_id, {}).get(
+                                                e["char_canonical"] or e["char_input"], set()
+                                            )
+                                        ),
+                                        "validation_pass":     e["accept"],
+                                    }
+                                    for e in img_audit
+                                ],
+                            )
+                        except Exception:
+                            pass
+                    result["new_chars"] = new_chars
             except Exception as e:
                 err_dict = {"skipped_reason": str(e), "download_success": False}
                 result["image_analysis"] = err_dict
@@ -423,13 +613,33 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         if result["action"] == "skip" and (new_chars or cleared):
             result["action"] = "updated"
 
-        results.append(result)
+        return i, result
 
-        # Update progress
-        pct = int((i + 1) / total * 100)
-        progress_bar.progress(pct)
-        status_text.text(f"Procesare: {i+1}/{total} produse...")
+    # ── Execuție paralelă — 8 produse procesate simultan ──────────────────────
+    results_ordered = [None] * total
+    completed_count = 0
+    status_text.text(f"⏳ Faza 2/2 — Procesare caracteristici: 0/{total} produse...")
 
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_process_one, (i, prod)): i for i, prod in enumerate(products)}
+        for future in as_completed(futures):
+            idx, res = future.result()
+            results_ordered[idx] = res
+            completed_count += 1
+            if completed_count % 50 == 0 or completed_count == total:
+                pct = 40 + int(completed_count / total * 60)
+                progress_bar.progress(pct)
+                status_text.text(f"⏳ Faza 2/2 — Caracteristici: {completed_count}/{total} produse...")
+
+    results = [r for r in results_ordered if r is not None]
+
+    if _run_logger:
+        try:
+            _run_logger.finish()
+        except Exception:
+            pass
+
+    _reset_sleep()  # reactivează sleep-ul normal după procesare
     return results
 
 
@@ -442,7 +652,7 @@ def render():
 
     # ── Step 1: Select marketplace ────────────────────────────────────────────
     mp_names = all_marketplace_names()
-    loaded   = [n for n in mp_names if get_marketplace(n) and get_marketplace(n).is_loaded()]
+    loaded   = [n for n in mp_names if is_marketplace_available(n)]
 
     if not loaded:
         st.warning("⚠️ Niciun marketplace configurat. Mergi la **⚙️ Setup Marketplace** mai întâi.")
@@ -450,6 +660,7 @@ def render():
 
     st.subheader("1️⃣ Selectează marketplace")
     selected_mp = st.selectbox("Marketplace", loaded, key="proc_mp")
+    load_marketplace_on_select(selected_mp)
     mp = get_marketplace(selected_mp)
     _rules_key = f"{TITLE_CATEGORY_RULES_KEY}_{selected_mp}"  # reguli separate per marketplace
 
@@ -681,15 +892,26 @@ def render():
             value=False,
             help="Analizează imaginea produsului și completează automat caracteristica de culoare dacă lipsește.",
         )
+        enable_yolo = st.checkbox(
+            "Detectare obiect YOLO",
+            value=False,
+            help="Folosește YOLO pentru a detecta și decupa obiectul principal din imagine înainte de analiză.",
+        )
     with col_img2:
         enable_product_hint = st.checkbox(
             "Folosește imaginea pentru îmbunătățirea categoriei",
             value=False,
             help="Folosește un model vision (Ollama llava-phi3) pentru a sugera tipul de produs din imagine.",
         )
+        enable_clip = st.checkbox(
+            "Validare semantică CLIP",
+            value=False,
+            help="Folosește CLIP pentru a valida semantic categoria detectată față de imaginea produsului.",
+        )
 
+    _any_image = enable_color or enable_product_hint or enable_yolo or enable_clip
     image_options = None
-    if enable_color or enable_product_hint:
+    if _any_image:
         vision_provider = None
         if enable_product_hint:
             try:
@@ -697,10 +919,70 @@ def render():
                 vision_provider = build_vision_provider("ollama")
             except Exception:
                 vision_provider = None
+
+        # Advanced options (shown only when at least one image option is active)
+        with st.expander("⚙️ Setări avansate imagine", expanded=False):
+            col_a1, col_a2 = st.columns(2)
+            with col_a1:
+                yolo_model = st.selectbox(
+                    "Model YOLO",
+                    ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"],
+                    index=0,
+                    disabled=not enable_yolo,
+                    help="Dimensiunea modelului YOLO: n=nano (rapid), s=small, m=medium.",
+                )
+                yolo_conf = st.slider(
+                    "Prag confidență YOLO",
+                    min_value=0.10, max_value=0.90, value=0.35, step=0.05,
+                    disabled=not enable_yolo,
+                    help="Detecțiile sub acest prag sunt ignorate.",
+                )
+            with col_a2:
+                clip_model = st.selectbox(
+                    "Model CLIP",
+                    ["ViT-B-32", "ViT-L-14"],
+                    index=0,
+                    disabled=not enable_clip,
+                    help="ViT-B-32 = rapid; ViT-L-14 = mai precis dar mai lent.",
+                )
+                clip_conf = st.slider(
+                    "Prag confidență CLIP",
+                    min_value=0.10, max_value=0.90, value=0.25, step=0.05,
+                    disabled=not enable_clip,
+                    help="Scorul CLIP sub acest prag nu este luat în considerare.",
+                )
+            col_b1, col_b2 = st.columns(2)
+            with col_b1:
+                image_strategy = st.selectbox(
+                    "Strategie imagini",
+                    ["first_only", "best_confidence", "aggregate_vote"],
+                    index=0,
+                    help="first_only=prima imagine; best_confidence=cea cu scorul YOLO mai mare; aggregate_vote=vot majoritar.",
+                )
+                suggestion_only = st.checkbox(
+                    "Doar sugestii (nu completează automat)",
+                    value=False,
+                    help="Când activ, rezultatele din imagine sunt vizibile dar nu suprascriu caracteristicile.",
+                )
+            with col_b2:
+                save_debug = st.checkbox(
+                    "Salvează crop/overlay debug",
+                    value=False,
+                    help="Salvează imaginile decupate și overlay-urile YOLO pentru inspecție manuală.",
+                )
         image_options = {
             "enable_color": enable_color,
             "enable_product_hint": enable_product_hint,
+            "enable_yolo": enable_yolo,
+            "enable_clip": enable_clip,
             "vision_provider": vision_provider,
+            "yolo_model": yolo_model if enable_yolo else "yolov8n.pt",
+            "clip_model": clip_model if enable_clip else "ViT-B-32",
+            "yolo_conf": yolo_conf if enable_yolo else 0.35,
+            "clip_conf": clip_conf if enable_clip else 0.25,
+            "image_strategy": image_strategy,
+            "suggestion_only": suggestion_only,
+            "save_debug": save_debug,
         }
 
     if st.button(f"🚀 Pornește procesarea pentru {selected_mp}", type="primary", use_container_width=True):
@@ -716,6 +998,12 @@ def render():
 
         from core.state import save_dashboard_stats
         save_dashboard_stats(results)
+
+        try:
+            from core.reference_store_duckdb import save_process_run
+            save_process_run(results, selected_mp)
+        except Exception:
+            pass
 
         from core.logger import write_log
         file_name = st.session_state.get("offers_file_name", "necunoscut.xlsx")
@@ -740,4 +1028,51 @@ def render():
         col4.metric("Valori invalide șterse", n_cleared)
         col5.metric("Necesită review manual", n_manual)
 
-        st.info("Mergi la **📊 Results** pentru a revizui și descărca fișierul.")
+        # ── Auto-save export la finalizare ────────────────────────────────────
+        _file_bytes = st.session_state.get("offers_file_buf")
+        _products   = st.session_state.get("offers_products", [])
+        _file_name  = st.session_state.get("offers_file_name", "offers.xlsx")
+        _base_name  = _file_name.rsplit(".", 1)[0]
+
+        try:
+            import time as _time
+            from datetime import datetime as _dt
+            from pathlib import Path as _Path
+            from core.exporter import export_model_format
+
+            _exports_dir = _Path(__file__).parent.parent / "data" / "exports"
+            _exports_dir.mkdir(parents=True, exist_ok=True)
+
+            # Curăță fișierele mai vechi de 24h
+            _cutoff = _time.time() - 24 * 3600
+            for _f in _exports_dir.glob("*.xlsx"):
+                try:
+                    if _f.stat().st_mtime < _cutoff:
+                        _f.unlink()
+                except Exception:
+                    pass
+
+            _auto_bytes = export_model_format(
+                io.BytesIO(_file_bytes) if _file_bytes else None,
+                results,
+                _products,
+            )
+            _ts = _dt.now().strftime("%Y-%m-%d_%H-%M-%S")
+            _mp_slug = selected_mp.replace(" ", "_") if selected_mp else "export"
+            _auto_fname = f"{_base_name}_model.xlsx"
+            _save_path = _exports_dir / f"{_ts}_{_mp_slug}_{_auto_fname}"
+            _save_path.write_bytes(_auto_bytes)
+
+            st.markdown("---")
+            st.download_button(
+                f"⬇️ Descarcă {_auto_fname}",
+                data=_auto_bytes,
+                file_name=_auto_fname,
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+            st.caption(f"💾 Salvat automat în: `{_save_path}`")
+        except Exception as _e:
+            st.warning(f"⚠️ Auto-save eșuat: {_e}")
+            st.info("Mergi la **📊 Results** pentru a descărca fișierul.")
