@@ -112,10 +112,21 @@ class ImageAnalysisResult:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _missing_color_char(color_chars, mandatory_chars, all_filled) -> Optional[str]:
+def _missing_color_char(color_chars, mandatory_chars, all_filled, available_chars=None) -> Optional[str]:
+    """Return the first color characteristic that is missing and should be filled.
+
+    Priority:
+      1. Mandatory chars that are missing (original behaviour).
+      2. Non-mandatory chars that exist in the category's characteristic list
+         (available_chars) and are not yet filled.
+    """
     for ch in color_chars:
         if ch in mandatory_chars and not all_filled.get(ch):
             return ch
+    if available_chars:
+        for ch in color_chars:
+            if ch in available_chars and not all_filled.get(ch):
+                return ch
     return None
 
 
@@ -332,8 +343,11 @@ def analyze_product_image(
             result.color_confidence           = color_res.confidence
             result.is_multicolor              = color_res.is_multicolor
 
-            # Determine which color char is missing + mandatory
-            missing_char = _missing_color_char(color_chars, mandatory_chars, existing_chars)
+            # Determine which color char is missing + should be filled
+            missing_char = _missing_color_char(
+                color_chars, mandatory_chars, existing_chars,
+                available_chars=set(valid_values_for_cat.keys()),
+            )
 
             if run_logger:
                 run_logger.log(
