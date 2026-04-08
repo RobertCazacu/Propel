@@ -297,3 +297,52 @@ def read_ai_log(path: Path) -> list[dict]:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return []
+
+
+def write_run_to_duckdb(
+    *,
+    run_id: str,
+    ean: str | None,
+    offer_id: str | None,
+    marketplace: str,
+    model_used: str,
+    tokens_input: int,
+    tokens_output: int,
+    cost_usd: float,
+    fields_requested: int,
+    fields_accepted: int,
+    fields_rejected: int,
+    retry_count: int,
+    fallback_used: bool,
+    duration_ms: int,
+    structured_mode: str = "off",
+    structured_attempted: bool = False,
+    structured_success: bool = False,
+    structured_fallback_used: bool = False,
+    structured_latency_ms: int = 0,
+    structured_model_used: str = "",
+    schema_fields_count: int = 0,
+    shadow_diff: dict | None = None,
+) -> None:
+    """Scrie telemetry în ai_run_log DuckDB. Silent fail dacă DuckDB nu e disponibil."""
+    try:
+        from core.reference_store_duckdb import write_ai_run_log
+        write_ai_run_log(
+            run_id=run_id, ean=ean, offer_id=offer_id,
+            marketplace=marketplace, model_used=model_used,
+            tokens_input=tokens_input, tokens_output=tokens_output,
+            cost_usd=cost_usd, fields_requested=fields_requested,
+            fields_accepted=fields_accepted, fields_rejected=fields_rejected,
+            retry_count=retry_count, fallback_used=fallback_used,
+            duration_ms=duration_ms,
+            structured_mode=structured_mode,
+            structured_attempted=structured_attempted,
+            structured_success=structured_success,
+            structured_fallback_used=structured_fallback_used,
+            structured_latency_ms=structured_latency_ms,
+            structured_model_used=structured_model_used,
+            schema_fields_count=schema_fields_count,
+            shadow_diff=shadow_diff,
+        )
+    except Exception:
+        pass  # Telemetry nu blochează niciodată procesarea

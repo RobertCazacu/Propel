@@ -3,9 +3,9 @@ Strict validation gate for characteristic name/value matching.
 
 All values emitted to output must pass through validate_new_chars_strict:
 - char_name must exist in the characteristics table for the category
-- value must be mappable to an entry in the values table
-
-Nothing is accepted by guessing or free-text injection.
+- value must be mappable to an entry in the values table, OR
+- for non-restrictive characteristics with no values defined, the raw value
+  is accepted as freeform (by design — these fields allow free text).
 """
 from __future__ import annotations
 
@@ -44,8 +44,8 @@ def validate_new_chars_strict(
     Rejection reasons:
         char_not_in_characteristics  — char_name unknown for this category
         value_not_in_values_table    — char exists but value has no valid match
-        no_values_defined_for_char   — char exists but values table is empty for it
-                                       (freeform chars without marketplace fallback)
+        no_values_defined_for_char   — char is restrictive and values table is empty
+                                       (freeform non-restrictive chars are accepted as-is)
     """
     accepted: dict = {}
     audit_log: list[dict] = []

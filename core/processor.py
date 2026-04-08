@@ -4,6 +4,8 @@ Detects values from product title + description using rule-based logic,
 validates against the marketplace valid-values list, and fills gaps.
 """
 import re
+import functools
+import weakref
 from bs4 import BeautifulSoup
 from typing import Optional
 from core.loader import MarketplaceData
@@ -12,9 +14,15 @@ from core.app_logger import get_logger
 log = get_logger("marketplace.processor")
 
 
+@functools.lru_cache(maxsize=512)
+def _compile_wb(kw: str):
+    """Cache compiled word-boundary patterns — keywords are finite (~200 unique)."""
+    return re.compile(r"\b" + re.escape(kw) + r"\b")
+
+
 def _wb(kw: str, text: str) -> bool:
     """Word-boundary match: prevents 'alb' matching 'album', 'rosu' matching 'caramiziu'."""
-    return bool(re.search(r"\b" + re.escape(kw) + r"\b", text))
+    return bool(_compile_wb(kw).search(text))
 
 
 def strip_html(html: str) -> str:
@@ -28,10 +36,41 @@ def strip_html(html: str) -> str:
         return str(html)
 
 
+def _get_mandatory_missing_for_ai(
+    cat_id: str,
+    combined_existing: dict,
+    data: "MarketplaceData",
+) -> list:
+    """Returnează caracteristicile mandatory care lipsesc SAU au valori invalide.
+
+    P02: Include și câmpurile cu valori prezente dar invalide față de valid_values,
+    astfel încât AI poate corecta valori greșite detectate de reguli.
+    """
+    mandatory = data.mandatory_chars(cat_id)
+    missing = []
+    for ch in mandatory:
+        val = combined_existing.get(ch)
+        if not val:
+            missing.append(ch)
+            continue
+        vs = data.valid_values(cat_id, ch)
+        if vs and val not in vs:
+            missing.append(ch)
+    return missing
+
+
 def extract_size_from_title(title: str) -> Optional[str]:
-    """Extract size from last ' - ' segment of title."""
+    """Extract size from last ' - ' segment of title.
+
+    Returns None for: missing title, no separator, or empty segment after separator.
+    P08: uses `or None` to convert empty string to None.
+    """
+    if not title:
+        return None
     parts = title.rsplit(" - ", 1)
-    return parts[1].strip() if len(parts) == 2 else None
+    if len(parts) != 2:
+        return None
+    return parts[1].strip() or None   # P08: "" → None
 
 
 # ── Individual detectors ───────────────────────────────────────────────────────
@@ -54,14 +93,18 @@ def detect_marime(title: str, data: MarketplaceData, cat_id, char_name: str = "M
         if not data.valid_values(cat_id, char_name):
             try:
                 num = float(size_num.replace(",", "."))
-                return f"{num:g} EU"
+                # P20: filter year-like numbers (>200 or <1) — anti year-in-title false positive
+                if 1 <= num <= 200:
+                    return f"{num:g} EU"
             except ValueError:
                 pass
     # Daca nu exista lista de valori permise (camp freeform), returneaza marimea formatata
     if not data.valid_values(cat_id, char_name):
         try:
             num = float(size_raw.replace(",", "."))
-            return f"{num:g} EU"
+            # P20: filter year-like numbers (>200 or <1)
+            if 1 <= num <= 200:
+                return f"{num:g} EU"
         except ValueError:
             return size_raw.strip()
     return None
@@ -87,12 +130,16 @@ def detect_culoare_baza(title: str, desc: str, data: MarketplaceData, cat_id,
         (["auriu", "gold", "aur", "aurie"],       "Auriu"),
     ]
     vs = data.valid_values(cat_id, char_name)
-    if not vs:
-        return None  # fara lista valida nu putem sti ce valoare e corecta
     for keywords, color in mapping:
         if any(_wb(kw, text) for kw in keywords):
-            if color in vs:
-                log.debug("detect_culoare_baza: %r → %r", keywords, color)
+            if vs:
+                found = data.find_valid(color, cat_id, char_name)
+                if found:
+                    log.debug("detect_culoare_baza: %r → %r", keywords, found)
+                    return found
+            else:
+                # P19: freeform field — returnează valoarea detectată direct
+                log.debug("detect_culoare_baza freeform: %r → %r", keywords, color)
                 return color
     return None
 
@@ -132,8 +179,9 @@ def detect_imprimeu(title: str, desc: str, data: MarketplaceData, cat_id) -> Opt
         return None
     if any(_wb(x, text) for x in ["logo", "swoosh", "jumpman", "brand", "emblem"]) and "Logo" in vs:
         return "Logo"
-    if any(_wb(x, text) for x in ["grafic", "graphic", "print", "imprimeu", "pattern", "model", "all over"]) and "Cu model" in vs:
-        return "Cu model"
+    if any(_wb(x, text) for x in ["grafic", "graphic", "imprimeu", "pattern", "all over", "all-over"]):
+        found = data.find_valid("Cu model", cat_id, "Imprimeu:")
+        if found: return found
     if any(_wb(x, text) for x in ["uni color", "unicolor", "solid", "simplu", "plain"]) and "Uni" in vs:
         return "Uni"
     return None
@@ -159,9 +207,10 @@ def detect_material(title: str, desc: str, data: MarketplaceData, cat_id,
         return None  # fara lista valida nu putem sti ce valoare e corecta
     for keywords, mat in checks:
         if any(_wb(kw, text) for kw in keywords):
-            if mat in vs:
-                log.debug("detect_material: %r → %r", keywords, mat)
-                return mat
+            found = data.find_valid(mat, cat_id, char_name)
+            if found:
+                log.debug("detect_material: %r → %r", keywords, found)
+                return found
     return None
 
 
@@ -170,14 +219,18 @@ def detect_croiala(title: str, desc: str, data: MarketplaceData, cat_id) -> Opti
     vs = data.valid_values(cat_id, "Croiala:")
     if not vs:
         return None
-    if any(_wb(x, text) for x in ["slim fit", "slim-fit", "fitted", "slim"]) and "Slim fit" in vs:
-        return "Slim fit"
-    if any(_wb(x, text) for x in ["regular fit", "regular-fit", "standard"]) and "Regular fit" in vs:
-        return "Regular fit"
-    if any(_wb(x, text) for x in ["lejer", "loose", "relaxed", "oversized", "wide"]) and "Lejer" in vs:
-        return "Lejer"
-    if any(_wb(x, text) for x in ["compresie", "compression", "tight"]) and "De compresie" in vs:
-        return "De compresie"
+    if any(_wb(x, text) for x in ["slim fit", "slim-fit", "fitted", "slim"]):
+        found = data.find_valid("Slim fit", cat_id, "Croiala:")
+        if found: return found
+    if any(_wb(x, text) for x in ["regular fit", "regular-fit", "standard"]):
+        found = data.find_valid("Regular fit", cat_id, "Croiala:")
+        if found: return found
+    if any(_wb(x, text) for x in ["lejer", "loose", "relaxed", "oversized", "wide"]):
+        found = data.find_valid("Lejer", cat_id, "Croiala:")
+        if found: return found
+    if any(_wb(x, text) for x in ["compresie", "compression", "tight"]):
+        found = data.find_valid("De compresie", cat_id, "Croiala:")
+        if found: return found
     return None
 
 
@@ -187,17 +240,17 @@ def detect_lungime_maneca(title: str, desc: str, data: MarketplaceData, cat_id) 
     if not vs:
         return None
     if any(_wb(x, text) for x in ["fara maneca", "sleeveless", "maieu", "maiou", "tank", "vest"]):
-        if "Fara maneca" in vs:
-            return "Fara maneca"
+        found = data.find_valid("Fara maneca", cat_id, "Lungime maneca:")
+        if found: return found
     if any(_wb(x, text) for x in ["maneca lunga", "long sleeve", "long-sleeve"]):
-        if "Maneca lunga" in vs:
-            return "Maneca lunga"
+        found = data.find_valid("Maneca lunga", cat_id, "Lungime maneca:")
+        if found: return found
     if any(_wb(x, text) for x in ["maneca scurta", "short sleeve", "short-sleeve", "tricou", "t-shirt", "tee"]):
-        if "Maneca scurta" in vs:
-            return "Maneca scurta"
+        found = data.find_valid("Maneca scurta", cat_id, "Lungime maneca:")
+        if found: return found
     if any(_wb(x, text) for x in ["trei sferturi", "3/4", "three quarter"]):
-        if "Maneca trei sferturi" in vs:
-            return "Maneca trei sferturi"
+        found = data.find_valid("Maneca trei sferturi", cat_id, "Lungime maneca:")
+        if found: return found
     return None
 
 
@@ -222,9 +275,10 @@ def detect_sport(title: str, desc: str, data: MarketplaceData, cat_id) -> Option
         return None  # fara lista valida nu putem sti ce valoare e corecta
     for sport, keywords in sports:
         if any(_wb(kw, text) for kw in keywords):
-            if sport in vs:
-                log.debug("detect_sport: %r → %r", keywords, sport)
-                return sport
+            found = data.find_valid(sport, cat_id, "Sport:")
+            if found:
+                log.debug("detect_sport: %r → %r", keywords, found)
+                return found
     return None
 
 
@@ -233,12 +287,16 @@ def detect_sezon(title: str, desc: str, data: MarketplaceData, cat_id) -> Option
     vs = data.valid_values(cat_id, "Sezon:")
     if not vs:
         return None
-    if any(_wb(x, text) for x in ["iarna", "winter", "fleece", "thermal", "therma", "thermo", "warm", "caldura", "polar"]):
-        if "Toamna-Iarna" in vs:
-            return "Toamna-Iarna"
-    if any(_wb(x, text) for x in ["vara", "summer", "light", "usor", "lightweight", "breathable", "respirabil"]):
-        if "Primavara-Vara" in vs:
-            return "Primavara-Vara"
+    _winter_hard = ["iarna", "winter", "thermal", "therma", "thermo", "warm", "caldura", "polar"]
+    _lightweight_kw = ["light", "usor", "lightweight", "breathable", "respirabil"]
+    _is_winter = any(_wb(x, text) for x in _winter_hard)
+    _is_fleece_heavy = _wb("fleece", text) and not any(_wb(x, text) for x in _lightweight_kw)
+    if _is_winter or _is_fleece_heavy:
+        found = data.find_valid("Toamna-Iarna", cat_id, "Sezon:")
+        if found: return found
+    if any(_wb(x, text) for x in ["vara", "summer"] + _lightweight_kw):
+        found = data.find_valid("Primavara-Vara", cat_id, "Sezon:")
+        if found: return found
     return None
 
 
@@ -254,7 +312,7 @@ def detect_tip_produs(title: str, data: MarketplaceData, cat_id) -> Optional[str
         (["geaca", "jacket", "parka", "anorak"],        "Geaca"),
         (["jacheta"],                                    "Jacheta"),
         (["pantalon", "jogger", "pant", "trouser"],     "Pantaloni"),
-        (["sort", "short"],                             "Pantaloni"),
+        (["sort", "pantaloni scurti", "shorts"],        "Pantaloni"),
         (["colanti", "legging", "tight"],               "Colanti"),
         (["sapca", "cap", "hat", "bucket hat"],         "Sapca"),
         (["caciula", "beanie", "boneta"],               "Caciula"),
@@ -265,8 +323,10 @@ def detect_tip_produs(title: str, data: MarketplaceData, cat_id) -> Optional[str
         (["manusi", "gloves", "glove"],                 "Manusi"),
     ]
     for keywords, tip in checks:
-        if any(_wb(kw, t) for kw in keywords) and tip in vs:
-            return tip
+        if any(_wb(kw, t) for kw in keywords):
+            found = data.find_valid(tip, cat_id, "Tip produs:")
+            if found:
+                return found
     return None
 
 
@@ -294,8 +354,10 @@ def detect_sistem_inchidere(title: str, desc: str, data: MarketplaceData, cat_id
         (["catarama", "buckle"],                 "Catarama"),
     ]
     for keywords, val in checks:
-        if any(_wb(kw, text) for kw in keywords) and val in vs:
-            return val
+        if any(_wb(kw, text) for kw in keywords):
+            found = data.find_valid(val, cat_id, "Sistem inchidere:")
+            if found:
+                return found
     return None
 
 
@@ -305,16 +367,25 @@ def detect_stil(title: str, desc: str, data: MarketplaceData, cat_id, char_name:
     if not vs:
         return None
     # Pantofi profile
-    if "Profil inalt" in vs:
-        if any(_wb(x, text) for x in ["high top", "high-top", "inalti"]): return "Profil inalt"
-    if "Profil jos" in vs:
-        if any(_wb(x, text) for x in ["low", "low-top", "joasa"]): return "Profil jos"
-    if "Profil mediu" in vs:
-        if any(_wb(x, text) for x in ["mid", "mid-top", "mediu"]): return "Profil mediu"
+    if any(_wb(x, text) for x in ["high top", "high-top", "inalti"]):
+        found = data.find_valid("Profil inalt", cat_id, char_name)
+        if found: return found
+    if any(_wb(x, text) for x in ["low", "low-top", "joasa"]):
+        found = data.find_valid("Profil jos", cat_id, char_name)
+        if found: return found
+    if any(_wb(x, text) for x in ["mid", "mid-top", "mediu"]):
+        found = data.find_valid("Profil mediu", cat_id, char_name)
+        if found: return found
     # Sapca
-    if "Snapback" in vs and _wb("snapback", text): return "Snapback"
-    if "Baseball" in vs and _wb("baseball", text): return "Baseball"
-    if "Bucket" in vs and _wb("bucket", text): return "Bucket"
+    if _wb("snapback", text):
+        found = data.find_valid("Snapback", cat_id, char_name)
+        if found: return found
+    if _wb("baseball", text):
+        found = data.find_valid("Baseball", cat_id, char_name)
+        if found: return found
+    if _wb("bucket", text):
+        found = data.find_valid("Bucket", cat_id, char_name)
+        if found: return found
     return None
 
 
@@ -344,10 +415,18 @@ def detect_tip_inchidere(title: str, desc: str, data: MarketplaceData, cat_id) -
     vs = data.valid_values(cat_id, "Tip inchidere:")
     if not vs:
         return None
-    if any(_wb(x, text) for x in ["fermoar", "zip"]) and "Fermoar" in vs: return "Fermoar"
-    if any(_wb(x, text) for x in ["capse", "snap"]) and "Capse" in vs: return "Capse"
-    if any(_wb(x, text) for x in ["nasturi", "button"]) and "Nasturi" in vs: return "Nasturi"
-    if any(_wb(x, text) for x in ["arici", "velcro"]) and "Velcro" in vs: return "Velcro"
+    if any(_wb(x, text) for x in ["fermoar", "zip"]):
+        found = data.find_valid("Fermoar", cat_id, "Tip inchidere:")
+        if found: return found
+    if any(_wb(x, text) for x in ["capse", "snap"]):
+        found = data.find_valid("Capse", cat_id, "Tip inchidere:")
+        if found: return found
+    if any(_wb(x, text) for x in ["nasturi", "button"]):
+        found = data.find_valid("Nasturi", cat_id, "Tip inchidere:")
+        if found: return found
+    if any(_wb(x, text) for x in ["arici", "velcro"]):
+        found = data.find_valid("Velcro", cat_id, "Tip inchidere:")
+        if found: return found
     return None
 
 
@@ -357,9 +436,15 @@ def detect_lungime(title: str, desc: str, data: MarketplaceData, cat_id, char_na
     vs = data.valid_values(cat_id, char_name)
     if not vs:
         return None
-    if any(_wb(x, text) for x in ["scurti", "short", "sort"]) and "Scurti" in vs: return "Scurti"
-    if any(_wb(x, text) for x in ["trei sferturi", "3/4"]) and "Trei sferturi" in vs: return "Trei sferturi"
-    if any(_wb(x, text) for x in ["lungi", "long", "full"]) and "Lungi" in vs: return "Lungi"
+    if any(_wb(x, text) for x in ["scurti", "sort"]):
+        found = data.find_valid("Scurti", cat_id, char_name)
+        if found: return found
+    if any(_wb(x, text) for x in ["trei sferturi", "3/4"]):
+        found = data.find_valid("Trei sferturi", cat_id, char_name)
+        if found: return found
+    if any(_wb(x, text) for x in ["lungi", "long", "full"]):
+        found = data.find_valid("Lungi", cat_id, char_name)
+        if found: return found
     return None
 
 
@@ -394,6 +479,11 @@ ALL_DETECTORS = [
     ("Материал:",            lambda t, d, mp, cid: detect_material(t, d, mp, cid, "Материал:")),
 ]
 
+# Module-level cache: WeakKeyDictionary data -> {cat_id -> tuple of (char_name, detector)}.
+# P05: WeakKeyDictionary previne refolosirea cache-ului după GC (id(data) reuse).
+# Entriile expiră automat când obiectul data e distrus.
+_applicable_detectors_cache: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+
 
 def process_product(
     title: str,
@@ -424,11 +514,23 @@ def process_product(
     _char_log: list[dict] = []
 
     # ── Rule-based detection ──────────────────────────────────────────────────
-    for char_name, detector in ALL_DETECTORS:
+    # Cache applicable detectors per (data, cat_id) via WeakKeyDictionary.
+    # P05: WeakKeyDictionary auto-expires entries when data is GC'd, preventing
+    # stale cache reuse after memory address recycling (id(data) reuse).
+    _data_cache = _applicable_detectors_cache.setdefault(data, {})
+    if cat_id not in _data_cache:
+        _data_cache[cat_id] = tuple(
+            (cn, det) for cn, det in ALL_DETECTORS if data.has_char(cat_id, cn)
+        )
+        if not _data_cache[cat_id]:
+            log.warning(
+                "Niciun detector aplicabil pentru cat_id=%s cat_name=%r — verifică caracteristicile importate",
+                cat_id, cat_name,
+            )
+    applicable = _data_cache[cat_id]
+
+    for char_name, detector in applicable:
         if char_name in existing_chars and existing_chars[char_name]:
-            continue
-        # Skip detector daca acest camp nu apartine marketplace-ului curent
-        if not data.has_char(cat_id, char_name):
             continue
         try:
             val = detector(title, desc_clean, data, cat_id)
@@ -453,8 +555,7 @@ def process_product(
             from core.ai_enricher import enrich_with_ai, is_configured
             if is_configured():
                 combined_existing = {**existing_chars, **results}
-                mandatory = data.mandatory_chars(cat_id)
-                mandatory_missing = [c for c in mandatory if not combined_existing.get(c)]
+                mandatory_missing = _get_mandatory_missing_for_ai(cat_id, combined_existing, data)  # P02
 
                 # Log freeform mandatory fields (no valid values defined)
                 for ch in mandatory_missing:
@@ -472,10 +573,11 @@ def process_product(
                         title[:60], mandatory_missing,
                     )
                     char_options = {
-                        ch: vals
+                        ch: sorted(vals)[:50] if len(vals) > 50 else vals
                         for ch, vals in data._valid_values.get(cat_id, {}).items()
-                        if not combined_existing.get(ch) and len(vals) <= 40
+                        if not combined_existing.get(ch) and len(vals) <= 80
                     }
+                    _meta = product_meta or {}
                     ai_fills, ai_suggested = enrich_with_ai(
                         title=title,
                         description=desc_clean,
@@ -485,8 +587,10 @@ def process_product(
                         valid_values_for_cat=data._valid_values.get(cat_id, {}),
                         mandatory_chars=mandatory_missing,
                         marketplace=marketplace,
-                        product_meta=product_meta,
+                        product_meta=_meta,
                         data=data,
+                        ean=_meta.get("ean") or None,
+                        brand=_meta.get("brand") or None,
                     )
                     _cat_vals = data._valid_values.get(cat_id, {})
                     for k, v in ai_fills.items():
@@ -600,6 +704,11 @@ def validate_existing(
         if not value:
             continue
         vs = data.valid_values(cat_id, char_name)
-        if vs and str(value).strip() not in vs:
-            invalid[char_name] = value
+        if vs:
+            val_str = str(value).strip()
+            if val_str not in vs:
+                # Fallback: case-insensitive check înainte de a marca ca invalid
+                vs_lower = {v.lower() for v in vs}
+                if val_str.lower() not in vs_lower:
+                    invalid[char_name] = value
     return invalid

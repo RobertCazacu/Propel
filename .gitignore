@@ -49,6 +49,10 @@ data/reference_data.duckdb
 # ── Export files (auto-saved, 24h retention) ───────────────────────────────────
 data/exports/
 
+# ── Node.js ────────────────────────────────────────────────────────────────────
+node_modules/
+package-lock.json
+
 # ── Stray debug/temp files at root ─────────────────────────────────────────────
 /0
 /dict

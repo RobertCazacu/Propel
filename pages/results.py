@@ -38,6 +38,17 @@ def render():
 
     results = st.session_state.get("process_results", [])
     if not results:
+        marketplace = st.session_state.get("active_mp", "")
+        if marketplace:
+            if st.button("📂 Încarcă ultima sesiune"):
+                from core.reference_store_duckdb import load_last_process_run
+                loaded = load_last_process_run(marketplace)
+                if loaded:
+                    st.session_state["process_results"] = loaded
+                    st.session_state["process_results_mp"] = marketplace
+                    st.rerun()
+                else:
+                    st.warning("Nu există sesiune salvată pentru acest marketplace.")
         st.info("Nu există rezultate de afișat. Mergi la **📁 Process Offers** și rulează procesarea.")
         return
 

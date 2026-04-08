@@ -244,7 +244,10 @@ def _dominant_rgb_ignore_bg(
         (p[0] // _q * _q, p[1] // _q * _q, p[2] // _q * _q)
         for p in border_samples
     )
-    bg = bg_cnt.most_common(1)[0][0]
+    _top_bg = bg_cnt.most_common(1)   # P09: bounds check înainte de index
+    if not _top_bg:
+        return (0, 0, 0), []
+    bg = _top_bg[0][0]
 
     # Quantize palette
     q = img.quantize(colors=palette_size, method=Image.Quantize.FASTOCTREE)

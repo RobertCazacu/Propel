@@ -8,19 +8,79 @@ Strategii de optimizare:
 4. AI doar pentru caracteristici obligatorii lipsa — skip daca regulile au acoperit tot
 """
 import json
+import os
 import re
+import random
 import hashlib
 import time
 import threading
+import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from core.app_logger import get_logger
 from core.llm_router import get_router
-from core.ai_logger import log_category_batch, log_char_enrichment
+from core.ai_logger import log_category_batch, log_char_enrichment, write_run_to_duckdb
+from core.reference_store_duckdb import get_product_knowledge, upsert_product_knowledge, marketplace_id_slug
+from core.schema_builder import SchemaBuilder, build_json_schema
+
+
+# ── Structured output config ───────────────────────────────────────────────────
+
+def get_structured_config() -> dict:
+    """Citește config structured output din session_state (UI) sau env.
+
+    Returns dict cu cheile:
+      mode: 'off' | 'shadow' | 'on'
+      sample: float [0..1]
+      provider_only: bool
+    """
+    try:
+        import streamlit as st
+        cfg = st.session_state.get("structured_output_config", {})
+    except Exception:
+        cfg = {}
+
+    return {
+        "mode":          cfg.get("mode",          os.getenv("AI_STRUCTURED_MODE", "off")),
+        "sample":        float(cfg.get("sample",  os.getenv("AI_STRUCTURED_SAMPLE", "0.10"))),
+        "provider_only": cfg.get("provider_only", os.getenv("AI_STRUCTURED_PROVIDER_ONLY", "true").lower() == "true"),
+    }
+
+
+def _should_run_structured(cfg: dict, provider_name: str) -> bool:
+    """Decide dacă structured output trebuie rulat pentru această cerere."""
+    mode = cfg.get("mode", "off")
+    if mode == "off":
+        return False
+    # Verifică restricție provider
+    if cfg.get("provider_only", True) and provider_name != "anthropic":
+        return False
+    # Sampling
+    sample = float(cfg.get("sample", 0.10))
+    return random.random() < sample
 
 log = get_logger("marketplace.ai")
 
 CACHE_PATH = Path(__file__).parent.parent / "data" / "ai_cache.json"
+
+
+def _normalize_title(title: str) -> str:
+    """Normalizează titlul pentru knowledge store matching.
+
+    'Samsung Galaxy S24 128GB Negru!' → 'samsung galaxy s24 128gb negru'
+    """
+    # Lowercase
+    s = title.lower().strip()
+    # Remove diacritice
+    s = unicodedata.normalize("NFD", s)
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    # Remove punctuatie, păstrează alfanumeric și spații
+    s = re.sub(r"[^\w\s]", " ", s)
+    # Collapse whitespace
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
 _cache_lock = threading.Lock()
+_merge_lock = threading.Lock()   # P01: protejează citirea+scrierea learned_title_rules
 
 # Load .env if present
 try:
@@ -79,22 +139,63 @@ def _done_key(title: str, category: str, marketplace: str = "") -> str:
     return hashlib.md5(f"done|{marketplace}|{title.strip().lower()}|{category}".encode()).hexdigest()
 
 
-_MAX_AI_RETRIES = 2
+_MAX_AI_RETRIES = 4
+_RATE_LIMIT_BASE_SLEEP = 10  # secunde — backoff initial pentru 429
+
+
+def _sanitize_for_prompt(text: str, max_len: int = 300) -> str:
+    """P10: Sanitizează input utilizator pentru inserare sigură în prompt LLM.
+
+    Elimină newline-uri (ar putea injecta instrucțiuni noi),
+    escape-ează ghilimele duble (sparg structura JSON așteptată),
+    truncată la max_len pentru a limita token-ii și vectorii de injecție.
+    """
+    if not text:
+        return ""
+    text = str(text).replace("\n", " ").replace("\r", " ")
+    text = text.replace('"', '\\"')
+    return text[:max_len]
 
 
 def _complete_with_retry(prompt: str, max_tok: int, system: str, temperature: float) -> str:
-    """Calls router.complete with up to _MAX_AI_RETRIES retries on transient errors."""
+    """Calls router.complete with up to _MAX_AI_RETRIES retries.
+
+    Handling:
+    - 429 RateLimitError → exponential backoff (10s, 20s, 40s, 80s)
+    - TimeoutError / ConnectionError → retry imediat (max 2×)
+    """
     router = get_router()
     last_exc: Exception = Exception("unknown")
+    rate_sleep = _RATE_LIMIT_BASE_SLEEP
+
     for attempt in range(_MAX_AI_RETRIES + 1):
         try:
             return router.complete(prompt, max_tok, system=system, temperature=temperature)
-        except (TimeoutError, ConnectionError) as exc:
+        except Exception as exc:
             last_exc = exc
-            if attempt < _MAX_AI_RETRIES:
+            exc_str = str(type(exc).__name__)
+            is_rate_limit = (
+                "RateLimitError" in exc_str
+                or "rate_limit" in str(exc).lower()
+                or "429" in str(exc)
+                or "overloaded" in str(exc).lower()
+            )
+            if is_rate_limit and attempt < _MAX_AI_RETRIES:
+                # Jitter: ±50% din sleep pentru a evita thundering herd cu workeri paraleli
+                jitter = random.uniform(0, rate_sleep * 0.5)
+                actual_sleep = rate_sleep + jitter
+                log.warning(
+                    "Rate limit API (attempt %d/%d) — backoff %.0fs...",
+                    attempt + 1, _MAX_AI_RETRIES + 1, actual_sleep,
+                )
+                time.sleep(actual_sleep)
+                rate_sleep = min(rate_sleep * 2, 120)  # max 2 minute sleep
+            elif isinstance(exc, (TimeoutError, ConnectionError)) and attempt < _MAX_AI_RETRIES:
                 log.warning("AI call failed (attempt %d/%d): %s — retrying...",
                             attempt + 1, _MAX_AI_RETRIES + 1, exc)
-                time.sleep(1)
+                time.sleep(2)
+            else:
+                raise
     raise last_exc
 
 
@@ -146,35 +247,89 @@ _MP_ALIASES: list[tuple[list[str], str]] = [
 
 
 def _build_char_system_prompt(marketplace: str) -> str:
-    """Prompt de sistem static pentru enrichment caracteristici — nu conține date de produs."""
+    """Prompt de sistem static pentru enrichment caracteristici.
+
+    Înlocuiește vechiul prompt cu _reasoning (tokeni irosiți).
+    Noul câmp _src capturează semnalul cheie folosit — util pentru audit log.
+    """
     return (
-        f"Ești un expert în clasificarea produselor pe marketplace-uri.\n"
-        f"Marketplace activ: {_mp_ctx(marketplace)}\n\n"
-        "REGULI STRICTE:\n"
-        "1. Răspunde EXCLUSIV cu JSON valid: {\"Nume caracteristica\": \"valoare\", ...}\n"
-        "2. Primul câmp TREBUIE să fie \"_reasoning\": o propoziție scurtă care explică alegerile.\n"
-        "3. Pentru câmpuri cu listă de valori: folosești EXACT o valoare din lista permisă.\n"
-        "4. Pentru câmpuri libere: folosești valorile în limba locală a marketplace-ului.\n"
-        "5. Câmpurile marcate [OBLIGATORIU] se completează cu prioritate maximă.\n"
-        "6. Dacă nu poți determina o valoare, omite acea caracteristică.\n"
-        "7. Zero text în afara JSON-ului. Fără markdown, fără explicații extra."
+        f"Ești un expert în catalogul de produse pentru marketplace-uri.\n"
+        f"Marketplace: {_mp_ctx(marketplace)}\n\n"
+
+        "MISIUNEA TA: completează caracteristicile lipsă extragând informații din semnalele "
+        "produsului (titlu, brand, descriere, metadata).\n\n"
+
+        "FORMAT RĂSPUNS — JSON strict, fără text în afara lui:\n"
+        '{"_src": "<semnal cheie>", "Caracteristica": "valoare", ...}\n'
+        "  _src = semnalul principal folosit, ex: \"titlu:Dri-FIT→Poliester\" sau \"brand:Nike→Alergare\"\n\n"
+
+        "REGULI (în ordinea asta):\n"
+        "R1. Câmpuri marcate [OBLIGATORIU] → completezi cu prioritate maximă, indiferent de dificultate.\n"
+        "R2. Câmpuri cu listă de valori → copiezi EXACT o valoare din lista dată "
+        "(respecti majuscule, diacritice, spații).\n"
+        "R3. Câmpuri freeform (fără listă) → valoarea în limba marketplace-ului, concisă.\n"
+        "R4. Brand knowledge: Nike/Adidas/Puma=sport, Dri-FIT/Climalite/Climacool=Poliester, "
+        "Fleece/Polar=Fleece, Jordan=Baschet, Air Max/React/Zoom=pantofi alergare, "
+        "Merino=Lana, DWR=rezistent apa.\n"
+        "R5. Dacă nu poți determina cu certitudine → OMITE câmpul (nu ghici).\n"
+        "R6. Nu inventa valori în afara listei pentru câmpuri restrictive.\n"
+        "R7. Zero text în afara JSON-ului. Fără markdown, fără explicații.\n\n"
+
+        "IERARHIA SEMNALELOR (cel mai fiabil primul):\n"
+        "  1. Titlu produs\n"
+        "  2. Brand + model cunoscut\n"
+        "  3. Descriere\n"
+        "  4. Metadata (EAN, greutate, garanție)\n"
+        "  5. Date cross-marketplace (la finalul promptului dacă există)"
     )
 
 
 def _build_batch_system_prompt(marketplace: str, category_list: list[str]) -> str:
-    """Prompt de sistem static pentru clasificare batch categorii."""
-    cats_list = "\n".join(category_list)
+    """Prompt de sistem pentru clasificare batch categorii.
+
+    Îmbunătățiri față de v1:
+    - Few-shot examples pentru ancorare comportament
+    - Reguli disambiguation pentru titluri ambigue
+    - Keywords gen în 5 limbi (RO/HU/BG/PL/EN)
+    """
+    cats_list = "\n".join(f"  {c}" for c in category_list)
+    mp_ctx = _mp_ctx(marketplace)
+
     return (
-        f"Ești un expert în clasificarea produselor pe marketplace-uri.\n"
-        f"Marketplace activ: {_mp_ctx(marketplace)}\n\n"
-        "CATEGORII DISPONIBILE (copiază EXACT, fără modificări):\n"
+        f"Ești un expert în catalogul de produse pentru marketplace-uri.\n"
+        f"Marketplace: {mp_ctx}\n\n"
+
+        "CATEGORII DISPONIBILE:\n"
         f"{cats_list}\n\n"
-        "REGULI STRICTE:\n"
-        "1. Răspunde EXCLUSIV cu JSON: {\"1\":\"Categorie\",\"2\":\"Categorie\",...}\n"
-        "2. Copiezi EXACT numele categoriei din lista de mai sus.\n"
-        "3. Titlurile produselor pot fi în orice limbă — clasifici după tipul produsului, nu după limbă.\n"
-        "4. Dacă nicio categorie nu se potrivește, pui null pentru acel produs.\n"
-        "5. Zero text în afara JSON-ului."
+
+        "REGULĂ UNICĂ — răspunzi EXCLUSIV cu JSON:\n"
+        '{"1": "Categorie exacta", "2": "Categorie exacta", "3": null, ...}\n\n'
+
+        "REGULI:\n"
+        "1. Copiezi EXACT numele categoriei din lista de mai sus (majuscule, diacritice).\n"
+        "2. Titlul poate fi în orice limbă — clasifici după TIPUL produsului, nu după limbă.\n"
+        "3. Categorie ambiguă (gen neclar) → alege genul indicat în titlu; dacă lipsește → bărbați.\n"
+        "4. Nicio categorie potrivită → null.\n"
+        "5. Zero text în afara JSON-ului.\n\n"
+
+        "SEMNALE GEN:\n"
+        "  Bărbați: men, barbati, férfi, мъже, mężczyźni, homme, masculin, herren\n"
+        "  Femei: women, femei, női, жени, kobiety, femme, femenino, damen\n"
+        "  Copii: kids, copii, gyerek, деца, dzieci, enfants, kinder, junior\n\n"
+
+        "SEMNALE TIP PRODUS:\n"
+        "  hoodie/sweatshirt → hanorac | jacket/geaca → geaca\n"
+        "  tights/leggings/colanti → colanti | shorts/sort → pantaloni scurti\n"
+        "  sneakers/shoes/pantofi → pantofi | t-shirt/tricou/tee → tricou\n"
+        "  backpack/rucsac → rucsacuri | cap/sapca/hat → sapca\n\n"
+
+        "EXEMPLE:\n"
+        '  "Nike Dri-FIT T-Shirt Men" → Tricouri sport barbati\n'
+        '  "Adidas Essentials Hoodie Femei" → Hanorace sport femei\n'
+        '  "Jordan Sneakers Kids" → Pantofi sport copii\n'
+        '  "Rucsac Nike 20L" → Rucsacuri sport\n'
+        '  "Minge fotbal Adidas" → Mingi fotbal\n'
+        '  "Sosete Nike 3-pack" → Sosete sport'
     )
 
 
@@ -209,10 +364,12 @@ def _process_batch(batch: list[dict], category_list: list[str],
     """Trimite un singur batch de produse la AI. Returneaza {prod_id: category}."""
     lines = []
     for i, prod in enumerate(batch, 1):
-        desc = re.sub(r"<[^>]+>", " ", prod.get("description") or "").strip()[:80]
-        line = f'{i}. "{prod["title"]}"'
-        if desc:
-            line += f" | {desc}"
+        raw_desc = re.sub(r"<[^>]+>", " ", prod.get("description") or "").strip()[:80]
+        safe_title = _sanitize_for_prompt(prod.get("title", ""), max_len=300)  # P10
+        safe_desc  = _sanitize_for_prompt(raw_desc, max_len=80)                # P10
+        line = f'{i}. "{safe_title}"'
+        if safe_desc:
+            line += f" | {safe_desc}"
         lines.append(line)
 
     system_prompt = _build_batch_system_prompt(marketplace, category_list)
@@ -227,6 +384,22 @@ def _process_batch(batch: list[dict], category_list: list[str],
     rejected = 0
     t_start = time.perf_counter()
     router = get_router()
+
+    # Index normalizat pentru match rapid (lowercase strip) — util pt. categorii non-ASCII (BG, HU)
+    import difflib as _difflib
+    _cat_norm_index = {c.strip().lower(): c for c in category_list}
+
+    def _match_category(ai_cat: str):
+        """Incearca match exact → normalizat → fuzzy. Returneaza categoria din lista sau None."""
+        if ai_cat in category_list:
+            return ai_cat
+        norm_key = ai_cat.strip().lower()
+        if norm_key in _cat_norm_index:
+            return _cat_norm_index[norm_key]
+        # Fuzzy fallback (cutoff 0.88 — previne false positives)
+        close = _difflib.get_close_matches(ai_cat, category_list, n=1, cutoff=0.88)
+        return close[0] if close else None
+
     try:
         raw = _complete_with_retry(prompt, max_tok, system_prompt, 0.2)
         duration_ms = round((time.perf_counter() - t_start) * 1000)
@@ -237,11 +410,14 @@ def _process_batch(batch: list[dict], category_list: list[str],
 
         for i, prod in enumerate(batch, 1):
             pid = prod["id"]
-            cat = suggested.get(str(i))
-            if cat and cat in category_list:
-                batch_results[pid] = cat
+            ai_cat = suggested.get(str(i))
+            matched_cat = _match_category(ai_cat) if ai_cat else None
+            if matched_cat:
+                if matched_cat != ai_cat:
+                    log.debug("AI batch categorie fuzzy-matched %r → %r (prod %s)", ai_cat, matched_cat, pid)
+                batch_results[pid] = matched_cat
                 accepted += 1
-                cache["category_map"][_title_key(prod["title"], marketplace)] = cat
+                cache["category_map"][_title_key(prod["title"], marketplace)] = matched_cat
                 # Auto-invata regula
                 title_base = prod["title"].rsplit(" - ", 1)[0].strip()
                 words = [w.lower() for w in re.split(r"[\s\-]+", title_base)
@@ -250,18 +426,19 @@ def _process_batch(batch: list[dict], category_list: list[str],
                          and not w.isupper()
                          and not any(c.isdigit() for c in w)][:5]
                 kw_string = ", ".join(words)
-                existing_kws = {r.get("keywords", r.get("prefix", "")) for r in cache["learned_title_rules"]}
-                if kw_string and kw_string not in existing_kws:
-                    cache["learned_title_rules"].append({
-                        "keywords": kw_string,
-                        "exclude": "",
-                        "category": cat,
-                    })
+                with _merge_lock:   # P01: atomic read+append pentru thread safety
+                    existing_kws = {r.get("keywords", r.get("prefix", "")) for r in cache["learned_title_rules"]}
+                    if kw_string and kw_string not in existing_kws:
+                        cache["learned_title_rules"].append({
+                            "keywords": kw_string,
+                            "exclude": "",
+                            "category": matched_cat,
+                        })
             else:
-                if cat:
+                if ai_cat:
                     log.warning(
                         "AI a sugerat categorie invalida %r pentru prod %s (%r)",
-                        cat, pid, prod["title"][:60],
+                        ai_cat, pid, prod["title"][:60],
                     )
                 batch_results[pid] = None
                 rejected += 1
@@ -331,18 +508,42 @@ def suggest_categories_batch(
     # Imparte in batch-uri de BATCH_SIZE
     chunks = [uncached[i:i + BATCH_SIZE] for i in range(0, len(uncached), BATCH_SIZE)]
     total = len(uncached)
-    processed = 0
+    completed_count = 0
+    merge_lock = threading.Lock()
 
-    for chunk_idx, chunk in enumerate(chunks):
-        if status_callback:
-            status_callback(
-                f"AI categorii: batch {chunk_idx + 1}/{len(chunks)} "
-                f"({processed}/{total} produse)..."
-            )
-        batch_res = _process_batch(chunk, category_list, marketplace, cache)
-        results.update(batch_res)
-        processed += len(chunk)
-        _save_cache(cache)  # salveaza dupa fiecare batch
+    if status_callback:
+        status_callback(
+            f"AI categorii: se procesează {len(chunks)} batch-uri în paralel (2 simultan)..."
+        )
+
+    def _run_chunk(args):
+        chunk_idx, chunk = args
+        # Fiecare thread primește un cache local — evită race conditions
+        local_cache: dict = {"category_map": {}, "char_map": {}, "learned_title_rules": [], "done_map": {}}
+        batch_res = _process_batch(chunk, category_list, marketplace, local_cache)
+        return chunk_idx, batch_res, local_cache
+
+    # 2 workeri paraleli (redus de la 5) — evita thundering herd pe rate limit
+    max_workers = min(2, len(chunks))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_run_chunk, (i, chunk)): i for i, chunk in enumerate(chunks)}
+        for future in as_completed(futures):
+            chunk_idx, batch_res, local_cache = future.result()
+            with merge_lock:
+                results.update(batch_res)
+                cache["category_map"].update(local_cache["category_map"])
+                for rule in local_cache.get("learned_title_rules", []):
+                    existing_kws = {r.get("keywords", r.get("prefix", "")) for r in cache["learned_title_rules"]}
+                    if rule.get("keywords") and rule["keywords"] not in existing_kws:
+                        cache["learned_title_rules"].append(rule)
+                completed_count += len(chunks[chunk_idx])
+                if status_callback:
+                    status_callback(
+                        f"AI categorii: {completed_count}/{total} produse "
+                        f"({chunk_idx + 1}/{len(chunks)} batch-uri)..."
+                    )
+
+    _save_cache(cache)  # o singura scriere la final in loc de N scrieri
 
     if status_callback:
         status_callback(f"AI categorii: gata ({total} produse procesate).")
@@ -361,31 +562,20 @@ def _build_prompt(title: str, description: str, category: str,
     """
     Construiește promptul pentru AI enrichment.
 
-    mandatory_set: set de display-names (cu ":" deja stripuit) ale câmpurilor obligatorii.
-    product_meta: câmpuri extra din fișierul de oferte (ean, sku, weight, warranty, brand).
+    Îmbunătățiri față de v1:
+    - Descriere 700 chars (era 400)
+    - 20 câmpuri max (era 15), 25 valori (era 20)
+    - Obligatorii garantat primele
+    - existing_chars condensat (key="val" nu JSON întreg)
+    - Instrucțiune finală clară
     """
     mandatory_set = mandatory_set or set()
     meta = product_meta or {}
 
-    # Separa campurile cu lista de valori de cele freeform; obligatorii primele
-    options_lines = []
-    freeform_lines = []
-    for ch_name, values in list(char_options.items())[:15]:
-        req = " [OBLIGATORIU]" if ch_name in mandatory_set else ""
-        if values:
-            options_lines.append(
-                f'  "{ch_name}"{req}: {json.dumps(sorted(values)[:20], ensure_ascii=False)}'
-            )
-        else:
-            freeform_lines.append(f'  "{ch_name}"{req}')
-
-    # Curăță descrierea: elimină HTML rezidual, colapsează whitespace, trunchiază
-    desc_clean = re.sub(r"<[^>]+>", " ", description or "")
-    desc_clean = re.sub(r"\s+", " ", desc_clean).strip()[:400]
-
     # Brand: prioritate meta > existing chars
     brand = (
-        str(meta["brand"]).strip() if meta.get("brand") and str(meta["brand"]).strip() not in ("", "nan")
+        str(meta["brand"]).strip()
+        if meta.get("brand") and str(meta["brand"]).strip() not in ("", "nan")
         else next(
             (str(v).strip() for k, v in existing.items()
              if k.lower().rstrip(":").strip() in _BRAND_KEYS and v and str(v).strip()),
@@ -393,38 +583,73 @@ def _build_prompt(title: str, description: str, category: str,
         )
     )
 
-    # Filtrează cheile interne (prefixate cu "_") din afișarea existing
-    existing_display = {k: v for k, v in existing.items() if not k.startswith("_")}
+    # Descriere curățată — 700 chars (era 400)
+    desc_clean = re.sub(r"<[^>]+>", " ", description or "")
+    desc_clean = re.sub(r"\s+", " ", desc_clean).strip()[:700]
 
-    prompt = f"Marketplace: {_mp_ctx(marketplace)}\n"
-    prompt += f"Produs: {title}\n"
+    # Existing: doar cheile cu valori, fără chei interne "_"
+    existing_display = {k: v for k, v in existing.items()
+                        if not k.startswith("_") and v}
+
+    # Câmpuri: obligatorii primele, opționale la final
+    # Max: 12 obligatorii + 8 opționale = 20 total (era 15 fără ordine garantată)
+    mandatory_lines = []
+    optional_lines = []
+
+    for ch_name, values in char_options.items():
+        req_tag = " [OBLIGATORIU]" if ch_name in mandatory_set else ""
+        if values:
+            vals_sample = json.dumps(sorted(values)[:25], ensure_ascii=False)
+            line = f'  "{ch_name}"{req_tag}: {vals_sample}'
+        else:
+            line = f'  "{ch_name}"{req_tag}: <text liber>'
+
+        if ch_name in mandatory_set:
+            mandatory_lines.append(line)
+        else:
+            optional_lines.append(line)
+
+    all_lines = mandatory_lines[:12] + optional_lines[:8]
+
+    # Construiește prompt-ul
+    parts = [f"PRODUS: {title}"]
+
     if brand:
-        prompt += f"Brand: {brand}\n"
-    # Extra metadata signals for the model
-    for meta_key, label in (("ean", "EAN"), ("sku", "SKU"), ("weight", "Greutate"), ("warranty", "Garanție")):
-        val = meta.get(meta_key)
+        parts.append(f"BRAND: {brand}")
+
+    # Metadata pe un rând (economie de tokeni)
+    meta_parts = []
+    for key, label in (("ean", "EAN"), ("sku", "SKU"),
+                       ("weight", "Greutate(g)"), ("warranty", "Garantie")):
+        val = meta.get(key)
         if val and str(val).strip() not in ("", "nan"):
-            prompt += f"{label}: {str(val).strip()}\n"
-    prompt += (
-        f"Categorie: {category}\n"
-        f"Descriere: {desc_clean}\n"
-        f"Completate deja: {json.dumps(existing_display, ensure_ascii=False)}\n\n"
+            meta_parts.append(f"{label}:{str(val).strip()}")
+    if meta_parts:
+        parts.append("META: " + " | ".join(meta_parts))
+
+    parts.append(f"CATEGORIE: {category}")
+
+    if desc_clean:
+        parts.append(f"DESCRIERE: {desc_clean}")
+
+    if existing_display:
+        # Condensat: key="val" în loc de JSON întreg
+        filled = ", ".join(
+            f'{k}="{v}"' for k, v in list(existing_display.items())[:8]
+        )
+        parts.append(f"COMPLETATE DEJA: {filled}")
+
+    parts.append("")
+    parts.append("CAMPURI DE COMPLETAT:")
+    parts.extend(all_lines)
+    parts.append("")
+    parts.append(
+        "Completează în JSON. Obligatorii mai întâi. "
+        "Valori EXACTE din lista pentru câmpuri restrictive. "
+        "Omite câmpul dacă nu ești sigur."
     )
 
-    if options_lines:
-        prompt += (
-            "Completeaza caracteristicile urmatoare alegand EXACT o valoare din lista permisa:\n"
-            + "\n".join(options_lines) + "\n\n"
-        )
-
-    if freeform_lines:
-        prompt += (
-            "Completeaza si aceste campuri libere (orice valoare potrivita, ex: '41 EU', culoare, material):\n"
-            + "\n".join(freeform_lines) + "\n\n"
-        )
-
-    prompt += 'Completează caracteristicile lipsă. Câmpurile marcate [OBLIGATORIU] au prioritate maximă.'
-    return prompt
+    return "\n".join(parts)
 
 
 def _parse_json(text: str) -> dict:
@@ -458,16 +683,27 @@ def enrich_with_ai(
     marketplace: str = "",
     product_meta: dict = None,
     data=None,           # Optional[MarketplaceData] — enables strict value validation
+    ean: str | None = None,
+    brand: str | None = None,
+    vision_chars: dict | None = None,
 ) -> tuple[dict, dict]:
     """
     Completeaza caracteristicile cu AI.
     Optimizare: verifica cache-ul mai intai, apeleaza API doar daca e necesar.
     Daca mandatory_chars e specificat, trimite AI doar caracteristicile obligatorii lipsa.
+    vision_chars: atribute deja detectate din imagine — AI le va considera ca existente.
 
     Returns:
         (validated, suggested_remapped) — validated = chars that passed validation;
         suggested_remapped = all AI suggestions (original keys, _reasoning excluded).
     """
+    # Injectează atributele detectate vizual ca deja-existente (AI nu le mai solicită)
+    if vision_chars:
+        existing = {**existing}
+        for k, v in vision_chars.items():
+            if k not in existing and v:
+                existing[k] = v
+
     # Filtreaza doar cele lipsa
     missing_options = {k: v for k, v in char_options.items() if not existing.get(k)}
 
@@ -491,6 +727,15 @@ def enrich_with_ai(
         optional_extra = {k: v for k, v in missing_options.items()
                          if k not in mandatory_chars and len(mandatory_missing) < 8}
         missing_options = {**mandatory_missing, **dict(list(optional_extra.items())[:5])}
+
+    # ── Knowledge store lookup ──────────────────────────────────────────────────
+    _norm_title = _normalize_title(title)
+    _mp_id = marketplace_id_slug(marketplace) if marketplace else ""
+    _known = get_product_knowledge(ean=ean, brand=brand, normalized_title=_norm_title, marketplace_id=_mp_id) if (ean or brand) and _mp_id else None
+    _known_attrs = _known["final_attributes"] if _known else {}
+
+    if _known_attrs:
+        log.debug("Knowledge store hit: %d atribute cunoscute pentru '%s'", len(_known_attrs), title[:50])
 
     # Verifica cache
     cache = _load_cache()
@@ -547,6 +792,9 @@ def enrich_with_ai(
         # Setul de display-names obligatorii (cu ":" deja stripuit) pentru marcare în prompt
         mandatory_display_set = {k.rstrip(":") for k in (mandatory_chars or [])}
         prompt = _build_prompt(title, description, category, existing, missing_options_display, marketplace, mandatory_display_set, product_meta)
+        if _known_attrs:
+            known_context = "\n".join(f"  {k}: {v}" for k, v in _known_attrs.items())
+            prompt += f"\n\nDate cunoscute din alte marketplace-uri (verificate):\n{known_context}"
         system_prompt = _build_char_system_prompt(marketplace)
         raw = _complete_with_retry(prompt, max_tok, system_prompt, 0.2)
         duration_ms = round((time.perf_counter() - t_start) * 1000)
@@ -638,6 +886,24 @@ def enrich_with_ai(
                 if newly_done:
                     log.debug("Done-map updated pentru %r — obligatorii rezolvate: %s", title[:60], sorted(newly_done))
             _save_cache(cache)
+
+            # ── Save to knowledge store (doar atribute validate) ─────────────
+            if ean or brand:
+                import uuid as _uuid
+                try:
+                    upsert_product_knowledge(
+                        ean=ean,
+                        brand=brand or "",
+                        normalized_title=_norm_title,
+                        marketplace_id=_mp_id,
+                        offer_id=str(existing.get("_offer_id", "")),
+                        category=str(category),
+                        final_attributes=validated,
+                        confidence=round(len(validated) / max(len(missing_options), 1), 2),
+                        run_id=str(_uuid.uuid4()),
+                    )
+                except Exception as e:
+                    log.warning("Nu s-a putut salva în knowledge store: %s", e)
         else:
             log.warning("AI char enrichment — niciun camp validat pentru %r (raw: %s)", title[:60], raw[:200])
 
@@ -663,6 +929,134 @@ def enrich_with_ai(
             validated=validated,
             duration_ms=duration_ms,
             max_tokens=max_tok,
+        )
+    except Exception:
+        pass
+
+    # ── Structured output (off / shadow / on) ──────────────────────────────────
+    _scfg = get_structured_config()
+    _smode = _scfg.get("mode", "off")
+    _s_attempted = False
+    _s_success = False
+    _s_fallback = False
+    _s_latency_ms = 0
+    _s_model = ""
+    _s_schema_fields = 0
+    _shadow_diff = None
+
+    try:
+        router = get_router()
+        if _should_run_structured(_scfg, router.provider_name):
+            _s_attempted = True
+            # Construiește schema pentru caracteristicile lipsă
+            char_list = [
+                {"name": k, "is_mandatory": k in (mandatory_chars or []), "values": sorted(v)}
+                for k, v in missing_options.items()
+            ]
+            sb = SchemaBuilder(max_total=20)
+            selected_chars = sb.select(char_list, "", _known_attrs)
+            schema = build_json_schema(selected_chars)
+            _s_schema_fields = len(selected_chars)
+
+            _s_t0 = time.perf_counter()
+            structured_result = router.complete_structured(
+                prompt if "prompt" in dir() else "",
+                schema,
+                system=system_prompt if "system_prompt" in dir() else None,
+            )
+            _s_latency_ms = round((time.perf_counter() - _s_t0) * 1000)
+            _s_model = str(getattr(router._provider, "_STRUCTURED_MODEL",
+                                   getattr(router._provider, "_model", "unknown")))
+
+            if structured_result and isinstance(structured_result, dict):
+                _s_success = True
+                if _smode == "on":
+                    # Structured devine primar — validăm și folosim rezultatul
+                    validated_structured = {}
+                    if data is not None:
+                        _ai_cat_id_s = data.category_id(category) if data is not None else None
+                        for ch_name, ch_val in structured_result.items():
+                            if not str(ch_val).strip():
+                                continue
+                            if _ai_cat_id_s is not None:
+                                mapped = data.find_valid(str(ch_val), _ai_cat_id_s, ch_name)
+                                if mapped is not None:
+                                    validated_structured[ch_name] = mapped
+                            elif ch_name in missing_options:
+                                vs = missing_options.get(ch_name, set())
+                                if not vs or str(ch_val) in vs:
+                                    validated_structured[ch_name] = str(ch_val)
+                    else:
+                        validated_structured = {
+                            k: str(v) for k, v in structured_result.items()
+                            if str(v).strip() and k in missing_options
+                        }
+
+                    if validated_structured:
+                        # Structured output valid — înlocuiește text validated
+                        validated = validated_structured
+                        log.info("Structured output ON — %d câmpuri validate pentru %r",
+                                 len(validated), title[:60])
+                    else:
+                        # Structured a returnat dar validarea a eșuat — fallback la text
+                        _s_fallback = True
+                        log.warning("Structured output ON — validare eșuată, fallback text pentru %r",
+                                    title[:60])
+                else:
+                    # shadow: log comparativ, NU afectează output final
+                    _shadow_diff = {
+                        "agree": sorted(set(structured_result.keys()) & set(validated.keys())),
+                        "only_structured": sorted(set(structured_result.keys()) - set(validated.keys())),
+                        "only_plain": sorted(set(validated.keys()) - set(structured_result.keys())),
+                        "value_conflicts": {
+                            k: {"structured": str(structured_result[k]), "plain": str(validated[k])}
+                            for k in set(structured_result.keys()) & set(validated.keys())
+                            if str(structured_result[k]).strip().lower() != str(validated[k]).strip().lower()
+                        },
+                    }
+                    log.info(
+                        "Structured SHADOW pentru %r — agree=%d only_s=%d only_p=%d conflicts=%d",
+                        title[:60],
+                        len(_shadow_diff["agree"]),
+                        len(_shadow_diff["only_structured"]),
+                        len(_shadow_diff["only_plain"]),
+                        len(_shadow_diff["value_conflicts"]),
+                    )
+            else:
+                # Structured a returnat None/empty — fallback la text deja calculat
+                _s_fallback = True
+                log.debug("Structured output None/gol pentru %r — text fallback activ", title[:60])
+    except Exception as _s_exc:
+        _s_fallback = True
+        log.warning("Structured output exc pentru %r: %s", title[:60], _s_exc)
+
+    # ── DuckDB telemetry ───────────────────────────────────────────────────────
+    try:
+        import uuid as _uuid
+        router = get_router()
+        write_run_to_duckdb(
+            run_id=str(_uuid.uuid4()),
+            ean=ean,
+            offer_id=str(existing.get("_offer_id", "")),
+            marketplace=marketplace,
+            model_used=str(getattr(router._provider, "_model", "unknown")),
+            tokens_input=0,   # nu e expus de provider
+            tokens_output=0,
+            cost_usd=0.0,
+            fields_requested=len(missing_options),
+            fields_accepted=len(validated),
+            fields_rejected=len(suggested) - len(validated),
+            retry_count=0,
+            fallback_used=False,
+            duration_ms=duration_ms,
+            structured_mode=_smode,
+            structured_attempted=_s_attempted,
+            structured_success=_s_success,
+            structured_fallback_used=_s_fallback,
+            structured_latency_ms=_s_latency_ms,
+            structured_model_used=_s_model,
+            schema_fields_count=_s_schema_fields,
+            shadow_diff=_shadow_diff,
         )
     except Exception:
         pass

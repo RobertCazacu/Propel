@@ -26,7 +26,7 @@ from core.vision.color_analyzer import (
     analyze_colors, ColorResult, find_multicolor_value, pick_best_accepted_color,
     _rgb_to_family,
 )
-from core.vision.visual_rules import get_category_rules, load_rules, ensure_rules_file
+from core.vision.visual_rules import get_category_rules, load_rules, ensure_rules_file, is_vision_eligible
 
 log = get_logger("marketplace.vision.analyzer")
 
@@ -65,6 +65,10 @@ class ImageAnalysisResult:
     product_type_confidence: float  = 0.0
     used_for_category_support: bool = False
 
+    # Structured vision extraction (cloud only, feature-flagged)
+    vision_extracted_attrs: dict = field(default_factory=dict)   # validated attrs from cloud
+    vision_extraction_error: str = ""
+
     # Output
     suggested_attributes: dict  = field(default_factory=dict)
     used_for_attribute_fill: bool = False
@@ -97,6 +101,8 @@ class ImageAnalysisResult:
             "product_type_confidence":    self.product_type_confidence,
             "used_for_category_support":  self.used_for_category_support,
             "used_for_attribute_fill":    self.used_for_attribute_fill,
+            "vision_extracted_attrs":     self.vision_extracted_attrs,
+            "vision_extraction_error":    self.vision_extraction_error,
             "suggested_attributes":       self.suggested_attributes,
             "needs_review":               self.needs_review,
             "review_reason":              self.review_reason,
@@ -106,10 +112,21 @@ class ImageAnalysisResult:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _missing_color_char(color_chars, mandatory_chars, all_filled) -> Optional[str]:
+def _missing_color_char(color_chars, mandatory_chars, all_filled, available_chars=None) -> Optional[str]:
+    """Return the first color characteristic that is missing and should be filled.
+
+    Priority:
+      1. Mandatory chars that are missing (original behaviour).
+      2. Non-mandatory chars that exist in the category's characteristic list
+         (available_chars) and are not yet filled.
+    """
     for ch in color_chars:
         if ch in mandatory_chars and not all_filled.get(ch):
             return ch
+    if available_chars:
+        for ch in color_chars:
+            if ch in available_chars and not all_filled.get(ch):
+                return ch
     return None
 
 
@@ -168,6 +185,11 @@ def analyze_product_image(
     suggestion_only: bool = False,
     save_debug: bool = False,
     run_logger=None,           # VisionRunLogger | None
+    # ── Structured vision extraction (cloud only, off by default) ─────────────
+    enable_structured_vision: bool = False,   # feature flag — default OFF
+    cloud_vision_provider=None,               # OpenAIVisionProvider | None
+    data=None,                                # MarketplaceData | None
+    cat_id=None,                              # category id for validation
 ) -> ImageAnalysisResult:
     """
     Main entry point for image-based attribute extraction.
@@ -189,7 +211,7 @@ def analyze_product_image(
             run_logger.inc("skipped")
         return result
 
-    any_enabled = enable_color or enable_product_hint or enable_yolo or enable_clip
+    any_enabled = enable_color or enable_product_hint or enable_yolo or enable_clip or enable_structured_vision
     if not any_enabled:
         result.skipped_reason = "Image analysis disabled"
         log.debug("[Vision] Skip — analiza dezactivata offer=%s", offer_id)
@@ -212,6 +234,7 @@ def analyze_product_image(
     min_prod_conf        = cat_rules.get("min_product_confidence", 0.65)
     effective_yolo_conf  = cat_rules.get("min_yolo_confidence", yolo_conf)
     effective_clip_conf  = cat_rules.get("min_clip_confidence", clip_conf)
+    effective_yolo_allowlist = cat_rules.get("yolo_label_allowlist", [])
     effective_suggestion = suggestion_only or cat_rules.get("suggestion_only", False)
 
     if run_logger:
@@ -222,6 +245,7 @@ def analyze_product_image(
                 "category": category, "marketplace": marketplace,
                 "enable_color": enable_color, "enable_yolo": enable_yolo,
                 "enable_clip": enable_clip, "enable_product_hint": enable_product_hint,
+                "enable_structured_vision": enable_structured_vision,
                 "yolo_model": yolo_model, "clip_model": clip_model,
                 "yolo_conf": effective_yolo_conf, "clip_conf": effective_clip_conf,
                 "suggestion_only": effective_suggestion, "save_debug": save_debug,
@@ -269,6 +293,7 @@ def analyze_product_image(
 
             yolo_res = detect_objects(
                 img, model_name=yolo_model, conf_threshold=effective_yolo_conf,
+                label_allowlist=effective_yolo_allowlist or None,
                 run_logger=run_logger, offer_id=offer_id, image_url=image_url,
             )
             result.yolo_fallback_used = yolo_res.fallback_used
@@ -277,11 +302,16 @@ def analyze_product_image(
                 result.detected_object = yolo_res.best.label
                 result.yolo_confidence = yolo_res.best.confidence
                 result.yolo_bbox       = yolo_res.best.bbox
-                working_img            = crop_to_detection(img, yolo_res.best)
-                result.used_crop       = True
-                log.debug("[Vision] YOLO crop offer=%s det=%r conf=%.2f bbox=%s",
-                          offer_id, yolo_res.best.label, yolo_res.best.confidence,
-                          yolo_res.best.bbox)
+                # P15: skip crop for low-confidence detections to avoid misleading color analysis
+                if yolo_res.best.confidence >= 0.50:
+                    working_img      = crop_to_detection(img, yolo_res.best)
+                    result.used_crop = True
+                    log.debug("[Vision] YOLO crop offer=%s det=%r conf=%.2f bbox=%s",
+                              offer_id, yolo_res.best.label, yolo_res.best.confidence,
+                              yolo_res.best.bbox)
+                else:
+                    log.debug("[Vision] YOLO low confidence — skipping crop offer=%s det=%r conf=%.2f",
+                              offer_id, yolo_res.best.label, yolo_res.best.confidence)
 
             # Save debug artifacts
             if save_debug and run_logger and yolo_res.best:
@@ -313,8 +343,11 @@ def analyze_product_image(
             result.color_confidence           = color_res.confidence
             result.is_multicolor              = color_res.is_multicolor
 
-            # Determine which color char is missing + mandatory
-            missing_char = _missing_color_char(color_chars, mandatory_chars, existing_chars)
+            # Determine which color char is missing + should be filled
+            missing_char = _missing_color_char(
+                color_chars, mandatory_chars, existing_chars,
+                available_chars=set(valid_values_for_cat.keys()),
+            )
 
             if run_logger:
                 run_logger.log(
@@ -331,6 +364,8 @@ def analyze_product_image(
                         "palette_top3":        color_res.palette_rgb[:3],
                         "missing_char":        missing_char,
                         "min_conf_threshold":  min_color_conf,
+                        "color_chars_tried":   color_chars,
+                        "available_chars_sample": sorted(valid_values_for_cat.keys())[:20],
                     },
                 )
                 run_logger.inc("color_ok")
@@ -385,6 +420,88 @@ def analyze_product_image(
             log.error("[Vision] CLIP error offer=%s: %s", offer_id, e, exc_info=True)
             if run_logger:
                 run_logger.log("clip", "exception", offer_id=offer_id,
+                               image_url=image_url, status="error", level="ERROR",
+                               data={"error": str(e)[:300]})
+
+    # ── Structured cloud vision extraction (feature-flagged, off by default) ──
+    if enable_structured_vision and cloud_vision_provider is not None and data is not None and cat_id is not None:
+        try:
+            from core.vision.vision_attr_extractor import extract_attrs_cloud
+            from core.vision.fusion_attrs import fuse_all_attributes
+
+            rules_for_fusion = load_rules()
+
+            # Build eligible_attrs: {char_name: set_of_valid_values} for vision-eligible only
+            all_chars_for_cat = data.valid_values_all(cat_id) if hasattr(data, "valid_values_all") else {}
+            eligible_attrs = {
+                ch: vals
+                for ch, vals in all_chars_for_cat.items()
+                if is_vision_eligible(ch, rules_for_fusion)
+            }
+
+            if eligible_attrs:
+                t_vis = time.perf_counter()
+                vis_result = extract_attrs_cloud(
+                    img=working_img,
+                    category=category,
+                    marketplace=marketplace,
+                    eligible_attrs=eligible_attrs,
+                    existing_chars=existing_chars,
+                    data=data,
+                    cat_id=cat_id,
+                    vision_provider=cloud_vision_provider,
+                    yolo_label=result.detected_object,
+                    clip_label=result.clip_best_label,
+                )
+                vis_ms = round((time.perf_counter() - t_vis) * 1000)
+                result.vision_extracted_attrs = vis_result.extracted_attrs
+                if vis_result.error:
+                    result.vision_extraction_error = vis_result.error
+
+                if vis_result.success and vis_result.extracted_attrs:
+                    # Build vision_attrs signal dict for fusion
+                    vision_signals = {
+                        ch: (val, 0.80, "vision_llm_cloud")
+                        for ch, val in vis_result.extracted_attrs.items()
+                    }
+                    fusion_results = fuse_all_attributes(
+                        text_chars=existing_chars,
+                        vision_attrs=vision_signals,
+                        rules=rules_for_fusion,
+                        data=data,
+                        cat_id=cat_id,
+                    )
+                    for ch, fr in fusion_results.items():
+                        if fr.action == "use_vision" and fr.final_value:
+                            result.suggested_attributes[ch] = fr.final_value
+                            result.used_for_attribute_fill = True
+                        elif fr.action == "conflict_review":
+                            result.needs_review = True
+                            result.review_reason = (
+                                (result.review_reason + " | " if result.review_reason else "")
+                                + fr.reason
+                            )
+
+                if run_logger:
+                    run_logger.log(
+                        "structured_vision", "extraction_done",
+                        offer_id=offer_id, image_url=image_url,
+                        status="ok" if vis_result.success else "error",
+                        duration_ms=vis_ms, level="INFO" if vis_result.success else "WARNING",
+                        data={
+                            "provider": vis_result.provider_used,
+                            "attrs_requested": vis_result.attrs_requested,
+                            "attrs_accepted": vis_result.attrs_accepted,
+                            "extracted": vis_result.extracted_attrs,
+                            "error": vis_result.error or None,
+                        },
+                    )
+
+        except Exception as e:
+            log.error("[Vision] Structured extraction error offer=%s: %s", offer_id, e, exc_info=True)
+            result.vision_extraction_error = str(e)[:200]
+            if run_logger:
+                run_logger.log("structured_vision", "exception", offer_id=offer_id,
                                image_url=image_url, status="error", level="ERROR",
                                data={"error": str(e)[:300]})
 
@@ -522,17 +639,14 @@ def _apply_color_to_result(
         map_reason = ""
 
         if valid_set:
-            mapped = _map_to_valid(normalized, valid_set)
-            if mapped:
-                map_reason = "exact/case-insensitive match"
-            else:
-                # Family scoring fallback
-                m = re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)", color_res.dominant_color_raw)
-                if m:
-                    fam    = _rgb_to_family((int(m.group(1)), int(m.group(2)), int(m.group(3))))
-                    mapped = pick_best_accepted_color(fam, valid_set) or None
-                    if mapped:
-                        map_reason = f"family scoring (family={fam})"
+            from core.color_mapper import map_detected_color_to_allowed
+            _cm = map_detected_color_to_allowed(
+                normalized,
+                list(valid_set),
+                context={"offer_id": offer_id},
+            )
+            mapped     = _cm.mapped_value
+            map_reason = f"{_cm.method} (score={_cm.score:.3f})" if mapped else ""
 
             if run_logger:
                 run_logger.log("fill", "color_mapping", offer_id=offer_id, image_url=image_url,

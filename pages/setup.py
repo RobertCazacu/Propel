@@ -3,97 +3,114 @@ from pathlib import Path
 from core.state import (
     all_marketplace_names, get_marketplace, set_marketplace,
     add_custom_marketplace, PREDEFINED_MARKETPLACES,
-    get_error_codes, set_error_codes, DUCKDB_MARKETPLACES,
+    get_error_codes, set_error_codes,
     clear_marketplace_data, remove_custom_marketplace,
+    get_backend, load_marketplace_on_select, is_marketplace_available,
+    _cached_load_marketplace_data,
 )
 
 from core.loader import MarketplaceData
+from core.app_logger import get_logger
+log = get_logger("marketplace.setup")
 
 
-def _do_save(selected: str, cat_src, char_src, val_src):
-    """
-    Logica comună de salvare — identică indiferent de sursa fișierelor
-    (upload Streamlit sau cale locală). cat_src/char_src/val_src pot fi
-    fie UploadedFile, fie str/Path.
-    """
-    with st.spinner("Se procesează fișierele..."):
-        try:
-            mp_new = MarketplaceData(selected)
-            mp_new.load_from_files(cat_src, char_src, val_src)
-            set_marketplace(selected, mp_new)
-            stats = mp_new.stats()
-            st.session_state.pop(f"_reload_{selected}", None)
-            st.success(
-                f"✅ Date salvate pentru **{selected}**: "
-                f"{stats['categories']} categorii, "
-                f"{stats['characteristics']} caracteristici, "
-                f"{stats['values']:,} valori."
-            )
-            st.rerun()
-        except Exception as e:
-            st.error(f"Eroare la procesare: {e}")
-
-
-def _do_save_duckdb(selected: str, cat_src, char_src, val_src, source_type: str = "upload"):
-    """
-    Versiunea DuckDB a lui _do_save, folosită pentru marketplace-urile DuckDB.
-    Parsează fișierele identic cu _do_save, dar persistă în DuckDB.
-    """
+def _do_save_unified(selected: str, cat_src, char_src, val_src, source_type: str = "upload"):
+    """Unified save function — routes to DuckDB, Parquet, or both based on REFERENCE_BACKEND."""
     from core import reference_store_duckdb as duckdb_store
     from core.loader import load_categories, load_characteristics, load_values
 
-    mp_id = duckdb_store.DUCKDB_ID_MAP.get(selected)
-    if not mp_id:
-        st.error(f"Marketplace '{selected}' nu este configurat pentru DuckDB.")
-        return
+    backend = get_backend()
 
-    with st.spinner("Se procesează și se salvează în DuckDB..."):
+    with st.spinner("Se procesează și se salvează..."):
         try:
             cats  = load_categories(cat_src)
             chars = load_characteristics(char_src)
             vals  = load_values(val_src)
+        except Exception as e:
+            st.error(f"❌ Eroare la parsarea fișierelor: {e}")
+            return
 
-            duckdb_store.init_db(duckdb_store.DB_PATH)
+        # ── DuckDB save ───────────────────────────────────────────────────────
+        if backend in ("duckdb", "dual"):
+            try:
+                mp_id = duckdb_store.marketplace_id_slug(selected)
+                duckdb_store.init_db(duckdb_store.DB_PATH)
+                duckdb_store.ensure_marketplace(duckdb_store.DB_PATH, mp_id, selected)
 
-            sources = {
-                "categories":      getattr(cat_src,  "name", str(cat_src)),
-                "characteristics": getattr(char_src, "name", str(char_src)),
-                "values":          getattr(val_src,  "name", str(val_src)),
-            }
-            run_id = duckdb_store.import_marketplace(mp_id, cats, chars, vals, source_type, sources)
+                sources = {
+                    "categories":      getattr(cat_src, "name", str(cat_src)),
+                    "characteristics": getattr(char_src, "name", str(char_src)),
+                    "values":          getattr(val_src,  "name", str(val_src)),
+                }
+                run_id = duckdb_store.import_marketplace(
+                    mp_id, cats, chars, vals, source_type, sources
+                )
 
-            cats2, chars2, vals2 = duckdb_store.load_marketplace_data(mp_id)
-            mp_new = MarketplaceData(selected)
-            mp_new.load_from_dataframes(cats2, chars2, vals2)
+                cats2, chars2, vals2 = duckdb_store.load_marketplace_data(mp_id)
+                mp_new = MarketplaceData(selected)
+                mp_new.load_from_dataframes(cats2, chars2, vals2)
+                st.session_state["marketplaces"][selected] = mp_new
+                st.session_state.pop(f"_reload_{selected}", None)
+                # Invalidează cache-ul după import nou
+                _cached_load_marketplace_data.clear()
 
-            st.session_state["marketplaces"][selected] = mp_new
-            st.session_state.pop(f"_reload_{selected}", None)
+                summary = duckdb_store.get_import_summary(run_id)
+                issues  = duckdb_store.get_issues(run_id)
 
-            summary = duckdb_store.get_import_summary(run_id)
-            issues  = duckdb_store.get_issues(run_id)
+                st.success(
+                    f"✅ Date salvate în DuckDB pentru **{selected}**: "
+                    f"{summary['categories']} categorii, "
+                    f"{summary['characteristics']} caracteristici, "
+                    f"{summary['values']:,} valori. "
+                    f"({summary['warnings']} warnings, {summary['errors']} errors)"
+                )
 
-            st.success(
-                f"✅ Date salvate în DuckDB pentru **{selected}**: "
-                f"{summary['categories']} categorii, "
-                f"{summary['characteristics']} caracteristici, "
-                f"{summary['values']:,} valori. "
-                f"({summary['warnings']} warnings, {summary['errors']} errors)"
-            )
-
-            errors_list   = [i for i in issues if i["severity"] == "error"]
-            warnings_list = [i for i in issues if i["severity"] == "warning"]
-
-            if errors_list:
+                errors_list   = [i for i in issues if i["severity"] == "error"]
+                warnings_list = [i for i in issues if i["severity"] == "warning"]
                 for iss in errors_list:
                     st.error(f"❌ [{iss['issue_type']}] {iss['message']}")
-            if warnings_list:
-                with st.expander(f"⚠️ {len(warnings_list)} warning-uri la import"):
-                    for iss in warnings_list:
-                        st.warning(f"[{iss['issue_type']}] {iss['message']}")
+                if warnings_list:
+                    with st.expander(f"⚠️ {len(warnings_list)} warning-uri la import"):
+                        for iss in warnings_list:
+                            st.warning(f"[{iss['issue_type']}] {iss['message']}")
 
-            st.rerun()
-        except Exception as e:
-            st.error(f"Eroare la import DuckDB: {e}")
+            except Exception as e:
+                st.error(f"❌ Eroare la import DuckDB: {e}")
+                log.error("DuckDB save failed for %s: %s", selected, e, exc_info=True)
+                return
+
+        # ── Parquet save (dual or parquet-only) ──────────────────────────────
+        if backend in ("parquet", "dual"):
+            try:
+                from core.state import DATA_DIR
+                mp_parquet = MarketplaceData(selected)
+                if backend == "dual":
+                    # Files already parsed for DuckDB step above.
+                    # Streamlit UploadedFile cursor is at EOF — MUST NOT re-read.
+                    # Reuse the already-parsed DataFrames.
+                    mp_parquet.load_from_dataframes(cats, chars, vals)
+                else:
+                    # parquet-only: first parse
+                    mp_parquet.load_from_files(cat_src, char_src, val_src)
+                folder = DATA_DIR / selected.replace(" ", "_")
+                mp_parquet.save_to_disk(folder)
+                if backend == "parquet":
+                    st.session_state["marketplaces"][selected] = mp_parquet
+                    st.session_state.pop(f"_reload_{selected}", None)
+                    stats = mp_parquet.stats()
+                    st.success(
+                        f"✅ Date salvate (Parquet) pentru **{selected}**: "
+                        f"{stats['categories']} categorii, "
+                        f"{stats['characteristics']} caracteristici, "
+                        f"{stats['values']:,} valori permise."
+                    )
+                else:
+                    log.info("Dual mode: Parquet also written for %s", selected)
+            except Exception as e:
+                st.error(f"❌ Eroare la salvare Parquet: {e}")
+                return
+
+        st.rerun()
 
 
 def render():
@@ -119,11 +136,20 @@ def render():
     if not selected:
         return
 
+    # Lazy-load marketplace data la selecție (cached — rapid dacă deja încărcat)
+    load_marketplace_on_select(selected)
     mp = get_marketplace(selected)
 
     # ── Badge DuckDB pilot ─────────────────────────────────────────────────────
-    if selected in DUCKDB_MARKETPLACES:
-        st.info("🦆 **Pilot DuckDB** — datele pentru acest marketplace sunt stocate în DuckDB local (`data/reference_data.duckdb`).")
+    backend = get_backend()
+    if backend in ("duckdb", "dual"):
+        st.info(f"🦆 **Backend: DuckDB** (`REFERENCE_BACKEND={backend}`) — `data/reference_data.duckdb`")
+    elif backend == "parquet":
+        st.warning(
+            "⚠️ **Backend Parquet este deprecat.** "
+            "Migreaza la DuckDB cu `scripts/migrate_parquet_to_duckdb.py` "
+            "și setează `REFERENCE_BACKEND=duckdb` în `.env`."
+        )
 
     if mp and mp.is_loaded():
         stats = mp.stats()
@@ -205,10 +231,7 @@ def render():
             if cat_file and char_file and val_file:
                 if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
                              use_container_width=True, key=f"save_upload_{selected}"):
-                    if selected in DUCKDB_MARKETPLACES:
-                        _do_save_duckdb(selected, cat_file, char_file, val_file, source_type="upload")
-                    else:
-                        _do_save(selected, cat_file, char_file, val_file)
+                    _do_save_unified(selected, cat_file, char_file, val_file, source_type="upload")
             else:
                 st.warning("⚠️ Încarcă toate cele 3 fișiere pentru a putea salva.")
 
@@ -252,11 +275,8 @@ def render():
             if all_paths_filled and paths_ok:
                 if st.button(f"💾 Salvează datele pentru {selected}", type="primary",
                              use_container_width=True, key=f"save_local_{selected}"):
-                    if selected in DUCKDB_MARKETPLACES:
-                        _do_save_duckdb(selected, cat_path.strip(), char_path.strip(),
-                                        val_path.strip(), source_type="local_path")
-                    else:
-                        _do_save(selected, cat_path.strip(), char_path.strip(), val_path.strip())
+                    _do_save_unified(selected, cat_path.strip(), char_path.strip(),
+                                     val_path.strip(), source_type="local_path")
             elif all_paths_filled and not paths_ok:
                 st.warning("⚠️ Corectează căile marcate cu ❌ înainte de a salva.")
             else:
@@ -284,12 +304,12 @@ def render():
             st.dataframe(mp.values.head(100), use_container_width=True, height=300)
 
     # ── DuckDB status panel ────────────────────────────────────────────────────
-    if selected in DUCKDB_MARKETPLACES:
+    if get_backend() in ("duckdb", "dual"):
         st.markdown("---")
         st.subheader("🦆 Status DuckDB")
         from core import reference_store_duckdb as _ddb
-        _mp_id = _ddb.DUCKDB_ID_MAP.get(selected)
-        db_status = _ddb.get_db_status(_mp_id) if _mp_id else {"available": False, "reason": "ID necunoscut"}
+        _mp_id = _ddb.marketplace_id_slug(selected)
+        db_status = _ddb.get_db_status(_mp_id)
         if db_status["available"]:
             st.success(
                 f"✅ DuckDB activ — ultimul import: `{db_status['imported_at']}`  \n"

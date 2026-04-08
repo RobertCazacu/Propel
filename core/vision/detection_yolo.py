@@ -60,7 +60,8 @@ class YoloResult:
 def detect_objects(
     img,                         # PIL.Image.Image
     model_name: str = "yolov8n.pt",
-    conf_threshold: float = 0.35,
+    conf_threshold: float = 0.50,
+    label_allowlist: list | None = None,  # None or [] = no filter
     run_logger=None,             # VisionRunLogger | None
     offer_id: str = "",
     image_url: str = "",
@@ -110,6 +111,21 @@ def detect_objects(
                 ))
 
         detections.sort(key=lambda d: -d.confidence)
+
+        # Apply label allowlist filter
+        if label_allowlist:
+            allowed = {lbl.lower() for lbl in label_allowlist}
+            filtered = [d for d in detections if d.label.lower() in allowed]
+            if run_logger and len(filtered) < len(detections):
+                removed = [d.label for d in detections if d.label.lower() not in allowed]
+                run_logger.log(
+                    stage="yolo", event="label_filter",
+                    offer_id=offer_id, image_url=image_url,
+                    status="ok", level="DEBUG",
+                    data={"removed_labels": removed, "kept": len(filtered)},
+                )
+            detections = filtered
+
         best         = detections[0] if detections else None
         fallback_used = best is None
 
@@ -220,6 +236,12 @@ def save_yolo_overlay(img, yolo_result: YoloResult, path) -> bool:
 
 def _get_model(model_name: str):
     if model_name not in _model_cache:
-        from ultralytics import YOLO
-        _model_cache[model_name] = YOLO(model_name)
+        try:
+            from ultralytics import YOLO
+            _model_cache[model_name] = YOLO(model_name)
+        except Exception as exc:
+            # P07: raise explicit error so callers get a clear message, not AttributeError/None
+            raise RuntimeError(
+                f"YOLO model '{model_name}' could not be loaded: {exc}"
+            ) from exc
     return _model_cache[model_name]

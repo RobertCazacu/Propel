@@ -78,7 +78,7 @@ class OllamaVisionProvider(BaseVisionProvider):
             "prompt": prompt,
             "images": [img_b64],
             "stream": False,
-            "options": {"temperature": 0.05, "num_predict": 80},
+            "options": {"temperature": 0.05, "num_predict": 200},
         }
         try:
             resp = requests.post(
@@ -93,6 +93,62 @@ class OllamaVisionProvider(BaseVisionProvider):
             return ""
 
 
+class OpenAIVisionProvider(BaseVisionProvider):
+    """
+    Calls OpenAI Chat Completions API with vision (gpt-4o-mini or gpt-4o).
+    Requires OPENAI_API_KEY in environment.
+    """
+    name = "openai"
+
+    def __init__(self, model: str = "gpt-4o-mini", timeout: int = 30):
+        import os
+        self._model   = os.getenv("OPENAI_VISION_MODEL", model)
+        self._api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        self._timeout = timeout
+
+    def is_available(self) -> bool:
+        return bool(self._api_key and not self._api_key.startswith("sk-your"))
+
+    def analyze(self, img: Image.Image, prompt: str) -> str:
+        if not self.is_available():
+            log.warning("OpenAIVisionProvider: OPENAI_API_KEY not configured")
+            return ""
+        import requests
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=80)
+        img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        payload = {
+            "model": self._model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {
+                        "url": f"data:image/jpeg;base64,{img_b64}",
+                        "detail": "low",
+                    }},
+                ],
+            }],
+            "max_tokens": 200,
+            "temperature": 0.05,
+        }
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                json=payload,
+                timeout=self._timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception as e:
+            log.warning("OpenAIVisionProvider.analyze error: %s", e)
+            return ""
+
+
 def build_vision_provider(
     provider_name: str = "ollama",
     model: str = "llava-phi3",
@@ -100,9 +156,18 @@ def build_vision_provider(
 ) -> BaseVisionProvider:
     """
     Factory. Falls back to MockVisionProvider if the requested provider
-    is unavailable (Ollama not running, model not pulled, etc.).
+    is unavailable (Ollama not running, model not pulled, API key missing, etc.).
     """
-    if provider_name == "ollama":
+    if provider_name == "openai":
+        p = OpenAIVisionProvider(model=model or "gpt-4o-mini")
+        if p.is_available():
+            log.info("Vision provider: OpenAI (%s)", p._model)
+            return p
+        log.warning(
+            "OpenAI vision provider unavailable — OPENAI_API_KEY not set. "
+            "Configurează cheia în pagina LLM Providers."
+        )
+    elif provider_name == "ollama":
         p = OllamaVisionProvider(model=model, base_url=base_url)
         if p.is_available():
             log.info("Vision provider: Ollama (%s)", p._model)

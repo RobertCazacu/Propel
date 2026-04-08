@@ -9,16 +9,18 @@ Schimbarea providerului:
     - switch_provider("groq")   (runtime, fără restart)
 """
 import os
+import threading
 from pathlib import Path
 from core.app_logger import get_logger
 from core.providers.base import BaseLLMProvider
 
 log = get_logger("marketplace.llm_router")
 
-VALID_PROVIDERS = ["anthropic", "ollama", "gemini", "groq", "mistral"]
+VALID_PROVIDERS = ["anthropic", "openai", "ollama", "gemini", "groq", "mistral"]
 
 # Singleton
 _instance: "LLMRouter | None" = None
+_instance_lock = threading.Lock()   # P04: double-checked locking
 
 
 # ── Factory ────────────────────────────────────────────────────────────────────
@@ -36,6 +38,9 @@ def _build_provider(name: str) -> BaseLLMProvider:
     if name == "anthropic":
         from core.providers.anthropic_provider import AnthropicProvider
         return AnthropicProvider()
+    if name == "openai":
+        from core.providers.openai_provider import OpenAIProvider
+        return OpenAIProvider()
     if name == "ollama":
         from core.providers.ollama_provider import OllamaProvider
         return OllamaProvider()
@@ -79,6 +84,29 @@ class LLMRouter:
         """Verifică dacă providerul activ e configururat și accesibil."""
         return self._provider.is_available()
 
+    def complete_structured(
+        self,
+        prompt: str,
+        schema: dict,
+        system: str | None = None,
+    ) -> dict | None:
+        """Delegă complete_structured la providerul activ.
+
+        Returnează dict conform schemei sau None dacă providerul nu suportă
+        structured output sau apelul eșuează — fără crash garantat.
+        """
+        try:
+            return self._provider.complete_structured(prompt, schema, system=system)
+        except Exception as exc:
+            log.warning("complete_structured failed (provider=%s): %s", self._provider.name, exc)
+            return None
+
+    def supports_structured(self) -> bool:
+        """Returnează True dacă providerul activ are complete_structured nativ (nu fallback)."""
+        return hasattr(self._provider, "complete_structured") and \
+               type(self._provider).complete_structured is not \
+               __import__("core.providers.base", fromlist=["BaseLLMProvider"]).BaseLLMProvider.complete_structured
+
     def switch_provider(self, name: str) -> None:
         """Schimbă providerul la runtime fără restart."""
         old = self._provider.name
@@ -90,10 +118,12 @@ class LLMRouter:
 # ── Singleton helpers ──────────────────────────────────────────────────────────
 
 def get_router() -> LLMRouter:
-    """Returnează instanța singleton a router-ului."""
+    """Returnează instanța singleton a router-ului (thread-safe via double-checked locking)."""
     global _instance
     if _instance is None:
-        _instance = LLMRouter()
+        with _instance_lock:
+            if _instance is None:   # P04: a doua verificare sub lock
+                _instance = LLMRouter()
     return _instance
 
 
