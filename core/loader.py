@@ -29,9 +29,11 @@ def _normalize_char_name(s: str) -> str:
     Maps 'Culoare:' and 'Culoare' and '  culoare  ' all to the same key 'culoare'.
     Used only for matching; output always uses the display name from the
     characteristics table.
+    Strips diacritics so 'Mărime:' matches 'Marime:'.
     """
     s = re.sub(r'\s+', ' ', str(s).strip())
-    return s.rstrip(':').strip().casefold()
+    s = s.rstrip(':').strip().casefold()
+    return _normalize_str(s)
 
 
 def _read_tabular(file_or_path: Union[str, Path, object]) -> pd.DataFrame:
@@ -74,7 +76,11 @@ def _read_excel_all_sheets(source) -> pd.DataFrame:
     schema as the first data sheet.  Skips sheets whose first column header
     contains SQL keywords (export artefacts like 'SELECT …').
     """
-    xl = pd.ExcelFile(source)
+    try:
+        import python_calamine  # noqa: F401
+        xl = pd.ExcelFile(source, engine="calamine")
+    except ImportError:
+        xl = pd.ExcelFile(source)
     if len(xl.sheet_names) == 1:
         return xl.parse(xl.sheet_names[0])
 
@@ -155,18 +161,38 @@ def load_categories(file) -> pd.DataFrame:
     """Load categories file. Returns DataFrame with standardised columns."""
     df = _read_tabular(file)
     mapping = _map_cols(df, CAT_COL_ALIASES)
+    for col in ("id", "name"):
+        if not mapping[col]:
+            log.warning(
+                "load_categories: coloana critică '%s' nu a fost găsită. Aliasuri încercate: %s",
+                col, CAT_COL_ALIASES[col],
+            )
     result = pd.DataFrame()
     result["id"]        = df[mapping["id"]]        if mapping["id"]        else None
     result["emag_id"]   = df[mapping["emag_id"]]   if mapping["emag_id"]   else result["id"]
     result["name"]      = df[mapping["name"]]      if mapping["name"]      else None
     result["parent_id"] = df[mapping["parent_id"]] if mapping["parent_id"] else None
-    return result.dropna(subset=["id", "name"])
+    total_before = len(result)
+    result = result.dropna(subset=["id", "name"])
+    eliminated = total_before - len(result)
+    if eliminated > 0:
+        log.warning(
+            "load_categories: %d rânduri eliminate din %d total (lipsă id sau name). Rămân: %d",
+            eliminated, total_before, len(result),
+        )
+    return result
 
 
 def load_characteristics(file) -> pd.DataFrame:
     """Load characteristics file."""
     df = _read_tabular(file)
     mapping = _map_cols(df, CHAR_COL_ALIASES)
+    for col in ("category_id", "name"):
+        if not mapping[col]:
+            log.warning(
+                "load_characteristics: coloana critică '%s' nu a fost găsită. Aliasuri încercate: %s",
+                col, CHAR_COL_ALIASES[col],
+            )
     result = pd.DataFrame()
     result["id"]                = df[mapping["id"]]                if mapping["id"]                else range(len(df))
     result["characteristic_id"] = df[mapping["characteristic_id"]] if mapping["characteristic_id"] else result["id"]
@@ -174,7 +200,15 @@ def load_characteristics(file) -> pd.DataFrame:
     result["name"]              = df[mapping["name"]]              if mapping["name"]              else None
     result["mandatory"]         = df[mapping["mandatory"]]         if mapping["mandatory"]         else 0
     result["restrictive"]       = df[mapping["restrictive"]]       if mapping["restrictive"]       else 1
-    return result.dropna(subset=["category_id", "name"])
+    total_before = len(result)
+    result = result.dropna(subset=["category_id", "name"])
+    eliminated = total_before - len(result)
+    if eliminated > 0:
+        log.warning(
+            "load_characteristics: %d rânduri eliminate din %d total (lipsă category_id sau name). Rămân: %d",
+            eliminated, total_before, len(result),
+        )
+    return result
 
 
 def load_values(file) -> pd.DataFrame:
@@ -283,6 +317,8 @@ class MarketplaceData:
             join_ids = cats["id"]
         self._cat_name_to_id = dict(zip(cats["name"], join_ids))
         self._cat_id_to_name = dict(zip(join_ids, cats["name"]))
+        # Map internal category_id → join_id so char-based indexes use the same key
+        _internal_to_join = dict(zip(cats["id"], join_ids))
 
         # normalized category lookup (diacritics-insensitive, case-insensitive)
         self._cat_name_normalized = {}
@@ -294,20 +330,23 @@ class MarketplaceData:
         # mandatory characteristics (vectorized)
         chars = self.characteristics.copy()
         chars["name"] = chars["name"].astype(str).str.strip()
+        # Remap internal category_id → join_id (emag_id when available) so all
+        # char-based indexes use the same key scheme as _cat_name_to_id.
+        chars["_jcat"] = chars["category_id"].map(lambda x: _internal_to_join.get(x, x))
         mandatory_mask = chars["mandatory"].astype(str).isin(["1", "True", "true", "yes", "1.0"])
         valid_name_mask = chars["name"].notna() & (chars["name"] != "") & (chars["name"] != "nan")
-        for cat_id, grp in chars[mandatory_mask & valid_name_mask].groupby("category_id"):
+        for cat_id, grp in chars[mandatory_mask & valid_name_mask].groupby("_jcat"):
             self._mandatory[cat_id] = grp["name"].tolist()
 
         # all char names per category (to detect which fields belong to this marketplace)
-        for cat_id, grp in chars[valid_name_mask].groupby("category_id"):
+        for cat_id, grp in chars[valid_name_mask].groupby("_jcat"):
             self._cat_chars[cat_id] = set(grp["name"])
 
         # char name canonical map — built from characteristics display names
         # key: _normalize_char_name(display_name)  →  display_name (the authoritative form)
         # Allows tolerant lookup: "Culoare:" and "Culoare" both resolve to the same entry.
         self._char_name_map = {}
-        for cat_id, grp in chars[valid_name_mask].groupby("category_id"):
+        for cat_id, grp in chars[valid_name_mask].groupby("_jcat"):
             self._char_name_map[cat_id] = {
                 _normalize_char_name(name): name
                 for name in grp["name"]
@@ -328,7 +367,7 @@ class MarketplaceData:
             ]
             for _, row in char_id_data.iterrows():
                 emag_id = row["characteristic_id"]
-                cat_id_row = row["category_id"]
+                cat_id_row = row["_jcat"]
                 name = row["name"]
                 norm_name = _normalize_char_name(name)
                 self._char_name_to_emag_id.setdefault(cat_id_row, {})[norm_name] = emag_id
@@ -337,7 +376,7 @@ class MarketplaceData:
                     self._char_restrictive.add(emag_id)
 
         if "restrictive" in chars.columns:
-            for cat_id_row, grp in chars[valid_name_mask].groupby("category_id"):
+            for cat_id_row, grp in chars[valid_name_mask].groupby("_jcat"):
                 self._char_restrictive_by_name[cat_id_row] = {
                     _normalize_char_name(name): str(restr).strip() in _restr_vals
                     for name, restr in zip(grp["name"], grp["restrictive"])
@@ -349,7 +388,8 @@ class MarketplaceData:
         vals["characteristic_name"] = vals["characteristic_name"].astype(str).str.strip()
         vals["value"] = vals["value"].astype(str).str.strip()
         vals = vals[vals["value"] != "nan"]
-        for (cat_id, char_name), grp in vals.groupby(["category_id", "characteristic_name"]):
+        vals["_jcat"] = vals["category_id"].map(lambda x: _internal_to_join.get(x, x))
+        for (cat_id, char_name), grp in vals.groupby(["_jcat", "characteristic_name"]):
             # Resolve to canonical display name (from characteristics) if possible
             canonical = self._char_name_map.get(cat_id, {}).get(
                 _normalize_char_name(char_name), char_name

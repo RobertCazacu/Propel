@@ -364,6 +364,8 @@ def analyze_product_image(
                         "palette_top3":        color_res.palette_rgb[:3],
                         "missing_char":        missing_char,
                         "min_conf_threshold":  min_color_conf,
+                        "color_chars_tried":   color_chars,
+                        "available_chars_sample": sorted(valid_values_for_cat.keys())[:20],
                     },
                 )
                 run_logger.inc("color_ok")
