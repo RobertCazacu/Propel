@@ -623,17 +623,14 @@ def _apply_color_to_result(
         map_reason = ""
 
         if valid_set:
-            mapped = _map_to_valid(normalized, valid_set)
-            if mapped:
-                map_reason = "exact/case-insensitive match"
-            else:
-                # Family scoring fallback
-                m = re.match(r"rgb\((\d+),\s*(\d+),\s*(\d+)\)", color_res.dominant_color_raw)
-                if m:
-                    fam    = _rgb_to_family((int(m.group(1)), int(m.group(2)), int(m.group(3))))
-                    mapped = pick_best_accepted_color(fam, valid_set) or None
-                    if mapped:
-                        map_reason = f"family scoring (family={fam})"
+            from core.color_mapper import map_detected_color_to_allowed
+            _cm = map_detected_color_to_allowed(
+                normalized,
+                list(valid_set),
+                context={"offer_id": offer_id},
+            )
+            mapped     = _cm.mapped_value
+            map_reason = f"{_cm.method} (score={_cm.score:.3f})" if mapped else ""
 
             if run_logger:
                 run_logger.log("fill", "color_mapping", offer_id=offer_id, image_url=image_url,
