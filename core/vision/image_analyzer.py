@@ -291,11 +291,16 @@ def analyze_product_image(
                 result.detected_object = yolo_res.best.label
                 result.yolo_confidence = yolo_res.best.confidence
                 result.yolo_bbox       = yolo_res.best.bbox
-                working_img            = crop_to_detection(img, yolo_res.best)
-                result.used_crop       = True
-                log.debug("[Vision] YOLO crop offer=%s det=%r conf=%.2f bbox=%s",
-                          offer_id, yolo_res.best.label, yolo_res.best.confidence,
-                          yolo_res.best.bbox)
+                # P15: skip crop for low-confidence detections to avoid misleading color analysis
+                if yolo_res.best.confidence >= 0.50:
+                    working_img      = crop_to_detection(img, yolo_res.best)
+                    result.used_crop = True
+                    log.debug("[Vision] YOLO crop offer=%s det=%r conf=%.2f bbox=%s",
+                              offer_id, yolo_res.best.label, yolo_res.best.confidence,
+                              yolo_res.best.bbox)
+                else:
+                    log.debug("[Vision] YOLO low confidence — skipping crop offer=%s det=%r conf=%.2f",
+                              offer_id, yolo_res.best.label, yolo_res.best.confidence)
 
             # Save debug artifacts
             if save_debug and run_logger and yolo_res.best:

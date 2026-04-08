@@ -80,6 +80,7 @@ def _normalize_title(title: str) -> str:
     s = re.sub(r"\s+", " ", s).strip()
     return s
 _cache_lock = threading.Lock()
+_merge_lock = threading.Lock()   # P01: protejează citirea+scrierea learned_title_rules
 
 # Load .env if present
 try:
@@ -140,6 +141,20 @@ def _done_key(title: str, category: str, marketplace: str = "") -> str:
 
 _MAX_AI_RETRIES = 4
 _RATE_LIMIT_BASE_SLEEP = 10  # secunde — backoff initial pentru 429
+
+
+def _sanitize_for_prompt(text: str, max_len: int = 300) -> str:
+    """P10: Sanitizează input utilizator pentru inserare sigură în prompt LLM.
+
+    Elimină newline-uri (ar putea injecta instrucțiuni noi),
+    escape-ează ghilimele duble (sparg structura JSON așteptată),
+    truncată la max_len pentru a limita token-ii și vectorii de injecție.
+    """
+    if not text:
+        return ""
+    text = str(text).replace("\n", " ").replace("\r", " ")
+    text = text.replace('"', '\\"')
+    return text[:max_len]
 
 
 def _complete_with_retry(prompt: str, max_tok: int, system: str, temperature: float) -> str:
@@ -349,10 +364,12 @@ def _process_batch(batch: list[dict], category_list: list[str],
     """Trimite un singur batch de produse la AI. Returneaza {prod_id: category}."""
     lines = []
     for i, prod in enumerate(batch, 1):
-        desc = re.sub(r"<[^>]+>", " ", prod.get("description") or "").strip()[:80]
-        line = f'{i}. "{prod["title"]}"'
-        if desc:
-            line += f" | {desc}"
+        raw_desc = re.sub(r"<[^>]+>", " ", prod.get("description") or "").strip()[:80]
+        safe_title = _sanitize_for_prompt(prod.get("title", ""), max_len=300)  # P10
+        safe_desc  = _sanitize_for_prompt(raw_desc, max_len=80)                # P10
+        line = f'{i}. "{safe_title}"'
+        if safe_desc:
+            line += f" | {safe_desc}"
         lines.append(line)
 
     system_prompt = _build_batch_system_prompt(marketplace, category_list)
@@ -409,13 +426,14 @@ def _process_batch(batch: list[dict], category_list: list[str],
                          and not w.isupper()
                          and not any(c.isdigit() for c in w)][:5]
                 kw_string = ", ".join(words)
-                existing_kws = {r.get("keywords", r.get("prefix", "")) for r in cache["learned_title_rules"]}
-                if kw_string and kw_string not in existing_kws:
-                    cache["learned_title_rules"].append({
-                        "keywords": kw_string,
-                        "exclude": "",
-                        "category": matched_cat,
-                    })
+                with _merge_lock:   # P01: atomic read+append pentru thread safety
+                    existing_kws = {r.get("keywords", r.get("prefix", "")) for r in cache["learned_title_rules"]}
+                    if kw_string and kw_string not in existing_kws:
+                        cache["learned_title_rules"].append({
+                            "keywords": kw_string,
+                            "exclude": "",
+                            "category": matched_cat,
+                        })
             else:
                 if ai_cat:
                     log.warning(

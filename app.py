@@ -2,9 +2,12 @@
 Marketplace Offer Processor
 Multi-marketplace tool for automatic characteristic completion.
 """
+import logging
 import streamlit as st
 import sys
 from pathlib import Path
+
+log = logging.getLogger("marketplace.app")
 
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -52,6 +55,13 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 init_state()
+
+# Asigura schema DuckDB la zi (migrari idempotente)
+try:
+    from core.reference_store_duckdb import ensure_schema
+    ensure_schema()
+except Exception as _schema_exc:
+    log.error("ensure_schema() failed: %s", _schema_exc, exc_info=True)  # P24: nu mai înghite eroarea în tăcere
 
 # Sterge log-urile mai vechi de 7 zile
 from core.logger import cleanup_old_logs

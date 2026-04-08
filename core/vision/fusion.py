@@ -141,7 +141,8 @@ def fuse_category(
     if text_ok and img_ok and same:
         avg = (text.confidence + image.confidence) / 2
         res.final_category   = text.candidate
-        res.final_confidence = min(avg + 0.10, 1.0)
+        # P17: apply agreement bonus only when avg confidence is meaningful (>= 0.50)
+        res.final_confidence = min(avg + (0.10 if avg >= 0.50 else 0.0), 1.0)
         res.rule_applied     = "prefer_text"
         res.reason = (
             f"Text și imagine confirmă aceeași categorie '{text.candidate}'. "
@@ -169,24 +170,54 @@ def fuse_category(
         )
     else:
         # Default: review — pick higher confidence signal but flag
-        if text_ok and text.confidence >= (image.confidence if img_ok else 0):
+        # P18: if both signals are very weak, don't commit — mark for review with None category
+        _MIN_CONFLICT_CONF = 0.20
+        _text_conf  = text.confidence if text_ok else 0.0
+        _img_conf   = image.confidence if img_ok else 0.0
+        if _text_conf < _MIN_CONFLICT_CONF and _img_conf < _MIN_CONFLICT_CONF:
+            res.final_category   = ""
+            res.final_confidence = 0.0
+            res.rule_applied     = "review"
+            res.needs_review     = True
+            res.reason = (
+                f"Conflict cu ambele semnale sub pragul minim ({_MIN_CONFLICT_CONF}): "
+                f"text={_text_conf:.2f}, img={_img_conf:.2f}. Nicio decizie luată."
+            )
+        elif text_ok and text.confidence >= (image.confidence if img_ok else 0):
             best = text.candidate
             best_conf = text.confidence
+            res.final_category   = best
+            res.final_confidence = best_conf * 0.80  # discounted due to conflict
+            res.rule_applied     = "review"
+            res.needs_review     = True
+            res.reason = (
+                f"Conflict nerezolvat: text='{text.candidate}'({text.confidence:.2f}) vs "
+                f"imagine='{image.candidate}'({image.confidence:.2f}). "
+                f"Marcat pentru review manual. Confidență redusă la {res.final_confidence:.2f}."
+            )
         elif img_ok:
             best = image.candidate
             best_conf = image.confidence
+            res.final_category   = best
+            res.final_confidence = best_conf * 0.80
+            res.rule_applied     = "review"
+            res.needs_review     = True
+            res.reason = (
+                f"Conflict nerezolvat: text='{text.candidate}'({text.confidence:.2f}) vs "
+                f"imagine='{image.candidate}'({image.confidence:.2f}). "
+                f"Marcat pentru review manual. Confidență redusă la {res.final_confidence:.2f}."
+            )
         else:
-            best = text.candidate
             best_conf = text.confidence
-        res.final_category   = best
-        res.final_confidence = best_conf * 0.80  # discounted due to conflict
-        res.rule_applied     = "review"
-        res.needs_review     = True
-        res.reason = (
-            f"Conflict nerezolvat: text='{text.candidate}'({text.confidence:.2f}) vs "
-            f"imagine='{image.candidate}'({image.confidence:.2f}). "
-            f"Marcat pentru review manual. Confidență redusă la {res.final_confidence:.2f}."
-        )
+            res.final_category   = text.candidate
+            res.final_confidence = best_conf * 0.80
+            res.rule_applied     = "review"
+            res.needs_review     = True
+            res.reason = (
+                f"Conflict nerezolvat: text='{text.candidate}'({text.confidence:.2f}) vs "
+                f"imagine='{image.candidate}'({image.confidence:.2f}). "
+                f"Marcat pentru review manual. Confidență redusă la {res.final_confidence:.2f}."
+            )
 
     _log(res, run_logger, offer_id)
     return res

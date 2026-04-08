@@ -1,3 +1,5 @@
+import json
+import re
 from abc import ABC, abstractmethod
 
 
@@ -39,16 +41,16 @@ class BaseLLMProvider(ABC):
         Implementarea implicită face fallback la complete() + json.loads.
         Override în provideri care suportă tool_use nativ.
         """
-        import json
         system_msg = system or "Returnează DOAR JSON valid, fără text suplimentar."
         raw = self.complete(prompt, max_tokens=500, system=system_msg)
         try:
-            # Curăță markdown code blocks dacă există
             text = raw.strip()
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-            return json.loads(text.strip())
+            # P16: regex robust pentru extragere din ```json...``` sau ```...```
+            match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+            if match:
+                text = match.group(1).strip()
+            if not text:
+                return None
+            return json.loads(text)
         except Exception:
             return None

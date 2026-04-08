@@ -186,6 +186,11 @@ _MIGRATIONS = [
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS vision_confidence DOUBLE DEFAULT NULL",
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS fusion_action VARCHAR DEFAULT NULL",
     "ALTER TABLE ai_run_log ADD COLUMN IF NOT EXISTS conflict_flag BOOLEAN DEFAULT FALSE",
+    # P11: indexes for dedup prevention on re-import and fast lookup
+    "CREATE INDEX IF NOT EXISTS idx_cats_mp_cat ON categories(marketplace_id, category_id)",
+    "CREATE INDEX IF NOT EXISTS idx_chars_mp_char_cat ON characteristics(marketplace_id, characteristic_id, category_id)",
+    # P21: fast lookup for find_valid() queries
+    "CREATE INDEX IF NOT EXISTS idx_cv_mp_charname ON characteristic_values(marketplace_id, characteristic_name)",
 ]
 
 _UPSERT_MARKETPLACE = """
@@ -209,11 +214,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
     with duckdb.connect(str(db_path)) as con:
         for ddl in _DDL_STATEMENTS:
             con.execute(ddl)
-        for migration in _MIGRATIONS:
-            try:
-                con.execute(migration)
-            except Exception:
-                pass  # column already exists or other benign conflict
+        _run_migrations(con)  # P28: idempotent migrations with RENAME COLUMN guard
         # Register known pilot marketplaces (backward compat).
         # New marketplaces are registered on-demand via ensure_marketplace().
         for mp_id, mp_name in [(EMAG_HU_ID, EMAG_HU_NAME), (ALLEGRO_ID, ALLEGRO_NAME)]:
@@ -479,6 +480,23 @@ def import_marketplace(
 
     Returns: import_run_id
     """
+    with _WRITE_LOCK:   # P06: single-writer constraint DuckDB pe Windows
+        return _import_marketplace_locked(
+            marketplace_id, cats_df, chars_df, vals_df,
+            source_type, sources, db_path,
+        )
+
+
+def _import_marketplace_locked(
+    marketplace_id: str,
+    cats_df: pd.DataFrame,
+    chars_df: pd.DataFrame,
+    vals_df: pd.DataFrame,
+    source_type: str,
+    sources: dict,
+    db_path: Path,
+) -> str:
+    """Implementarea internă a import_marketplace — apelată sub _WRITE_LOCK."""
     import_run_id = str(uuid.uuid4())
     now = datetime.now(timezone.utc)
     mandatory_truthy = {"1", "true", "True", "yes", "1.0"}
@@ -528,7 +546,7 @@ def import_marketplace(
         cats_bulk = pd.DataFrame({
             "marketplace_id":     marketplace_id,
             "category_id":        _norm_id_series(cats_df["id"]),
-            "emag_id":            cats_df["emag_id"].astype(str),
+            "emag_id":            _norm_id_series(cats_df["emag_id"]),
             "category_name":      cats_df["name"].astype(str),
             "parent_category_id": cats_df["parent_id"].where(cats_df["parent_id"].notna(), None),
             "import_run_id":      import_run_id,
@@ -579,7 +597,7 @@ def import_marketplace(
         ].copy()
         vals_bulk = pd.DataFrame({
             "marketplace_id":      marketplace_id,
-            "category_id":         _norm_id_series(vals_clean["category_id"]),
+            "category_id":         vals_clean["category_id"].apply(_remap_cat_id).replace("", None),
             "characteristic_id":   vals_clean["characteristic_id"].where(vals_clean["characteristic_id"].notna(), None),
             "characteristic_name": vals_clean["characteristic_name"].where(vals_clean["characteristic_name"].notna(), None),
             "value":               vals_clean["value"].astype(str).str.strip(),
@@ -857,6 +875,32 @@ def get_db_status(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> 
         return {"available": False, "reason": str(exc)}
 
 
+def _run_migrations(con) -> None:
+    """Rulează migrările idempotent. P28: RENAME COLUMN are guard explicit."""
+    import re as _re
+    _rename_pat = _re.compile(
+        r"ALTER TABLE\s+(\w+)\s+RENAME COLUMN\s+(\w+)\s+TO\s+(\w+)", _re.IGNORECASE
+    )
+    for migration in _MIGRATIONS:
+        m = _rename_pat.search(migration)
+        if m:
+            table, old_col, new_col = m.group(1), m.group(2), m.group(3)
+            # P28: skip RENAME if target column already exists (fresh DB or already migrated)
+            try:
+                cols = {
+                    row[0].lower()
+                    for row in con.execute(f"PRAGMA table_info({table})").fetchall()
+                }
+                if new_col.lower() in cols or old_col.lower() not in cols:
+                    continue  # guard: already renamed or source doesn't exist
+            except Exception:
+                pass
+        try:
+            con.execute(migration)
+        except Exception:
+            pass  # other benign conflicts (column already exists, index exists, etc.)
+
+
 def ensure_schema(db_path: Path | None = None) -> None:
     """Asigură că schema DuckDB este la zi (tabele + indecși).
 
@@ -869,11 +913,7 @@ def ensure_schema(db_path: Path | None = None) -> None:
     with duckdb.connect(str(db_path)) as con:
         for ddl in _DDL_STATEMENTS:
             con.execute(ddl)
-        for migration in _MIGRATIONS:
-            try:
-                con.execute(migration)
-            except Exception:
-                pass
+        _run_migrations(con)
 
 
 # ── product_knowledge CRUD ─────────────────────────────────────────────────────

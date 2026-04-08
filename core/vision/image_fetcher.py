@@ -8,10 +8,13 @@ returns the same file. Call clear_image_cache() to reset.
 Returns a PIL.Image (RGB) or None on any failure.
 """
 import io
+import ipaddress
+import socket
 import time
 import hashlib
 import requests
 from pathlib import Path
+from urllib.parse import urlparse
 from PIL import Image
 from core.app_logger import get_logger
 
@@ -33,6 +36,28 @@ def _url_hash(url: str) -> str:
     return hashlib.md5(url.strip().encode("utf-8")).hexdigest()
 
 
+def _is_private_ip(hostname: str) -> bool:
+    """P27: Return True if hostname resolves to an RFC-1918/loopback/link-local address."""
+    try:
+        ip = ipaddress.ip_address(socket.gethostbyname(hostname))
+        return ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved
+    except Exception:
+        return False  # DNS failure — let requests handle it normally
+
+
+def _validate_url(url: str) -> str | None:
+    """P27: Return error string if URL is disallowed, else None."""
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        return f"Scheme not allowed: {parsed.scheme!r}"
+    hostname = parsed.hostname or ""
+    if not hostname:
+        return "No hostname in URL"
+    if _is_private_ip(hostname):
+        return f"SSRF blocked: hostname '{hostname}' resolves to private/loopback address"
+    return None
+
+
 def _is_image_url(url: str, content_type: str) -> bool:
     if "image" in content_type.lower():
         return True
@@ -52,6 +77,12 @@ def fetch_image(url: str, sku: str = "") -> tuple:
     if not url or not url.strip().startswith("http"):
         log.warning("[Fetch] URL invalid sau lipsa: %r", url)
         return None, "Invalid or missing URL"
+
+    # P27: block SSRF — reject private/loopback IP targets
+    _url_err = _validate_url(url.strip())
+    if _url_err:
+        log.warning("[Fetch] URL blocat (SSRF): %s — %r", _url_err, url[:100])
+        return None, _url_err
 
     cache_key  = _url_hash(url)
     cache_path = CACHE_DIR / f"{cache_key}.jpg"

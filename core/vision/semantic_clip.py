@@ -9,9 +9,12 @@ Public API:
     is_available() -> bool
 """
 from __future__ import annotations
+import logging
 import time
 from dataclasses import dataclass, field
 from typing import Optional
+
+log = logging.getLogger("marketplace.clip")
 
 _open_clip_ok: Optional[bool]       = None
 _transformers_ok: Optional[bool]    = None
@@ -116,7 +119,7 @@ def _score_open_clip(img, labels, model_name, run_logger, offer_id, image_url, y
             )
 
         model, _, preprocess = _get_open_clip_model(model_name)
-        tokenizer   = open_clip.get_tokenizer("ViT-B-32")
+        tokenizer   = open_clip.get_tokenizer(model_name)   # P03: tokenizer matches model
         img_tensor  = preprocess(img).unsqueeze(0)
         text_tokens = tokenizer(labels)
 
@@ -249,7 +252,11 @@ def _get_open_clip_model(model_name: str):
         import open_clip
         try:
             m, _, p = open_clip.create_model_and_transforms(model_name, pretrained="openai")
-        except Exception:
+        except Exception as exc:
+            # P12: explicit warning when requested model is unavailable and fallback kicks in
+            log.warning(
+                "CLIP model '%s' unavailable (%s) — falling back to ViT-B-32", model_name, exc
+            )
             m, _, p = open_clip.create_model_and_transforms("ViT-B-32", pretrained="openai")
         m.eval()
         _open_clip_cache[model_name] = (m, None, p)
