@@ -166,6 +166,77 @@ def write_log(
     return out_path
 
 
+# ── Resolver log ───────────────────────────────────────────────────────────────
+
+def write_resolver_log(
+    marketplace: str,
+    filename: str,
+    results: list[dict],
+    base_log_path=None,  # Path returned by write_log — used to match timestamp
+) -> "Path | None":
+    """
+    Scrie un fișier JSON dedicat resolver-ului, cu toate evenimentele de rezoluție
+    din această rulare. Salvat în data/logs/ cu același timestamp ca log-ul principal.
+
+    Returnează path-ul fișierului sau None dacă nu există evenimente resolver.
+    """
+    events = []
+    method_counts: dict = {}
+
+    for r in results:
+        flags = r.get("new_chars", {}).get("_review_flags", {})
+        if not flags:
+            continue
+        for char_name, meta in flags.items():
+            method = meta.get("method", "none")
+            method_counts[method] = method_counts.get(method, 0) + 1
+            events.append({
+                "product_id":    str(r.get("id", "")),
+                "title":         str(r.get("title", ""))[:120],
+                "char":          char_name,
+                "mandatory":     char_name in r.get("missing_mandatory", []) or meta.get("value") is not None,
+                "llm_value":     meta.get("llm_value", ""),
+                "resolved_value": meta.get("value"),
+                "method":        method,
+                "score":         meta.get("score", 0.0),
+                "top_k":         meta.get("top_k", []),
+                "reason":        meta.get("reason", ""),
+                "needs_review":  True,
+            })
+
+    if not events:
+        return None
+
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Reuse timestamp from base log path if available, else generate new one
+    if base_log_path is not None:
+        stem = Path(base_log_path).stem  # e.g. "2026-04-09_04-05-09_eMAG_BG"
+        out_path = LOGS_DIR / f"{stem}_ollama_resolver.json"
+    else:
+        ts_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        out_path = LOGS_DIR / f"{ts_str}_{marketplace.replace(' ', '_')}_ollama_resolver.json"
+
+    total_resolved   = sum(1 for e in events if e["resolved_value"] is not None)
+    total_unresolved = sum(1 for e in events if e["resolved_value"] is None)
+
+    payload = {
+        "timestamp":  datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        "marketplace": marketplace,
+        "fisier":     filename,
+        "sumar": {
+            "total_events":       len(events),
+            "rezolvate":          total_resolved,
+            "nerezolvate":        total_unresolved,
+            "metode":             method_counts,
+        },
+        "events": events,
+    }
+
+    out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return out_path
+
+
 # ── Read ───────────────────────────────────────────────────────────────────────
 
 def list_logs() -> list[dict]:

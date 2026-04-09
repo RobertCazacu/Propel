@@ -1,0 +1,23 @@
+{
+  "_comment": "Maps marketplace_id tokens → ISO 639-1 language code. Required at runtime.",
+  "emag_ro": "ro",
+  "emag": "ro",
+  "romania": "ro",
+  "emag_hu": "hu",
+  "hu": "hu",
+  "hungary": "hu",
+  "magyarország": "hu",
+  "fashiondays_hu": "hu",
+  "pepita": "hu",
+  "emag_bg": "bg",
+  "bg": "bg",
+  "bulgaria": "bg",
+  "fashiondays_bg": "bg",
+  "allegro": "pl",
+  "allegro_pl": "pl",
+  "pl": "pl",
+  "poland": "pl",
+  "fashiondays": "ro",
+  "trendyol": "tr",
+  "decathlon": "ro"
+}
