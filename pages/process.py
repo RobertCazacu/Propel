@@ -18,107 +18,31 @@ _AI_PRICE_OUTPUT = 4.00 / 1_000_000   # $4.00 per million output tokens
 _AI_BATCH_SIZE   = 60
 
 
-# ── Category mapping helpers (for 1007 missing-category errors) ───────────────
-# These are per-marketplace and stored in session state after user confirms.
-
-TITLE_CATEGORY_RULES_KEY = "title_cat_rules"  # prefix — se foloseste per-marketplace: f"{KEY}_{mp_name}"
-
-
-def _default_title_rules() -> list[dict]:
-    return []
-
-
-def _rule_keywords(rule: dict) -> list[str]:
-    """Extrage lista de cuvinte cheie dintr-o regula (suporta format nou si vechi)."""
-    raw = rule.get("keywords", rule.get("prefix", ""))
-    return [k.strip().lower() for k in re.split(r"[,\s]+", raw) if k.strip()]
-
-
-def _preprocess_rules(rules: list, mp) -> list:
-    """Pre-procesează regulile o singură dată: validează categoriile, pre-sortează și pre-calculează keywords.
-
-    Apelat ÎNAINTE de orice buclă per-produs pentru a evita O(N_produse * N_reguli) overhead.
-    Returneaza lista sortată de reguli valide cu '_kws' și '_exclude' pre-calculate.
-    """
-    valid = []
-    seen_kw = set()
-    for r in rules:
-        cat = r.get("category", "")
-        kws = _rule_keywords(r)
-        if not cat or not kws:
-            continue
-        if not mp.category_id(cat):
-            continue
-        kw_str = ",".join(sorted(kws))
-        if kw_str in seen_kw:
-            continue  # deduplicare
-        seen_kw.add(kw_str)
-        exclude = [k.strip().lower() for k in r.get("exclude", "").split(",") if k.strip()]
-        valid.append({**r, "_kws": kws, "_exclude": exclude})
-    return sorted(valid, key=lambda r: -len(r["_kws"]))
-
-
-def _resolve_category(title: str, current_cat: str, mp, rules: list,
-                      _fast_rules: list | None = None) -> tuple[str, str]:
+def _resolve_category(title: str, current_cat: str, mp) -> tuple[str, str]:
     """
     Returns (final_category, action) where action is one of:
-    'ok', 'assigned', 'corrected', 'unknown'
-
-    Matching logic: ALL keywords trebuie sa apara oriunde in titlu (case-insensitive).
-    Regulile cu mai multe keywords sunt verificate primele (mai specifice).
-
-    _fast_rules: pre-processed rules from _preprocess_rules() — skips sort/validate overhead.
+    'ok', 'unknown'
     """
-    # Pasul 1 — categoria curenta exista in marketplace-ul activ
     if current_cat and mp.category_id(current_cat):
         return current_cat, "ok"
-
-    # Pasul 2 — categoria curenta NU exista in MP-ul activ (e din alt marketplace)
-    # o ignoram complet si determinam din titlu cu regulile MP-ului curent
-    title_lower = title.lower()
-
-    if _fast_rules is not None:
-        # Cale rapida: reguli pre-sortate, pre-validate, keywords pre-calculate
-        for rule in _fast_rules:
-            keywords = rule["_kws"]
-            if all(kw in title_lower for kw in keywords):
-                if not any(ex in title_lower for ex in rule["_exclude"]):
-                    return rule["category"], "assigned"
-    else:
-        # Cale lenta (backward-compat): sortare si validare per-apel
-        sorted_rules = sorted(rules, key=lambda r: -len(_rule_keywords(r)))
-        for rule in sorted_rules:
-            cat      = rule.get("category", "")
-            keywords = _rule_keywords(rule)
-            exclude  = [k.strip().lower() for k in rule.get("exclude", "").split(",") if k.strip()]
-            if not keywords or not cat:
-                continue
-            if not mp.category_id(cat):
-                continue
-            if all(kw in title_lower for kw in keywords):
-                if not any(ex in title_lower for ex in exclude):
-                    return cat, "assigned"
-
     log.debug(
-        "_resolve_category UNKNOWN: titlu=%r, cat_curenta=%r, reguli=%d, niciuna nu se potriveste",
-        title[:60], current_cat, len(rules),
+        "_resolve_category UNKNOWN: titlu=%r, cat_curenta=%r",
+        title[:60], current_cat,
     )
     return "", "unknown"
 
 
-def _estimate_ai_cost(to_process: list, mp, rules: list) -> dict:
+def _estimate_ai_cost(to_process: list, mp) -> dict:
     """
     Estimează tokenii și costul API înainte de procesare.
     - Category AI: produse fără categorie valabilă → batch calls
     - Char AI: produse cu categorii valabile dar cu caracteristici obligatorii lipsă → per-product calls
     """
-    # Memoize _resolve_category — evita apeluri duble per produs
-    _fast_rules_est = _preprocess_rules(rules, mp)
     _resolve_cache: dict = {}
     def _resolve_cached(title: str, cat: str):
         key = (title, cat)
         if key not in _resolve_cache:
-            _resolve_cache[key] = _resolve_category(title, cat, mp, rules, _fast_rules=_fast_rules_est)
+            _resolve_cache[key] = _resolve_category(title, cat, mp)
         return _resolve_cache[key]
 
     # ── Category AI ──────────────────────────────────────────────────────────
@@ -227,7 +151,8 @@ def _prevent_sleep():
         return lambda: None
 
 
-def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, marketplace="", image_options=None):
+def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketplace="", image_options=None,
+                 resume_results=None, resume_ids=None, checkpoint_filename=""):
     from core.ai_logger import start_run as _ai_start_run
     _ai_start_run(marketplace)
 
@@ -258,12 +183,10 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
     )
     log.info(
         "START procesare [%s]: %d produse total, %d de procesat (cod eligibil), "
-        "%d cu categorie in fisier, %d cu categorie valida in MP, "
-        "%d reguli configurate, AI=%s, "
+        "%d cu categorie in fisier, %d cu categorie valida in MP, AI=%s, "
         "MP incarcat: %d categorii / %d caracteristici / %d valori",
         marketplace, total, n_processable,
-        n_with_cat, n_valid_cat,
-        len(rules), use_ai,
+        n_with_cat, n_valid_cat, use_ai,
         mp_stats.get("categories", 0), mp_stats.get("characteristics", 0), mp_stats.get("values", 0),
     )
     if n_processable == 0:
@@ -288,40 +211,25 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         if use_ai:
             log.info(
                 "[%s] Niciun produs nu are o categorie valida — AI activ, "
-                "categoriile vor fi determinate automat prin batch AI. Reguli: %d.",
-                marketplace, len(rules),
+                "categoriile vor fi determinate automat prin batch AI.",
+                marketplace,
             )
         else:
             log.warning(
                 "[%s] Niciun produs nu are o categorie valida pentru acest marketplace. "
-                "Reguli: %d. AI dezactivat — categoriile NU pot fi determinate automat.",
-                marketplace, len(rules),
+                "AI dezactivat — categoriile NU pot fi determinate automat.",
+                marketplace,
             )
-
-    # Pre-procesare reguli o singura data (O(N_reguli)) — folosita in toata functia
-    _fast_rules = _preprocess_rules(rules, mp)
 
     # ── Pre-procesare batch categorie (1 apel API pentru toate produsele fara categorie) ─
     if use_ai:
         try:
-            from core.ai_enricher import suggest_categories_batch, get_learned_rules, is_configured
+            from core.ai_enricher import suggest_categories_batch, is_configured
             _ai_ok = is_configured()
             if not _ai_ok:
                 st.warning("⚠️ AI dezactivat — ANTHROPIC_API_KEY lipsește sau e invalidă în .env. Categoriile nu vor fi determinate automat.")
                 log.warning("[%s] is_configured() = False — API key lipseste sau invalida.", marketplace)
             if _ai_ok:
-                # Adauga regulile invatate automat din rulari anterioare
-                learned = get_learned_rules()
-                existing_kws = {r.get("keywords", r.get("prefix", "")) for r in rules}
-                for r in learned:
-                    kw = r.get("keywords", r.get("prefix", ""))
-                    if kw and kw not in existing_kws:
-                        rules = rules + [r]
-
-                # Re-pre-procesare reguli dupa adaugarea celor invatate
-                _fast_rules = _preprocess_rules(rules, mp)
-                log.info("[%s] Pre-procesare reguli (cu invatate): %d → %d valide", marketplace, len(rules), len(_fast_rules))
-
                 # Colecteaza produsele care au nevoie de AI pentru categorie
                 needs_ai_cat = []
                 for prod in products:
@@ -330,8 +238,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                         continue
                     cat = str(prod.get("category") or "")
                     title = str(prod.get("name") or "")
-                    # Verifica daca categoria e deja rezolvabila fara AI
-                    _, cat_action = _resolve_category(title, cat, mp, rules, _fast_rules=_fast_rules)
+                    _, cat_action = _resolve_category(title, cat, mp)
                     if cat_action == "unknown":
                         needs_ai_cat.append({
                             "id": prod.get("id") or title,
@@ -403,7 +310,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
             return i, result
 
         # ── Fix category ──────────────────────────────────────────────────────
-        final_cat, cat_action = _resolve_category(title, cat, mp, rules, _fast_rules=_fast_rules)
+        final_cat, cat_action = _resolve_category(title, cat, mp)
 
         if cat_action == "assigned":
             result["action"]       = "cat_assigned"
@@ -433,7 +340,7 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
                 )
             else:
                 result["mapping_log"]["category_reason"] = (
-                    f"Nicio regulă din {len(rules)} nu s-a potrivit cu titlul (AI dezactivat)"
+                    "AI dezactivat — categoria nu a putut fi determinată automat"
                 )
 
             if not final_cat or not mp.category_id(final_cat):
@@ -616,22 +523,56 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
         return i, result
 
     # ── Execuție paralelă — 8 produse procesate simultan ──────────────────────
+    from core.logger import save_checkpoint, clear_checkpoint, CHECKPOINT_EVERY
+
+    # Pre-populare cu rezultatele din checkpoint (dacă se reia)
+    _resume_ids: set = set(resume_ids or [])
     results_ordered = [None] * total
     completed_count = 0
-    status_text.text(f"⏳ Faza 2/2 — Procesare caracteristici: 0/{total} produse...")
+    _checkpoint_done_ids: set = set(_resume_ids)
+
+    # Inserează rezultatele deja procesate la pozițiile corecte
+    if resume_results:
+        _id_to_idx = {str(prod.get("id", i)): i for i, prod in enumerate(products)}
+        for rr in resume_results:
+            pos = _id_to_idx.get(str(rr.get("id", "")))
+            if pos is not None:
+                results_ordered[pos] = rr
+                completed_count += 1
+
+    # Filtrează produsele deja procesate
+    pending_products = [
+        (i, prod) for i, prod in enumerate(products)
+        if str(prod.get("id", i)) not in _resume_ids
+    ]
+
+    total_display = total  # total real (inclusiv cele deja procesate)
+    status_text.text(f"⏳ Faza 2/2 — Procesare caracteristici: {completed_count}/{total_display} produse...")
 
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_process_one, (i, prod)): i for i, prod in enumerate(products)}
+        futures = {executor.submit(_process_one, (i, prod)): i for i, prod in pending_products}
         for future in as_completed(futures):
             idx, res = future.result()
             results_ordered[idx] = res
             completed_count += 1
-            if completed_count % 50 == 0 or completed_count == total:
-                pct = 40 + int(completed_count / total * 60)
+            _checkpoint_done_ids.add(str(res.get("id", idx)))
+
+            if completed_count % 10 == 0 or completed_count == total_display:
+                pct = 40 + int(completed_count / total_display * 60)
                 progress_bar.progress(pct)
-                status_text.text(f"⏳ Faza 2/2 — Caracteristici: {completed_count}/{total} produse...")
+                status_text.text(f"⏳ Faza 2/2 — Caracteristici: {completed_count}/{total_display} produse...")
+
+            # Checkpoint periodic
+            if checkpoint_filename and completed_count % CHECKPOINT_EVERY == 0:
+                _done_so_far = [r for r in results_ordered if r is not None]
+                save_checkpoint(marketplace, checkpoint_filename, _done_so_far,
+                                total_display, _checkpoint_done_ids)
 
     results = [r for r in results_ordered if r is not None]
+
+    # Șterge checkpointul după rulare completă
+    if checkpoint_filename:
+        clear_checkpoint(marketplace, checkpoint_filename)
 
     if _run_logger:
         try:
@@ -646,9 +587,8 @@ def _process_all(products, mp, rules, progress_bar, status_text, use_ai=False, m
 # ── Page render ────────────────────────────────────────────────────────────────
 
 def render():
-    st.title("📁 Procesare Oferte")
-    st.markdown("Încarcă fișierul de oferte, selectează marketplace-ul și pornește procesarea automată.")
-    st.markdown("---")
+    from pages.ui_helpers import hero_header, section_header
+    hero_header("📁 Procesare Oferte", "Încarcă fișierul de oferte, selectează marketplace-ul și pornește procesarea automată.")
 
     # ── Step 1: Select marketplace ────────────────────────────────────────────
     mp_names = all_marketplace_names()
@@ -658,27 +598,30 @@ def render():
         st.warning("⚠️ Niciun marketplace configurat. Mergi la **⚙️ Setup Marketplace** mai întâi.")
         return
 
-    st.subheader("1️⃣ Selectează marketplace")
+    section_header("1️⃣ Selectează marketplace")
     selected_mp = st.selectbox("Marketplace", loaded, key="proc_mp")
     load_marketplace_on_select(selected_mp)
     mp = get_marketplace(selected_mp)
-    _rules_key = f"{TITLE_CATEGORY_RULES_KEY}_{selected_mp}"  # reguli separate per marketplace
-
     stats = mp.stats()
+    from pages.ui_helpers import badge_html as _badge_html
     st.markdown(
-        f"<div style='background:#1e3a5f;border-left:5px solid #4da6ff;padding:10px 16px;"
-        f"border-radius:4px;margin:4px 0 12px 0'>"
-        f"<span style='color:#4da6ff;font-size:13px;font-weight:600;letter-spacing:0.5px'>"
-        f"MARKETPLACE ACTIV</span><br>"
-        f"<span style='color:#ffffff;font-size:20px;font-weight:700'>{selected_mp}</span>"
-        f"<span style='color:#aaaaaa;font-size:12px;margin-left:12px'>"
-        f"{stats['categories']} categorii · {stats['characteristics']} caracteristici · {stats['values']} valori</span>"
-        f"</div>",
+        f'<div class="setup-status-card">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between">'
+        f'<span style="font-size:1rem;font-weight:700;color:#f1f5f9">{selected_mp}</span>'
+        f'{_badge_html("Activ", "success")}</div>'
+        f'<div class="setup-stats">'
+        f'<div class="setup-stat"><span class="setup-stat-val">{stats["categories"]}</span>'
+        f'<span class="setup-stat-lbl">Categorii</span></div>'
+        f'<div class="setup-stat"><span class="setup-stat-val">{stats["characteristics"]}</span>'
+        f'<span class="setup-stat-lbl">Caracteristici</span></div>'
+        f'<div class="setup-stat"><span class="setup-stat-val">{stats["values"]:,}</span>'
+        f'<span class="setup-stat-lbl">Valori</span></div>'
+        f'</div></div>',
         unsafe_allow_html=True,
     )
 
     # ── Step 2: Upload offers file ─────────────────────────────────────────────
-    st.subheader("2️⃣ Încarcă fișierul de oferte")
+    section_header("2️⃣ Încarcă fișierul de oferte")
 
     from core.templates import offers_template
     col_dl, col_info = st.columns([1, 3])
@@ -689,7 +632,7 @@ def render():
             file_name="model_offers.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             key="dl_offers",
-            use_container_width=True,
+            width="stretch",
         )
     with col_info:
         st.caption(
@@ -728,62 +671,17 @@ def render():
         proc_count = sum(err_counts.get(c, 0) for c in processable)
         other_count = sum(v for k, v in err_counts.items() if k not in processable)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total produse", len(products))
-        col2.metric(f"De procesat (cod: {codes_str})", proc_count)
-        col3.metric("Alte erori / fără eroare", other_count)
+        from pages.ui_helpers import kpi_row as _kpi_row_upload
+        _kpi_row_upload([
+            {"value": len(products), "label": "Total produse",                        "color": "#f1f5f9"},
+            {"value": proc_count,    "label": f"De procesat (cod: {codes_str})",       "color": "#22c55e"},
+            {"value": other_count,   "label": "Alte erori / fără eroare",              "color": "#6b7280"},
+        ])
 
-    # ── Step 3: Category mapping rules ────────────────────────────────────────
-    with st.expander("⚙️ Reguli mapare categorii (pentru erori 1007)", expanded=False):
-        st.markdown(
-            "Definește reguli bazate pe **cuvinte cheie** prezente oriunde în titlu.\n\n"
-            "- **Cuvinte cheie**: separate prin virgulă — **TOATE** trebuie să apară în titlu\n"
-            "- **Excludere** *(opțional)*: cuvinte care **NU** trebuie să apară\n"
-            "- Regulile cu mai multe cuvinte cheie au prioritate (mai specifice)\n\n"
-            "**Exemple:** `tricou, barbati` prinde orice titlu cu ambele cuvinte, indiferent de ordine sau brand."
-        )
-
-        if _rules_key not in st.session_state:
-            # Regulile implicite cu categorii romanesti se aplica DOAR pentru eMAG Romania
-            st.session_state[_rules_key] = _default_title_rules() if "Romania" in selected_mp else []
-
-        rules = st.session_state[_rules_key]
-
-        cat_list = mp.category_list() if mp else []
-        updated_rules = []
-        for i, rule in enumerate(rules):
-            c1, c2, c3, c4 = st.columns([3, 2, 3, 1])
-            # Suport format vechi (prefix) si nou (keywords)
-            kw_val = rule.get("keywords", rule.get("prefix", ""))
-            keywords = c1.text_input(
-                f"Cuvinte cheie #{i+1}", value=kw_val, key=f"rule_kw_{i}",
-                help="Ex: tricou, barbati — TOATE trebuie în titlu"
-            )
-            exclude = c2.text_input(
-                f"Excludere #{i+1}", value=rule.get("exclude", ""), key=f"rule_ex_{i}",
-                help="Ex: copii — dacă apare, regula nu se aplică"
-            )
-            category = c3.selectbox(
-                f"Categorie #{i+1}", options=[""] + cat_list,
-                index=(cat_list.index(rule["category"]) + 1) if rule.get("category") in cat_list else 0,
-                key=f"rule_cat_{i}"
-            )
-            keep = not c4.button("🗑", key=f"rule_del_{i}")
-            if keep:
-                updated_rules.append({"keywords": keywords, "exclude": exclude, "category": category})
-
-        st.session_state[_rules_key] = updated_rules
-
-        c1, c2 = st.columns([3, 1])
-        if c2.button("➕ Adaugă regulă"):
-            st.session_state[_rules_key].append({"keywords": "", "exclude": "", "category": ""})
-            st.rerun()
-
-    # ── Step 4: Process ────────────────────────────────────────────────────────
-    st.subheader("3️⃣ Procesare")
+    # ── Step 3: Process ────────────────────────────────────────────────────────
+    section_header("3️⃣ Procesare")
 
     products = st.session_state.get("offers_products", [])
-    rules    = st.session_state.get(_rules_key, _default_title_rules() if "Romania" in selected_mp else [])
 
     if not products:
         st.info("Încarcă un fișier de oferte pentru a continua.")
@@ -799,11 +697,11 @@ def render():
         ):
             st.caption(
                 "Categoriile de mai jos nu există în indexul acestui marketplace. "
-                "Vor fi ignorate și sistemul va încerca să le determine din titlu folosind regulile de mai sus."
+                "Vor fi ignorate și sistemul va încerca să le determine automat prin AI."
             )
             rows = [{"Categorie invalidă": cat, "Nr. produse": n}
                     for cat, n in audit["invalid_cats"].items()]
-            st.dataframe(rows, use_container_width=True, hide_index=True)
+            st.dataframe(rows, width="stretch", hide_index=True)
     else:
         st.success(f"Toate cele {audit['valid']} produse au categorii valide pentru {selected_mp}.")
 
@@ -859,64 +757,95 @@ def render():
         pass
 
     if use_ai and to_process and _is_anthropic:
-        est = _estimate_ai_cost(to_process, mp, rules)
-        with st.expander("💰 Cost estimativ API Claude", expanded=True):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Produse → categorie AI", est["n_cat_ai"],
-                      help=f"{est['n_batches']} batch-uri × max {_AI_BATCH_SIZE} produse/batch")
-            c2.metric("Batches categorii", est["n_batches"])
-            c3.metric("Produse → caractere AI", est["n_char_ai"],
-                      help="Produse cu categorii valabile și câmpuri obligatorii lipsă")
-            c4.metric("Cost estimativ", f"~${est['cost_usd']:.4f}",
-                      help="Estimare pe baza prețurilor claude-haiku-4-5-20251001")
-
+        est = _estimate_ai_cost(to_process, mp)
+        with st.expander("💰 Cost estimativ API Claude", expanded=False):
+            from pages.ui_helpers import kpi_row as _kpi_row_cost
+            _kpi_row_cost([
+                {"value": est["n_cat_ai"],           "label": "Produse → categorie AI"},
+                {"value": est["n_batches"],           "label": "Batch-uri categorii"},
+                {"value": est["n_char_ai"],           "label": "Produse → caractere AI"},
+                {"value": f"~${est['cost_usd']:.4f}", "label": "Cost estimativ", "color": "#22c55e"},
+            ])
             st.caption(
-                f"Tokeni estimați: **{est['total_input']:,}** input"
-                f" ({est['cat_input']:,} categ. + {est['char_input']:,} caractere)"
-                f" · **{est['total_output']:,}** output"
-                f" ({est['cat_output']:,} categ. + {est['char_output']:,} caractere)"
-                f"  ·  Preț model: $0.80/MTok input · $4.00/MTok output"
+                f"Tokeni: **{est['total_input']:,}** input · **{est['total_output']:,}** output"
+                f"  ·  $0.80/MTok input · $4.00/MTok output"
             )
             if est["n_cat_ai"] == 0:
-                st.success("✅ Toate categoriile sunt rezolvabile fără AI — cost categorizare: $0.00")
+                st.success("✅ Toate categoriile rezolvabile fără AI — cost categorizare: $0.00")
             if est["cost_usd"] < 0.001:
                 st.info("💡 Cost sub $0.001 — practic gratuit pentru acest număr de oferte.")
 
-    # ── Image analysis options ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🖼️ Analiză imagine (opțional)")
-    col_img1, col_img2 = st.columns(2)
-    with col_img1:
-        enable_color = st.checkbox(
-            "Detectează culoarea din imagine",
-            value=False,
-            help="Analizează imaginea produsului și completează automat caracteristica de culoare dacă lipsește.",
-        )
-        enable_yolo = st.checkbox(
-            "Detectare obiect YOLO",
-            value=False,
-            help="Folosește YOLO pentru a detecta și decupa obiectul principal din imagine înainte de analiză.",
-        )
-    with col_img2:
-        enable_product_hint = st.checkbox(
-            "Folosește imaginea pentru îmbunătățirea categoriei",
-            value=False,
-            help="Folosește un model vision (Ollama llava-phi3) pentru a sugera tipul de produs din imagine.",
-        )
-        enable_clip = st.checkbox(
-            "Validare semantică CLIP",
-            value=False,
-            help="Folosește CLIP pentru a valida semantic categoria detectată față de imaginea produsului.",
-        )
+    # ── Image analysis options (collapsed by default — optional feature) ─────────
+    enable_color = False
+    enable_yolo  = False
+    enable_product_hint = False
+    enable_clip  = False
+
+    with st.expander("🖼️ Analiză imagine (opțional)", expanded=False):
+        st.caption("Activează pentru a detecta culoarea, tipul produsului sau a valida categoria din imagini.")
+        col_img1, col_img2 = st.columns(2)
+        with col_img1:
+            enable_color = st.checkbox(
+                "Detectează culoarea din imagine",
+                value=False,
+                help="Analizează imaginea produsului și completează automat caracteristica de culoare dacă lipsește.",
+            )
+            enable_yolo = st.checkbox(
+                "Detectare obiect YOLO",
+                value=False,
+                help="Folosește YOLO pentru a detecta și decupa obiectul principal din imagine înainte de analiză.",
+            )
+            if enable_yolo:
+                try:
+                    from core.vision.detection_yolo import is_available as _yolo_available
+                    if not _yolo_available():
+                        st.warning(
+                            "YOLO dezactivat — pachetul `ultralytics` nu este instalat. "
+                            "Rulează: `pip install ultralytics`"
+                        )
+                except Exception:
+                    st.warning("YOLO dezactivat — eroare la verificarea ultralytics.")
+        with col_img2:
+            enable_product_hint = st.checkbox(
+                "Folosește imaginea pentru îmbunătățirea categoriei",
+                value=False,
+                help="Folosește un model vision (Ollama llava-phi3) pentru a sugera tipul de produs din imagine.",
+            )
+            enable_clip = st.checkbox(
+                "Validare semantică CLIP",
+                value=False,
+                help="Folosește CLIP pentru a valida semantic categoria detectată față de imaginea produsului.",
+            )
 
     _any_image = enable_color or enable_product_hint or enable_yolo or enable_clip
     image_options = None
     if _any_image:
         vision_provider = None
         if enable_product_hint:
+            import os
+            _has_openai = bool(os.getenv("OPENAI_API_KEY", "").strip()
+                               and not os.getenv("OPENAI_API_KEY", "").startswith("sk-your"))
+            _vision_options = ["openai (gpt-4o-mini)", "ollama (local)"] if _has_openai \
+                              else ["ollama (local)", "openai (gpt-4o-mini — cheie lipsă)"]
+            _vision_sel = st.selectbox(
+                "Provider vision",
+                _vision_options,
+                index=0,
+                key="vision_provider_sel",
+                help="OpenAI gpt-4o-mini: mai precis, cost mic per imagine. "
+                     "Ollama: gratuit, necesită instalare locală.",
+            )
+            _use_openai_vision = "openai" in _vision_sel and _has_openai
             try:
-                from core.vision.visual_provider import build_vision_provider
-                vision_provider = build_vision_provider("ollama")
+                from core.vision.visual_provider import build_vision_provider, MockVisionProvider
+                vision_provider = build_vision_provider(
+                    "openai" if _use_openai_vision else "ollama"
+                )
+                if isinstance(vision_provider, MockVisionProvider):
+                    st.warning(
+                        f"Îmbunătățirea categoriei din imagine **dezactivată** — "
+                        f"{vision_provider.fallback_reason}"
+                    )
             except Exception:
                 vision_provider = None
 
@@ -985,12 +914,42 @@ def render():
             "save_debug": save_debug,
         }
 
-    if st.button(f"🚀 Pornește procesarea pentru {selected_mp}", type="primary", use_container_width=True):
+    # ── Checkpoint resume UI ───────────────────────────────────────────────────
+    from core.logger import load_checkpoint
+    _file_name_ui = st.session_state.get("offers_file_name", "")
+    _checkpoint = load_checkpoint(selected_mp, _file_name_ui) if _file_name_ui else None
+    _resume_results, _resume_ids = None, None
+
+    if _checkpoint:
+        _done = _checkpoint.get("processed_cnt", 0)
+        _tot  = _checkpoint.get("total", 0)
+        st.warning(
+            f"🔄 Progres salvat găsit: **{_done}/{_tot} produse** procesate "
+            f"(salvat la {_checkpoint.get('saved_at', '?')}). "
+            f"Apasă **Continuă** pentru a relua sau **Începe de la zero** pentru o rulare nouă."
+        )
+        col_resume, col_restart = st.columns(2)
+        if col_resume.button("▶️ Continuă de unde am rămas", type="primary"):
+            _resume_results = _checkpoint.get("results", [])
+            _resume_ids     = set(_checkpoint.get("processed_ids", []))
+        if col_restart.button("🔁 Începe de la zero"):
+            from core.logger import clear_checkpoint
+            clear_checkpoint(selected_mp, _file_name_ui)
+            _checkpoint = None
+            st.rerun()
+
+    st.markdown('<div style="margin-top:1.5rem"></div>', unsafe_allow_html=True)
+    if st.button(f"🚀 Pornește procesarea pentru {selected_mp}", type="primary", width="stretch"):
         progress = st.progress(0)
         status   = st.empty()
         start    = time.time()
 
-        results = _process_all(products, mp, rules, progress, status, use_ai=use_ai, marketplace=selected_mp, image_options=image_options)
+        results = _process_all(
+            products, mp, progress, status,
+            use_ai=use_ai, marketplace=selected_mp, image_options=image_options,
+            resume_results=_resume_results, resume_ids=_resume_ids,
+            checkpoint_filename=_file_name_ui,
+        )
 
         elapsed = time.time() - start
         st.session_state["process_results"] = results
@@ -1005,9 +964,10 @@ def render():
         except Exception:
             pass
 
-        from core.logger import write_log
+        from core.logger import write_log, write_resolver_log
         file_name = st.session_state.get("offers_file_name", "necunoscut.xlsx")
-        write_log(selected_mp, file_name, results, elapsed, use_ai)
+        _log_path = write_log(selected_mp, file_name, results, elapsed, use_ai)
+        write_resolver_log(selected_mp, file_name, results, base_log_path=_log_path)
 
         # Summary
         n_cat_assigned  = sum(1 for r in results if r["action"] == "cat_assigned")
@@ -1021,12 +981,54 @@ def render():
 
         st.success(f"✅ Procesare completă în {elapsed:.1f}s!")
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Categorii atribuite",   n_cat_assigned)
-        col2.metric("Categorii corectate",   n_cat_corrected)
-        col3.metric("Caracteristici adăugate", n_chars_added)
-        col4.metric("Valori invalide șterse", n_cleared)
-        col5.metric("Necesită review manual", n_manual)
+        from pages.ui_helpers import kpi_row as _kpi_row
+        _kpi_row([
+            {"value": n_cat_assigned,  "label": "Categorii atribuite",    "color": "#6366f1"},
+            {"value": n_cat_corrected, "label": "Categorii corectate",    "color": "#a5b4fc"},
+            {"value": n_chars_added,   "label": "Caracteristici adăugate","color": "#22c55e"},
+            {"value": n_cleared,       "label": "Valori invalide șterse", "color": "#f59e0b"},
+            {"value": n_manual,        "label": "Necesită review manual", "color": "#ef4444"},
+        ])
+
+        # ── Needs Review section ──────────────────────────────────────────────
+        review_products = [
+            r for r in results
+            if r.get("new_chars", {}).get("_review_flags")
+        ]
+        if review_products:
+            with st.expander(
+                f"⚠️ {len(review_products)} produse cu câmpuri ce necesită verificare",
+                expanded=True,
+            ):
+                st.caption(
+                    "Aceste valori au fost completate cu încredere scăzută (rescue/repair). "
+                    "Verifică și corectează dacă este necesar."
+                )
+                for prod in review_products[:20]:  # max 20 in UI
+                    flags = prod["new_chars"].get("_review_flags", {})
+                    if not flags:
+                        continue
+                    st.markdown(f"**{str(prod.get('title', prod.get('id', '?')))[:80]}**")
+                    for char_name, meta in flags.items():
+                        val = meta.get("value")
+                        top_k = meta.get("top_k", [])
+                        method = meta.get("method", "?")
+                        score = meta.get("score", 0)
+                        sugestii = ", ".join(
+                            f"`{v}` ({s:.2f})" for v, s in top_k[:3]
+                        )
+                        if val:
+                            st.markdown(
+                                f"  - **{char_name}**: completat cu `{val}` "
+                                f"(method={method}, score={score:.2f}) | "
+                                f"Sugestii: {sugestii}"
+                            )
+                        else:
+                            st.markdown(
+                                f"  - **{char_name}**: ❌ necompletat | "
+                                f"Sugestii: {sugestii}"
+                            )
+                    st.divider()
 
         # ── Auto-save export la finalizare ────────────────────────────────────
         _file_bytes = st.session_state.get("offers_file_buf")
@@ -1063,16 +1065,17 @@ def render():
             _save_path = _exports_dir / f"{_ts}_{_mp_slug}_{_auto_fname}"
             _save_path.write_bytes(_auto_bytes)
 
-            st.markdown("---")
+            from pages.ui_helpers import section_header as _sh
+            _sh("⬇️ Export rapid", "Fișierul a fost generat automat", color="#22c55e")
             st.download_button(
                 f"⬇️ Descarcă {_auto_fname}",
                 data=_auto_bytes,
                 file_name=_auto_fname,
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
+                width="stretch",
                 type="primary",
             )
-            st.caption(f"💾 Salvat automat în: `{_save_path}`")
+            st.caption(f"💾 Salvat automat local: `{_save_path}`")
         except Exception as _e:
             st.warning(f"⚠️ Auto-save eșuat: {_e}")
             st.info("Mergi la **📊 Results** pentru a descărca fișierul.")

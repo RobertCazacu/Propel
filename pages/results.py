@@ -5,6 +5,7 @@ import pandas as pd
 from datetime import datetime
 from pathlib import Path
 from core.exporter import export_excel, export_model_format
+from pages.ui_helpers import hero_header, section_header, kpi_row
 
 _EXPORTS_DIR = Path(__file__).parent.parent / "data" / "exports"
 _EXPORT_TTL_HOURS = 24
@@ -33,8 +34,7 @@ def _auto_save_export(data: bytes, filename: str, marketplace: str = "") -> Path
 
 
 def render():
-    st.title("📊 Rezultate & Export")
-    st.markdown("---")
+    hero_header("📊 Rezultate & Export", "Revizuiește și descarcă rezultatele procesării.")
 
     results = st.session_state.get("process_results", [])
     if not results:
@@ -63,14 +63,13 @@ def render():
     n_manual   = sum(1 for r in results if r.get("needs_manual"))
     n_cat_fix  = sum(1 for r in results if r.get("action") in ("cat_assigned", "cat_corrected"))
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Produse actualizate", n_updated)
-    col2.metric("Caracteristici adăugate", n_chars)
-    col3.metric("Valori șterse (invalide)", n_cleared)
-    col4.metric("Categorii fixate", n_cat_fix)
-    col5.metric("🟡 Review manual", n_manual, delta_color="inverse")
-
-    st.markdown("---")
+    kpi_row([
+        {"value": n_updated,  "label": "Produse actualizate",       "color": "#6366f1"},
+        {"value": n_chars,    "label": "Caracteristici adăugate",    "color": "#22c55e"},
+        {"value": n_cleared,  "label": "Valori șterse (invalide)",   "color": "#f59e0b"},
+        {"value": n_cat_fix,  "label": "Categorii fixate"},
+        {"value": n_manual,   "label": "Review manual",              "color": "#ef4444"},
+    ])
 
     # ── Filters ────────────────────────────────────────────────────────────────
     col1, col2 = st.columns([3, 1])
@@ -130,7 +129,7 @@ def render():
             })
 
         df = pd.DataFrame(rows)
-        st.dataframe(df, use_container_width=True, height=400,
+        st.dataframe(df, width="stretch", height=400,
                      column_config={
                          "Char. adăugate": st.column_config.NumberColumn(format="%d"),
                      })
@@ -138,8 +137,8 @@ def render():
     # ── Manual review section ──────────────────────────────────────────────────
     manual = [r for r in results if r.get("needs_manual")]
     if manual:
-        st.markdown("---")
-        with st.expander(f"🟡 Produse care necesită completare manuală ({len(manual)})", expanded=False):
+        section_header("⚠️ Review manual", f"{len(manual)} produse necesită atenție", color="#f59e0b")
+        with st.expander(f"Arată produsele ({len(manual)})", expanded=False):
             st.markdown("Aceste produse au **caracteristici obligatorii** pe care nu le-am putut completa automat (ex: Mărime pentru categorii copii în format CM).")
             for r in manual[:50]:
                 missing = r.get("missing_mandatory", [])
@@ -151,8 +150,7 @@ def render():
                 st.caption(f"... și încă {len(manual)-50} produse")
 
     # ── Export ─────────────────────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("⬇️ Export Excel")
+    section_header("⬇️ Export Excel", "Descarcă rezultatele în format Excel gata de import")
 
     st.markdown("""
 **Legenda culori:**
@@ -171,7 +169,7 @@ def render():
     with col1:
         st.markdown("**Format original** *(modifică fișierul sursă)*")
         st.caption("Funcționează doar dacă fișierul original are coloanele `Offer ch. N name/val`.")
-        if file_bytes and st.button("📥 Export format original", use_container_width=True):
+        if file_bytes and st.button("📥 Export format original", width="stretch"):
             with st.spinner("Se generează..."):
                 try:
                     output_bytes = export_excel(io.BytesIO(file_bytes), results, char_pairs)
@@ -181,7 +179,7 @@ def render():
                         data=output_bytes,
                         file_name=f"{base_name}_fixed.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
+                        width="stretch",
                     )
                     st.caption(f"💾 Salvat local: `{saved_path}`")
                 except Exception as e:
@@ -190,7 +188,7 @@ def render():
     with col2:
         st.markdown("**Format model import** *(recomandat)*")
         st.caption("Construiește fișierul de la zero cu coloanele `Characteristic Name / Value`.")
-        if st.button("📥 Export format model import", type="primary", use_container_width=True):
+        if st.button("📥 Export format model import", type="primary", width="stretch"):
             with st.spinner("Se generează..."):
                 try:
                     output_bytes = export_model_format(
@@ -204,7 +202,7 @@ def render():
                         data=output_bytes,
                         file_name=f"{base_name}_model.xlsx",
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True,
+                        width="stretch",
                     )
                     st.caption(f"💾 Salvat local: `{saved_path}`")
                 except Exception as e:

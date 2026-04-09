@@ -13,9 +13,12 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from typing import Optional, TYPE_CHECKING
+from core.app_logger import get_logger
 
 if TYPE_CHECKING:
     from PIL import Image as _PILImage
+
+log = get_logger("marketplace.vision.yolo")
 
 _ultralytics_ok: Optional[bool] = None
 _model_cache: dict = {}
@@ -29,8 +32,13 @@ def is_available() -> bool:
         try:
             import ultralytics  # noqa
             _ultralytics_ok = True
+            log.info("[YOLO] ultralytics disponibil (v%s)", ultralytics.__version__)
         except ImportError:
             _ultralytics_ok = False
+            log.warning(
+                "[YOLO] ultralytics nu este instalat — YOLO dezactivat. "
+                "Instalează cu: pip install ultralytics"
+            )
     return _ultralytics_ok
 
 
@@ -71,6 +79,11 @@ def detect_objects(
     by confidence descending.  Falls back to full-image if no detections.
     """
     if not is_available():
+        log.warning(
+            "[YOLO] Skipped offer=%s — ultralytics nu este instalat. "
+            "Instalează cu: pip install ultralytics",
+            offer_id,
+        )
         if run_logger:
             run_logger.log(
                 stage="yolo", event="unavailable", offer_id=offer_id,
@@ -129,6 +142,18 @@ def detect_objects(
         best         = detections[0] if detections else None
         fallback_used = best is None
 
+        if best:
+            log.info(
+                "[YOLO] offer=%s — detectat '%s' conf=%.2f bbox=%s în %dms (model=%s)",
+                offer_id, best.label, best.confidence, best.bbox, duration_ms, model_name,
+            )
+        else:
+            log.warning(
+                "[YOLO] offer=%s — nicio detecție (model=%s, conf_threshold=%.2f, "
+                "n_raw=%d). Se folosește imaginea completă.",
+                offer_id, model_name, conf_threshold, len(detections),
+            )
+
         if run_logger:
             run_logger.log(
                 stage="yolo", event="inference_done",
@@ -168,6 +193,10 @@ def detect_objects(
 
     except Exception as exc:
         duration_ms = round((time.perf_counter() - t0) * 1000)
+        log.error(
+            "[YOLO] Eroare offer=%s model=%s în %dms: %s",
+            offer_id, model_name, duration_ms, exc, exc_info=True,
+        )
         if run_logger:
             run_logger.log(
                 stage="yolo", event="error",
@@ -238,8 +267,11 @@ def _get_model(model_name: str):
     if model_name not in _model_cache:
         try:
             from ultralytics import YOLO
+            log.info("[YOLO] Se încarcă modelul '%s' (prima utilizare, poate descărca weights)...", model_name)
             _model_cache[model_name] = YOLO(model_name)
+            log.info("[YOLO] Model '%s' încărcat cu succes.", model_name)
         except Exception as exc:
+            log.error("[YOLO] Nu s-a putut încărca modelul '%s': %s", model_name, exc)
             # P07: raise explicit error so callers get a clear message, not AttributeError/None
             raise RuntimeError(
                 f"YOLO model '{model_name}' could not be loaded: {exc}"

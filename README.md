@@ -32,8 +32,14 @@ Takes an offer export file from a marketplace platform and automatically fixes:
 - **Auto-save export** — corrected Excel file generated and saved automatically after processing; download button appears immediately
 - **Sleep prevention** — blocks Windows standby/hibernate during processing via `SetThreadExecutionState`; resets automatically when done
 - **Rate limit resilience** — exponential backoff with jitter prevents thundering herd; 2 parallel batch workers
-- **Color-coded Excel export** — each type of change has a distinct color
-- **DuckDB telemetry** — every AI run logged to `ai_run_log` table with token counts, latency, structured output metrics
+- **Color mapper** — maps detected colors to marketplace valid values via multilingual synonym clusters (18 canonical clusters for RO/HU/BG), fuzzy scoring (rapidfuzz token_set_ratio + Jaccard), and semantic reranking (sentence-transformers); auto-accepts at 0.82 confidence, soft-review at 0.68
+- **Characteristic resolver V2.1** — 3-pass fallback for AI-suggested values that fail strict validation: Pass 1 fuzzy match on allowed values, Pass 2 Ollama local repair (budgeted at 2 calls/product), Pass 3 adaptive floor rescue; locale-aware prompts via `config/locale_registry.json`
+- **UI "Needs Review" expander** — low-confidence fills surfaced with top-3 suggestions for manual selection
+- **Per-attribute vision fusion** — `fusion_attrs.py` engine applies text+vision fusion per attribute with 5 decision cases and `find_valid()` as gate; controlled per-attribute via `visual_rules.json` `attribute_fusion_policy` table
+- **Color-coded Excel export** — each type of change has a distinct color; non-mandatory color chars filled when category supports them
+- **Thread safety** — merge lock on learned rule deduplication, double-checked locking in LLM singleton, write lock on marketplace import
+- **SSRF protection** — image fetcher blocks RFC1918 / loopback IPs before any download
+- **DuckDB telemetry** — every AI run logged to `ai_run_log` table with token counts, latency, structured output metrics, vision signal and fusion action columns
 - **Public access** — Cloudflare Tunnel + Telegram bot notification on startup
 
 ---
@@ -65,16 +71,28 @@ marketplace_tool/
 │   │   ├── __init__.py             # Exports analyze_product_image, ImageAnalysisResult
 │   │   ├── image_analyzer.py       # Main orchestrator: color + YOLO + CLIP + vision LLM fusion
 │   │   ├── color_analyzer.py       # Algorithmic color detection (PIL quantize, HSV classification)
-│   │   ├── image_fetcher.py        # Image downloader with local cache (data/image_cache/)
+│   │   ├── image_fetcher.py        # Image downloader with local cache + SSRF protection
 │   │   ├── visual_provider.py      # Vision model providers (Ollama llava-phi3, Mock)
-│   │   ├── visual_rules.py         # JSON rules engine (data/visual_rules.json)
-│   │   ├── yolo_detector.py        # YOLO object detection + crop pipeline
+│   │   ├── visual_rules.py         # JSON rules engine + attribute_fusion_policy table
+│   │   ├── yolo_detector.py        # YOLO object detection + crop pipeline (skip < 0.50 conf)
 │   │   ├── clip_validator.py       # CLIP semantic category validation
+│   │   ├── fusion_attrs.py         # Per-attribute text+vision fusion engine (5 decision cases)
+│   │   ├── vision_attr_extractor.py # Structured cloud-only attribute extraction
 │   │   └── vision_logger.py        # Per-run image analysis log
+│   ├── color_mapper/
+│   │   ├── __init__.py             # Public API: map_color()
+│   │   ├── types.py                # ColorMappingResult, ColorCandidate
+│   │   ├── normalize.py            # NFKD diacritics strip, separator normalization
+│   │   ├── synonyms.py             # 18 canonical multilingual synonym clusters (RO/HU/BG)
+│   │   ├── scoring.py              # Fuzzy + hybrid scoring + threshold logic
+│   │   ├── embedder.py             # Lazy sentence-transformers singleton for semantic rerank
+│   │   └── mapper.py               # Orchestrator: exact → synonym → fuzzy → semantic
+│   ├── characteristic_resolver.py  # 3-pass resolver: fuzzy + Ollama repair + adaptive floor
 │   └── providers/
 │       ├── base.py                 # Abstract BaseLLMProvider
 │       ├── anthropic_provider.py   # Anthropic Claude (SDK) — complete() + complete_structured()
 │       ├── ollama_provider.py      # Ollama local models (REST)
+│       ├── openai_provider.py      # OpenAI-compatible endpoint (REST)
 │       ├── gemini_provider.py      # Google Gemini (REST)
 │       ├── groq_provider.py        # Groq (REST, OpenAI-compatible)
 │       └── mistral_provider.py     # Mistral AI (REST, OpenAI-compatible)
@@ -86,6 +104,9 @@ marketplace_tool/
 │   ├── results.py                  # View results + export Excel (format original / model import)
 │   ├── diagnostic.py               # System diagnostic + AI Metrics tab (DuckDB telemetry)
 │   └── llm_providers.py            # AI provider management (switch, configure, test)
+│
+├── config/
+│   └── locale_registry.json        # Marketplace → ISO language code mapping (RO/HU/BG/PL/…)
 │
 └── data/
     ├── reference_data.duckdb       # All marketplace reference data + knowledge store + telemetry
@@ -177,7 +198,8 @@ The app supports 5 AI providers with a unified interface. All providers accept t
 | Provider | Default model | Notes |
 |---|---|---|
 | **anthropic** | `claude-haiku-4-5-20251001` | Recommended — best quality/cost ratio; supports structured output |
-| **ollama** | `qwen2.5:14b` | Free, runs locally — requires `ollama serve` |
+| **ollama** | `qwen2.5:14b` | Free, runs locally — requires `ollama serve`; used for Pass 2 resolver repair |
+| **openai** | `gpt-4o-mini` | OpenAI or any OpenAI-compatible endpoint |
 | **gemini** | `gemini-2.0-flash` | Google — free tier available |
 | **groq** | `llama-3.3-70b-versatile` | Free with rate limits, very fast |
 | **mistral** | `mistral-small-latest` | Mistral AI |
@@ -393,6 +415,20 @@ python scripts/migrate_parquet_to_duckdb.py
 ---
 
 ## Changelog
+
+### v9 — 2026-04-09
+
+- **Color mapper** — new `core/color_mapper/` package; maps detected color strings to marketplace-valid values via: exact match → multilingual synonym clusters (18 canonical clusters, RO/HU/BG) → fuzzy scoring (rapidfuzz token_set_ratio + Jaccard) → semantic reranking (sentence-transformers); thresholds AUTO_ACCEPT=0.82, SOFT_REVIEW=0.68; replaces ad-hoc `_map_to_valid` in `image_analyzer.py`
+- **Characteristic resolver V2.1** — `core/characteristic_resolver.py`; 3-pass fallback for values that fail strict `find_valid()` validation: Pass 1 fuzzy match on allowed values, Pass 2 Ollama local repair (budgeted 2 calls/product), Pass 3 adaptive floor rescue with near-tie guard; integrated into `ai_enricher.py` validation loop; structured resolver log saved per run (`*_ollama_resolver.json`)
+- **Locale registry** — `config/locale_registry.json` maps each marketplace to an ISO language code; `_get_language_code()` in `ai_enricher.py` injects `Output language: Hungarian/Bulgarian/…` into system prompts; removes default gender-to-Romanian bias in batch prompts
+- **UI "Needs Review" expander** — low-confidence fills in Process Offers show top-3 alternative suggestions for manual review; YOLO and vision provider warnings surfaced in UI
+- **Per-attribute vision fusion** — `core/vision/fusion_attrs.py` implements a 5-case decision engine (text-only, vision-only, agree, text-wins, conflict); `attribute_fusion_policy` table in `visual_rules.json` controls `vision_eligible`, `min_conf`, and `conflict_action` per attribute; `vision_attr_extractor.py` handles structured cloud-only extraction with JSON-strict parsing
+- **OpenAI provider** — `core/providers/openai_provider.py`; supports any OpenAI-compatible endpoint
+- **Prompt pipeline v2** — `_reasoning` field replaced by `_src` audit field; description truncation raised 400 → 700 chars; 20 ordered fields in enrichment prompt (12 mandatory first); brand-to-material hints (e.g. Dri-FIT→Polyester); R1–R7 signal hierarchy; few-shot batch examples with multilingual gender keywords
+- **Fill color for non-mandatory chars** — `_missing_color_char` now fills optional color characteristics (e.g. `Szín:`) when the char exists in the category's valid-values list, not only when mandatory; fixes silent skips on eMAG HU
+- **ID mismatch fix** — `core/loader.py` builds `_internal_to_join` mapping (internal `category_id` → `emag_id`); all char-based indexes keyed consistently; `mandatory_chars()` and `valid_values()` now return correct results for eMAG HU/BG marketplaces
+- **Security & thread-safety audit (P01–P30)** — `_merge_lock` protects learned rule deduplication; double-checked locking in `LLMRouter` singleton; `_WRITE_LOCK` guards `import_marketplace()`; SSRF protection in `image_fetcher` blocks RFC1918/loopback IPs; `_sanitize_for_prompt()` escapes injection chars + truncates to 300 chars; `WeakKeyDictionary` replaces `id(data)` cache key; DB indexes on categories, characteristics, characteristic_values; YOLO crop skipped when confidence < 0.50; regex-based JSON extraction in `complete_structured()`
+- **`ai_run_log` schema migration** — adds `vision_signal`, `vision_confidence`, `fusion_action`, `conflict_flag` columns; `_run_migrations()` guards RENAME COLUMN idempotently
 
 ### v8 — 2026-03-27
 

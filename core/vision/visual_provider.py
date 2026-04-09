@@ -34,6 +34,9 @@ class MockVisionProvider(BaseVisionProvider):
     """Always returns empty string. Used as safe fallback."""
     name = "mock"
 
+    def __init__(self, fallback_reason: str = ""):
+        self.fallback_reason = fallback_reason
+
     def analyze(self, img: Image.Image, prompt: str) -> str:
         return ""
 
@@ -161,20 +164,24 @@ def build_vision_provider(
     if provider_name == "openai":
         p = OpenAIVisionProvider(model=model or "gpt-4o-mini")
         if p.is_available():
-            log.info("Vision provider: OpenAI (%s)", p._model)
+            log.info("[VisionProvider] Provider activ: OpenAI (%s)", p._model)
             return p
+        reason = "OPENAI_API_KEY lipsă sau invalidă. Configurează cheia în pagina LLM Providers."
         log.warning(
-            "OpenAI vision provider unavailable — OPENAI_API_KEY not set. "
-            "Configurează cheia în pagina LLM Providers."
+            "[VisionProvider] FALLBACK la Mock — OpenAI indisponibil: %s", reason,
         )
+        return MockVisionProvider(fallback_reason=f"OpenAI indisponibil: {reason}")
     elif provider_name == "ollama":
         p = OllamaVisionProvider(model=model, base_url=base_url)
         if p.is_available():
-            log.info("Vision provider: Ollama (%s)", p._model)
+            log.info("[VisionProvider] Provider activ: Ollama (%s @ %s)", p._model, base_url)
             return p
-        log.warning(
-            "Ollama vision provider not reachable at %s — falling back to Mock. "
-            "Run 'ollama serve' and pull a vision model (e.g. 'ollama pull llava-phi3').",
-            base_url,
+        reason = (
+            f"Ollama nu răspunde la {base_url}. "
+            "Pornește Ollama cu 'ollama serve' și descarcă un model vision: 'ollama pull llava-phi3'."
         )
-    return MockVisionProvider()
+        log.warning(
+            "[VisionProvider] FALLBACK la Mock — Ollama indisponibil: %s", reason,
+        )
+        return MockVisionProvider(fallback_reason=f"Ollama indisponibil: {reason}")
+    return MockVisionProvider(fallback_reason="Provider necunoscut.")

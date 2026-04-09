@@ -251,36 +251,45 @@ def _build_char_system_prompt(marketplace: str) -> str:
 
     Înlocuiește vechiul prompt cu _reasoning (tokeni irosiți).
     Noul câmp _src capturează semnalul cheie folosit — util pentru audit log.
+    Include language_code explicit pentru a preveni confuzii multilinguale.
     """
+    lang = _get_language_code(marketplace)
+    lang_names = {"ro": "Romanian", "hu": "Hungarian", "bg": "Bulgarian",
+                  "pl": "Polish", "tr": "Turkish", "en": "English"}
+    lang_name = lang_names.get(lang, lang.upper())
+
     return (
-        f"Ești un expert în catalogul de produse pentru marketplace-uri.\n"
-        f"Marketplace: {_mp_ctx(marketplace)}\n\n"
+        f"You are a product catalog expert for marketplaces.\n"
+        f"Marketplace: {_mp_ctx(marketplace)}\n"
+        f"Output language: {lang_name} ({lang}). All freeform text values must be in this language.\n\n"
 
-        "MISIUNEA TA: completează caracteristicile lipsă extragând informații din semnalele "
-        "produsului (titlu, brand, descriere, metadata).\n\n"
+        "MISSION: Complete missing characteristics by extracting signals from product data.\n\n"
 
-        "FORMAT RĂSPUNS — JSON strict, fără text în afara lui:\n"
-        '{"_src": "<semnal cheie>", "Caracteristica": "valoare", ...}\n'
-        "  _src = semnalul principal folosit, ex: \"titlu:Dri-FIT→Poliester\" sau \"brand:Nike→Alergare\"\n\n"
+        "RESPONSE FORMAT — strict JSON only, no text outside:\n"
+        '{"_src": "<signal>", "Characteristic": "value", ...}\n'
+        "  _src = main signal used, e.g. 'title:Dri-FIT→Polyester'\n\n"
 
-        "REGULI (în ordinea asta):\n"
-        "R1. Câmpuri marcate [OBLIGATORIU] → completezi cu prioritate maximă, indiferent de dificultate.\n"
-        "R2. Câmpuri cu listă de valori → copiezi EXACT o valoare din lista dată "
-        "(respecti majuscule, diacritice, spații).\n"
-        "R3. Câmpuri freeform (fără listă) → valoarea în limba marketplace-ului, concisă.\n"
-        "R4. Brand knowledge: Nike/Adidas/Puma=sport, Dri-FIT/Climalite/Climacool=Poliester, "
-        "Fleece/Polar=Fleece, Jordan=Baschet, Air Max/React/Zoom=pantofi alergare, "
-        "Merino=Lana, DWR=rezistent apa.\n"
-        "R5. Dacă nu poți determina cu certitudine → OMITE câmpul (nu ghici).\n"
-        "R6. Nu inventa valori în afara listei pentru câmpuri restrictive.\n"
-        "R7. Zero text în afara JSON-ului. Fără markdown, fără explicații.\n\n"
+        "RULES (priority order — higher rule always wins):\n"
+        "P1. [MANDATORY] fields → complete with maximum priority.\n"
+        "P2. Fields with value list → copy EXACTLY one value from the list provided. "
+        "NEVER translate. NEVER invent. NEVER use values from outside the list.\n"
+        "P3. Freeform fields (no list) → value in output language, concise.\n"
+        "P4. Brand signals (concept inference only — do NOT use as final value):\n"
+        "    Dri-FIT/Climalite/Climacool → polyester-type material\n"
+        "    Fleece/Polar → fleece-type material\n"
+        "    Merino → wool-type material\n"
+        "    DWR → water-resistant\n"
+        "    Air Max/React/Zoom → running shoe type\n"
+        "    For fields with a list: use P2 (copy from list), not P4.\n"
+        "P5. Cannot determine with certainty → OMIT field (do not guess).\n"
+        "P6. Zero text outside JSON. No markdown, no explanations.\n\n"
 
-        "IERARHIA SEMNALELOR (cel mai fiabil primul):\n"
-        "  1. Titlu produs\n"
-        "  2. Brand + model cunoscut\n"
-        "  3. Descriere\n"
-        "  4. Metadata (EAN, greutate, garanție)\n"
-        "  5. Date cross-marketplace (la finalul promptului dacă există)"
+        "SIGNAL HIERARCHY (most reliable first):\n"
+        "  1. Product title\n"
+        "  2. Brand + model\n"
+        "  3. Description\n"
+        "  4. Metadata (EAN, weight, warranty)\n"
+        "  5. Cross-marketplace data (if provided at end of prompt)"
     )
 
 
@@ -308,7 +317,7 @@ def _build_batch_system_prompt(marketplace: str, category_list: list[str]) -> st
         "REGULI:\n"
         "1. Copiezi EXACT numele categoriei din lista de mai sus (majuscule, diacritice).\n"
         "2. Titlul poate fi în orice limbă — clasifici după TIPUL produsului, nu după limbă.\n"
-        "3. Categorie ambiguă (gen neclar) → alege genul indicat în titlu; dacă lipsește → bărbați.\n"
+        "3. Categorie ambiguă (gen neclar) → alege genul indicat în titlu; dacă lipsește → alege categoria fără gen specificat sau cea mai neutră disponibilă.\n"
         "4. Nicio categorie potrivită → null.\n"
         "5. Zero text în afara JSON-ului.\n\n"
 
@@ -354,6 +363,15 @@ def _mp_ctx(marketplace: str) -> str:
                 return ctx
 
     return marketplace  # fallback la numele exact
+
+
+def _get_language_code(marketplace: str) -> str:
+    """Returns ISO 639-1 language code for marketplace prompt context."""
+    try:
+        from core.characteristic_resolver import get_language_code
+        return get_language_code(marketplace)
+    except Exception:
+        return "ro"  # safe default for prompts only — resolver enforces strict
 
 
 BATCH_SIZE = 60  # max produse per apel AI (limita tokeni output ~8192)
@@ -783,6 +801,9 @@ def enrich_with_ai(
         log.debug("AI char enrichment — meta context: %s | titlu: %s", list(meta_present.keys()), title[:60])
 
     log.info("AI char enrichment pentru %r — missing: %s", title[:60], list(missing_options.keys()))
+    # Reset repair budget per product (2 Ollama repair calls max)
+    enrich_with_ai._repair_budget = {"remaining": 2, "used": 0}
+
     max_tok = 300
     raw = ""
     suggested = {}
@@ -853,10 +874,63 @@ def enrich_with_ai(
                         validated[ch_name] = val_str
                         log.debug("AI char freeform-acceptat [%s] = %r (non-restrictive)", ch_name, ch_val)
                     else:
+                        # Pass 1/2/3 resolver instead of hard reject
+                        from core.characteristic_resolver import CharacteristicResolver
+                        _budget = getattr(enrich_with_ai, "_repair_budget", {"remaining": 2, "used": 0})
+                        _resolver = CharacteristicResolver(marketplace_id=marketplace)
+                        _is_mand = ch_name in (mandatory_chars or [])
                         log.warning(
-                            "AI char respins [%s] = %r — nu e in lista de valori permise (%d valori)",
-                            ch_name, ch_val, len(vs),
+                            "[LLM->Resolver] LLM returned invalid value for [%s].\n"
+                            "  LLM value  : %r\n"
+                            "  Marketplace: %s (lang=%s)\n"
+                            "  Mandatory  : %s\n"
+                            "  Allowed cnt: %d values\n"
+                            "  Reason     : value not in allowed_values list\n"
+                            "  Budget left: %d Ollama repair calls",
+                            ch_name, val_str, marketplace, _resolver.language_code,
+                            _is_mand, len(vs), _budget.get("remaining", 0),
                         )
+                        res = _resolver.resolve(
+                            val_str,
+                            list(vs),
+                            is_mandatory=_is_mand,
+                            char_name=ch_name,
+                            budget_ctx=_budget,
+                        )
+                        if res.value is not None:
+                            validated[ch_name] = res.value
+                            log.info(
+                                "[Resolver] %s [%s] = %r method=%s score=%.3f "
+                                "review=%s soft=%s rescue=%s",
+                                marketplace, ch_name, res.value, res.method,
+                                res.score, res.needs_review, res.soft_review,
+                                res.low_confidence_autofill,
+                            )
+                            if res.needs_review:
+                                result_meta = validated.setdefault("_review_flags", {})
+                                result_meta[ch_name] = {
+                                    "llm_value": val_str,
+                                    "value": res.value,
+                                    "method": res.method,
+                                    "score": round(res.score, 4),
+                                    "top_k": res.top_k_candidates,
+                                    "reason": res.reason,
+                                }
+                        else:
+                            log.warning(
+                                "[Resolver] UNRESOLVED [%s] = %r top_k=%s reason=%s",
+                                ch_name, ch_val,
+                                [(v, round(s, 3)) for v, s in res.top_k_candidates[:2]],
+                                res.reason,
+                            )
+                            result_meta = validated.setdefault("_review_flags", {})
+                            result_meta[ch_name] = {
+                                "llm_value": val_str,
+                                "value": None,
+                                "method": "none",
+                                "top_k": res.top_k_candidates,
+                                "reason": res.reason,
+                            }
             else:
                 # ── Legacy path (no data object): direct set lookup ──────────
                 valid_set = valid_values_for_cat.get(ch_name, set())

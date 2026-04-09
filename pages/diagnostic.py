@@ -4,12 +4,11 @@ import streamlit as st
 import pandas as pd
 from pathlib import Path
 from core.logger import list_logs, read_log
+from pages.ui_helpers import hero_header, section_header, kpi_row
 
 
 def render():
-    st.title("🔍 Diagnostic Mapare")
-    st.markdown("Analiză detaliată a motivelor pentru care categoriile și caracteristicile nu au putut fi mapate automat.")
-    st.markdown("---")
+    hero_header("🔍 Diagnostic Mapare", "Analiză detaliată a motivelor pentru care maparea automată nu a reușit.")
 
     logs = list_logs()
     if not logs:
@@ -38,13 +37,12 @@ def render():
 
     # ── Sumar rapid ───────────────────────────────────────────────────────────
     s = log_data.get("sumar", {})
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Procesate", s.get("cu_erori_procesate", 0))
-    c2.metric("Completate automat", s.get("completate_automat", 0))
-    c3.metric("Necesită manual", s.get("necesita_manual", 0))
-    c4.metric("Categorii fixate", s.get("categorii_fixate", 0))
-
-    st.markdown("---")
+    kpi_row([
+        {"value": s.get("cu_erori_procesate", 0), "label": "Procesate",          "color": "#6366f1"},
+        {"value": s.get("completate_automat",  0), "label": "Completate automat", "color": "#22c55e"},
+        {"value": s.get("necesita_manual",     0), "label": "Necesită manual",    "color": "#f59e0b"},
+        {"value": s.get("categorii_fixate",    0), "label": "Categorii fixate"},
+    ])
 
     tab1, tab2, tab3, tab_ai_metrics, tab_logs = st.tabs([
         "📂 Categorii nemapate",
@@ -66,7 +64,7 @@ def render():
             rows = sorted(cat_reasons.items(), key=lambda x: -x[1])
             df_cat = pd.DataFrame(rows, columns=["Motiv", "Nr. produse"])
             df_cat["% din total"] = (df_cat["Nr. produse"] / df_cat["Nr. produse"].sum() * 100).round(1).astype(str) + "%"
-            st.dataframe(df_cat, use_container_width=True, hide_index=True)
+            st.dataframe(df_cat, width="stretch", hide_index=True)
 
             st.markdown("---")
             st.markdown("**Produse cu categorie nemapată:**")
@@ -79,7 +77,7 @@ def render():
                         "Motiv": p.get("motiv_categorie_nemapata", ""),
                     })
             if cat_rows:
-                st.dataframe(pd.DataFrame(cat_rows), use_container_width=True, hide_index=True, height=350)
+                st.dataframe(pd.DataFrame(cat_rows), width="stretch", hide_index=True, height=350)
 
     # ── Tab 2: motive caracteristici ──────────────────────────────────────────
     with tab2:
@@ -99,7 +97,7 @@ def render():
                         "Nr. produse":     count,
                     })
             df_chars = pd.DataFrame(rows).sort_values("Nr. produse", ascending=False)
-            st.dataframe(df_chars, use_container_width=True, hide_index=True, height=400)
+            st.dataframe(df_chars, width="stretch", hide_index=True, height=400)
 
             # Cele mai frecvente caracteristici problematice
             st.markdown("---")
@@ -109,7 +107,7 @@ def render():
                 key=lambda x: -x[1]
             )[:10]
             df_top = pd.DataFrame(top, columns=["Caracteristică", "Total produse afectate"])
-            st.dataframe(df_top, use_container_width=True, hide_index=True)
+            st.dataframe(df_top, width="stretch", hide_index=True)
 
     # ── Tab 3: detalii per produs ─────────────────────────────────────────────
     with tab3:
@@ -158,7 +156,7 @@ def render():
 
     # ── Tab 4: AI Metrics ─────────────────────────────────────────────────────
     with tab_ai_metrics:
-        st.subheader("AI Run Metrics")
+        section_header("AI Run Metrics", "Telemetrie și statistici pentru rulările AI")
 
         try:
             import duckdb
@@ -178,11 +176,12 @@ def render():
             """).fetchone()
 
             if summary and summary[0] > 0:
-                col1, col2, col3, col4 = st.columns(4)
-                col1.metric("Total Runs", f"{summary[0]:,}")
-                col2.metric("Accept Rate", f"{summary[1] or 0:.1f}%", delta_color="normal")
-                col3.metric("Avg Cost/Offer", f"${summary[2] or 0:.5f}")
-                col4.metric("Retry Rate", f"{summary[3] or 0:.1f}%")
+                kpi_row([
+                    {"value": f"{summary[0]:,}",              "label": "Total Runs",     "color": "#6366f1"},
+                    {"value": f"{summary[1] or 0:.1f}%",      "label": "Accept Rate",    "color": "#22c55e"},
+                    {"value": f"${summary[2] or 0:.5f}",       "label": "Avg Cost/Offer"},
+                    {"value": f"{summary[3] or 0:.1f}%",      "label": "Retry Rate",     "color": "#f59e0b"},
+                ])
 
                 # ── Structured output KPIs ─────────────────────────────────
                 try:
@@ -266,7 +265,7 @@ def render():
                     ORDER BY runs DESC
                     LIMIT 10
                 """).df()
-                st.dataframe(df_mp, use_container_width=True)
+                st.dataframe(df_mp, width="stretch")
 
                 # ── Knowledge store size ───────────────────────────────────
                 pk_count = con.execute("SELECT COUNT(*) FROM product_knowledge").fetchone()[0]
@@ -281,7 +280,7 @@ def render():
 
     # ── Tab 5: Logs Unificate ──────────────────────────────────────────────────
     with tab_logs:
-        st.subheader("Logs Unificate")
+        section_header("Logs Unificate", "Toate sursele de log într-un singur loc")
 
         col_lvl, col_src, col_n = st.columns(3)
         level_filter = col_lvl.selectbox(
@@ -385,7 +384,7 @@ def render():
 
         if entries:
             df_logs = pd.DataFrame(entries)[["ts", "level", "source", "message"]]
-            st.dataframe(df_logs, use_container_width=True, hide_index=True, height=500)
+            st.dataframe(df_logs, width="stretch", hide_index=True, height=500)
             st.caption(f"{len(entries)} intrări afișate")
         else:
             st.info("Niciun log disponibil pentru filtrele selectate.")

@@ -14,45 +14,14 @@ sys.path.insert(0, str(Path(__file__).parent))
 from core.state import init_state, all_marketplace_names, get_marketplace, is_marketplace_available
 
 st.set_page_config(
-    page_title="Marketplace Processor",
+    page_title="Propel — Marketplace Processor",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    /* Sidebar */
-    [data-testid="stSidebar"] { background: #0f1117; }
-    [data-testid="stSidebar"] .stSelectbox label { color: #94a3b8 !important; font-size: 12px; }
-
-    /* Cards */
-    .mp-card {
-        background: #1e2130; border: 1px solid #2d3250;
-        border-radius: 8px; padding: 16px; margin-bottom: 12px;
-    }
-    .mp-card-title { font-weight: 700; font-size: 15px; margin-bottom: 4px; }
-    .mp-card-sub { color: #64748b; font-size: 12px; }
-
-    /* Status badges */
-    .badge { display:inline-block; padding:2px 10px; border-radius:12px; font-size:12px; font-weight:600; }
-    .badge-green  { background:#16a34a22; color:#22c55e; }
-    .badge-yellow { background:#ca8a0422; color:#eab308; }
-    .badge-red    { background:#dc262622; color:#ef4444; }
-    .badge-blue   { background:#2563eb22; color:#3b82f6; }
-    .badge-gray   { background:#33333344; color:#94a3b8; }
-
-    /* Metric row */
-    .metric-row { display:flex; gap:16px; margin-bottom:20px; }
-    .metric-box {
-        flex:1; background:#1e2130; border:1px solid #2d3250;
-        border-radius:8px; padding:16px; text-align:center;
-    }
-    .metric-val { font-size:28px; font-weight:800; }
-    .metric-lbl { font-size:11px; color:#64748b; text-transform:uppercase; margin-top:4px; }
-</style>
-""", unsafe_allow_html=True)
+from pages.ui_helpers import inject_css
+inject_css()
 
 init_state()
 
@@ -69,25 +38,53 @@ cleanup_old_logs()
 
 # ── Sidebar ────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.markdown("## ⚡ Marketplace\nProcessor")
-    st.markdown("---")
+    # Logo / name
+    st.markdown(
+        '<div class="sidebar-logo">'
+        '<div class="app-name">⚡ Propel</div>'
+        '<div class="app-sub">Marketplace Offer Processor · v1.0</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
     mp_names = all_marketplace_names()
     loaded   = [n for n in mp_names if is_marketplace_available(n)]
 
-    # Show marketplace status
+    # Marketplace status indicators
+    st.markdown(
+        '<div style="font-size:9px;color:#374151;text-transform:uppercase;'
+        'letter-spacing:0.5px;font-weight:700;padding:10px 0 4px 0">'
+        'Marketplace-uri</div>',
+        unsafe_allow_html=True,
+    )
     for name in mp_names:
         mp = get_marketplace(name)
         available = (mp and mp.is_loaded()) or is_marketplace_available(name)
-        badge = '<span class="badge badge-green">✓ Loaded</span>' if available else '<span class="badge badge-gray">○ Empty</span>'
-        st.markdown(f"**{name}** {badge}", unsafe_allow_html=True)
+        dot   = '<span style="color:#22c55e;font-size:9px">●</span>' if available \
+                else '<span style="color:#374151;font-size:9px">●</span>'
+        label = f'<span style="font-size:12px;color:{"#f1f5f9" if available else "#4b5563"}">{name}</span>'
+        st.markdown(f'{dot} {label}', unsafe_allow_html=True)
 
-    st.markdown("---")
-    st.markdown("**Navigation**")
+    st.markdown('<div style="border-top:1px solid #1a1a2e;margin:10px 0 6px 0"></div>', unsafe_allow_html=True)
+
     page = st.radio(
-        "Go to",
+        "Navigare",
         ["🏠 Dashboard", "⚙️ Setup Marketplace", "📁 Process Offers", "📊 Results", "🔍 Diagnostic", "🤖 LLM Providers"],
         label_visibility="collapsed",
+    )
+
+    # Session stats widget
+    _sess_results = st.session_state.get("process_results", [])
+    _sess_chars   = sum(len(r.get("new_chars", {})) for r in _sess_results)
+    st.markdown(
+        f'<div class="session-stats">'
+        f'<div class="stat-title">Sesiunea curentă</div>'
+        f'<div class="stat-row"><span class="stat-label">Produse procesate</span>'
+        f'<span class="stat-val">{len(_sess_results)}</span></div>'
+        f'<div class="stat-row"><span class="stat-label">Caracteristici adăugate</span>'
+        f'<span class="stat-val">{_sess_chars}</span></div>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
 
 # ── Pages ──────────────────────────────────────────────────────────────────────
