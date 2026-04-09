@@ -151,7 +151,8 @@ def _prevent_sleep():
         return lambda: None
 
 
-def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketplace="", image_options=None):
+def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketplace="", image_options=None,
+                 resume_results=None, resume_ids=None, checkpoint_filename=""):
     from core.ai_logger import start_run as _ai_start_run
     _ai_start_run(marketplace)
 
@@ -522,22 +523,56 @@ def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketpl
         return i, result
 
     # ── Execuție paralelă — 8 produse procesate simultan ──────────────────────
+    from core.logger import save_checkpoint, clear_checkpoint, CHECKPOINT_EVERY
+
+    # Pre-populare cu rezultatele din checkpoint (dacă se reia)
+    _resume_ids: set = set(resume_ids or [])
     results_ordered = [None] * total
     completed_count = 0
-    status_text.text(f"⏳ Faza 2/2 — Procesare caracteristici: 0/{total} produse...")
+    _checkpoint_done_ids: set = set(_resume_ids)
+
+    # Inserează rezultatele deja procesate la pozițiile corecte
+    if resume_results:
+        _id_to_idx = {str(prod.get("id", i)): i for i, prod in enumerate(products)}
+        for rr in resume_results:
+            pos = _id_to_idx.get(str(rr.get("id", "")))
+            if pos is not None:
+                results_ordered[pos] = rr
+                completed_count += 1
+
+    # Filtrează produsele deja procesate
+    pending_products = [
+        (i, prod) for i, prod in enumerate(products)
+        if str(prod.get("id", i)) not in _resume_ids
+    ]
+
+    total_display = total  # total real (inclusiv cele deja procesate)
+    status_text.text(f"⏳ Faza 2/2 — Procesare caracteristici: {completed_count}/{total_display} produse...")
 
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_process_one, (i, prod)): i for i, prod in enumerate(products)}
+        futures = {executor.submit(_process_one, (i, prod)): i for i, prod in pending_products}
         for future in as_completed(futures):
             idx, res = future.result()
             results_ordered[idx] = res
             completed_count += 1
-            if completed_count % 50 == 0 or completed_count == total:
-                pct = 40 + int(completed_count / total * 60)
+            _checkpoint_done_ids.add(str(res.get("id", idx)))
+
+            if completed_count % 10 == 0 or completed_count == total_display:
+                pct = 40 + int(completed_count / total_display * 60)
                 progress_bar.progress(pct)
-                status_text.text(f"⏳ Faza 2/2 — Caracteristici: {completed_count}/{total} produse...")
+                status_text.text(f"⏳ Faza 2/2 — Caracteristici: {completed_count}/{total_display} produse...")
+
+            # Checkpoint periodic
+            if checkpoint_filename and completed_count % CHECKPOINT_EVERY == 0:
+                _done_so_far = [r for r in results_ordered if r is not None]
+                save_checkpoint(marketplace, checkpoint_filename, _done_so_far,
+                                total_display, _checkpoint_done_ids)
 
     results = [r for r in results_ordered if r is not None]
+
+    # Șterge checkpointul după rulare completă
+    if checkpoint_filename:
+        clear_checkpoint(marketplace, checkpoint_filename)
 
     if _run_logger:
         try:
@@ -552,9 +587,8 @@ def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketpl
 # ── Page render ────────────────────────────────────────────────────────────────
 
 def render():
-    st.title("📁 Procesare Oferte")
-    st.markdown("Încarcă fișierul de oferte, selectează marketplace-ul și pornește procesarea automată.")
-    st.markdown("---")
+    from pages.ui_helpers import hero_header, section_header
+    hero_header("📁 Procesare Oferte", "Încarcă fișierul de oferte, selectează marketplace-ul și pornește procesarea automată.")
 
     # ── Step 1: Select marketplace ────────────────────────────────────────────
     mp_names = all_marketplace_names()
@@ -564,25 +598,30 @@ def render():
         st.warning("⚠️ Niciun marketplace configurat. Mergi la **⚙️ Setup Marketplace** mai întâi.")
         return
 
-    st.subheader("1️⃣ Selectează marketplace")
+    section_header("1️⃣ Selectează marketplace")
     selected_mp = st.selectbox("Marketplace", loaded, key="proc_mp")
     load_marketplace_on_select(selected_mp)
     mp = get_marketplace(selected_mp)
     stats = mp.stats()
+    from pages.ui_helpers import badge_html as _badge_html
     st.markdown(
-        f"<div style='background:#1e3a5f;border-left:5px solid #4da6ff;padding:10px 16px;"
-        f"border-radius:4px;margin:4px 0 12px 0'>"
-        f"<span style='color:#4da6ff;font-size:13px;font-weight:600;letter-spacing:0.5px'>"
-        f"MARKETPLACE ACTIV</span><br>"
-        f"<span style='color:#ffffff;font-size:20px;font-weight:700'>{selected_mp}</span>"
-        f"<span style='color:#aaaaaa;font-size:12px;margin-left:12px'>"
-        f"{stats['categories']} categorii · {stats['characteristics']} caracteristici · {stats['values']} valori</span>"
-        f"</div>",
+        f'<div class="setup-status-card">'
+        f'<div style="display:flex;align-items:center;justify-content:space-between">'
+        f'<span style="font-size:1rem;font-weight:700;color:#f1f5f9">{selected_mp}</span>'
+        f'{_badge_html("Activ", "success")}</div>'
+        f'<div class="setup-stats">'
+        f'<div class="setup-stat"><span class="setup-stat-val">{stats["categories"]}</span>'
+        f'<span class="setup-stat-lbl">Categorii</span></div>'
+        f'<div class="setup-stat"><span class="setup-stat-val">{stats["characteristics"]}</span>'
+        f'<span class="setup-stat-lbl">Caracteristici</span></div>'
+        f'<div class="setup-stat"><span class="setup-stat-val">{stats["values"]:,}</span>'
+        f'<span class="setup-stat-lbl">Valori</span></div>'
+        f'</div></div>',
         unsafe_allow_html=True,
     )
 
     # ── Step 2: Upload offers file ─────────────────────────────────────────────
-    st.subheader("2️⃣ Încarcă fișierul de oferte")
+    section_header("2️⃣ Încarcă fișierul de oferte")
 
     from core.templates import offers_template
     col_dl, col_info = st.columns([1, 3])
@@ -632,13 +671,15 @@ def render():
         proc_count = sum(err_counts.get(c, 0) for c in processable)
         other_count = sum(v for k, v in err_counts.items() if k not in processable)
 
-        col1, col2, col3 = st.columns(3)
-        col1.metric("Total produse", len(products))
-        col2.metric(f"De procesat (cod: {codes_str})", proc_count)
-        col3.metric("Alte erori / fără eroare", other_count)
+        from pages.ui_helpers import kpi_row as _kpi_row_upload
+        _kpi_row_upload([
+            {"value": len(products), "label": "Total produse",                        "color": "#f1f5f9"},
+            {"value": proc_count,    "label": f"De procesat (cod: {codes_str})",       "color": "#22c55e"},
+            {"value": other_count,   "label": "Alte erori / fără eroare",              "color": "#6b7280"},
+        ])
 
     # ── Step 3: Process ────────────────────────────────────────────────────────
-    st.subheader("3️⃣ Procesare")
+    section_header("3️⃣ Procesare")
 
     products = st.session_state.get("offers_products", [])
 
@@ -717,64 +758,64 @@ def render():
 
     if use_ai and to_process and _is_anthropic:
         est = _estimate_ai_cost(to_process, mp)
-        with st.expander("💰 Cost estimativ API Claude", expanded=True):
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Produse → categorie AI", est["n_cat_ai"],
-                      help=f"{est['n_batches']} batch-uri × max {_AI_BATCH_SIZE} produse/batch")
-            c2.metric("Batches categorii", est["n_batches"])
-            c3.metric("Produse → caractere AI", est["n_char_ai"],
-                      help="Produse cu categorii valabile și câmpuri obligatorii lipsă")
-            c4.metric("Cost estimativ", f"~${est['cost_usd']:.4f}",
-                      help="Estimare pe baza prețurilor claude-haiku-4-5-20251001")
-
+        with st.expander("💰 Cost estimativ API Claude", expanded=False):
+            from pages.ui_helpers import kpi_row as _kpi_row_cost
+            _kpi_row_cost([
+                {"value": est["n_cat_ai"],           "label": "Produse → categorie AI"},
+                {"value": est["n_batches"],           "label": "Batch-uri categorii"},
+                {"value": est["n_char_ai"],           "label": "Produse → caractere AI"},
+                {"value": f"~${est['cost_usd']:.4f}", "label": "Cost estimativ", "color": "#22c55e"},
+            ])
             st.caption(
-                f"Tokeni estimați: **{est['total_input']:,}** input"
-                f" ({est['cat_input']:,} categ. + {est['char_input']:,} caractere)"
-                f" · **{est['total_output']:,}** output"
-                f" ({est['cat_output']:,} categ. + {est['char_output']:,} caractere)"
-                f"  ·  Preț model: $0.80/MTok input · $4.00/MTok output"
+                f"Tokeni: **{est['total_input']:,}** input · **{est['total_output']:,}** output"
+                f"  ·  $0.80/MTok input · $4.00/MTok output"
             )
             if est["n_cat_ai"] == 0:
-                st.success("✅ Toate categoriile sunt rezolvabile fără AI — cost categorizare: $0.00")
+                st.success("✅ Toate categoriile rezolvabile fără AI — cost categorizare: $0.00")
             if est["cost_usd"] < 0.001:
                 st.info("💡 Cost sub $0.001 — practic gratuit pentru acest număr de oferte.")
 
-    # ── Image analysis options ─────────────────────────────────────────────────
-    st.markdown("---")
-    st.subheader("🖼️ Analiză imagine (opțional)")
-    col_img1, col_img2 = st.columns(2)
-    with col_img1:
-        enable_color = st.checkbox(
-            "Detectează culoarea din imagine",
-            value=False,
-            help="Analizează imaginea produsului și completează automat caracteristica de culoare dacă lipsește.",
-        )
-        enable_yolo = st.checkbox(
-            "Detectare obiect YOLO",
-            value=False,
-            help="Folosește YOLO pentru a detecta și decupa obiectul principal din imagine înainte de analiză.",
-        )
-        if enable_yolo:
-            try:
-                from core.vision.detection_yolo import is_available as _yolo_available
-                if not _yolo_available():
-                    st.warning(
-                        "YOLO dezactivat — pachetul `ultralytics` nu este instalat. "
-                        "Rulează: `pip install ultralytics`"
-                    )
-            except Exception:
-                st.warning("YOLO dezactivat — eroare la verificarea ultralytics.")
-    with col_img2:
-        enable_product_hint = st.checkbox(
-            "Folosește imaginea pentru îmbunătățirea categoriei",
-            value=False,
-            help="Folosește un model vision (Ollama llava-phi3) pentru a sugera tipul de produs din imagine.",
-        )
-        enable_clip = st.checkbox(
-            "Validare semantică CLIP",
-            value=False,
-            help="Folosește CLIP pentru a valida semantic categoria detectată față de imaginea produsului.",
-        )
+    # ── Image analysis options (collapsed by default — optional feature) ─────────
+    enable_color = False
+    enable_yolo  = False
+    enable_product_hint = False
+    enable_clip  = False
+
+    with st.expander("🖼️ Analiză imagine (opțional)", expanded=False):
+        st.caption("Activează pentru a detecta culoarea, tipul produsului sau a valida categoria din imagini.")
+        col_img1, col_img2 = st.columns(2)
+        with col_img1:
+            enable_color = st.checkbox(
+                "Detectează culoarea din imagine",
+                value=False,
+                help="Analizează imaginea produsului și completează automat caracteristica de culoare dacă lipsește.",
+            )
+            enable_yolo = st.checkbox(
+                "Detectare obiect YOLO",
+                value=False,
+                help="Folosește YOLO pentru a detecta și decupa obiectul principal din imagine înainte de analiză.",
+            )
+            if enable_yolo:
+                try:
+                    from core.vision.detection_yolo import is_available as _yolo_available
+                    if not _yolo_available():
+                        st.warning(
+                            "YOLO dezactivat — pachetul `ultralytics` nu este instalat. "
+                            "Rulează: `pip install ultralytics`"
+                        )
+                except Exception:
+                    st.warning("YOLO dezactivat — eroare la verificarea ultralytics.")
+        with col_img2:
+            enable_product_hint = st.checkbox(
+                "Folosește imaginea pentru îmbunătățirea categoriei",
+                value=False,
+                help="Folosește un model vision (Ollama llava-phi3) pentru a sugera tipul de produs din imagine.",
+            )
+            enable_clip = st.checkbox(
+                "Validare semantică CLIP",
+                value=False,
+                help="Folosește CLIP pentru a valida semantic categoria detectată față de imaginea produsului.",
+            )
 
     _any_image = enable_color or enable_product_hint or enable_yolo or enable_clip
     image_options = None
@@ -873,12 +914,42 @@ def render():
             "save_debug": save_debug,
         }
 
+    # ── Checkpoint resume UI ───────────────────────────────────────────────────
+    from core.logger import load_checkpoint
+    _file_name_ui = st.session_state.get("offers_file_name", "")
+    _checkpoint = load_checkpoint(selected_mp, _file_name_ui) if _file_name_ui else None
+    _resume_results, _resume_ids = None, None
+
+    if _checkpoint:
+        _done = _checkpoint.get("processed_cnt", 0)
+        _tot  = _checkpoint.get("total", 0)
+        st.warning(
+            f"🔄 Progres salvat găsit: **{_done}/{_tot} produse** procesate "
+            f"(salvat la {_checkpoint.get('saved_at', '?')}). "
+            f"Apasă **Continuă** pentru a relua sau **Începe de la zero** pentru o rulare nouă."
+        )
+        col_resume, col_restart = st.columns(2)
+        if col_resume.button("▶️ Continuă de unde am rămas", type="primary"):
+            _resume_results = _checkpoint.get("results", [])
+            _resume_ids     = set(_checkpoint.get("processed_ids", []))
+        if col_restart.button("🔁 Începe de la zero"):
+            from core.logger import clear_checkpoint
+            clear_checkpoint(selected_mp, _file_name_ui)
+            _checkpoint = None
+            st.rerun()
+
+    st.markdown('<div style="margin-top:1.5rem"></div>', unsafe_allow_html=True)
     if st.button(f"🚀 Pornește procesarea pentru {selected_mp}", type="primary", width="stretch"):
         progress = st.progress(0)
         status   = st.empty()
         start    = time.time()
 
-        results = _process_all(products, mp, progress, status, use_ai=use_ai, marketplace=selected_mp, image_options=image_options)
+        results = _process_all(
+            products, mp, progress, status,
+            use_ai=use_ai, marketplace=selected_mp, image_options=image_options,
+            resume_results=_resume_results, resume_ids=_resume_ids,
+            checkpoint_filename=_file_name_ui,
+        )
 
         elapsed = time.time() - start
         st.session_state["process_results"] = results
@@ -910,12 +981,14 @@ def render():
 
         st.success(f"✅ Procesare completă în {elapsed:.1f}s!")
 
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("Categorii atribuite",   n_cat_assigned)
-        col2.metric("Categorii corectate",   n_cat_corrected)
-        col3.metric("Caracteristici adăugate", n_chars_added)
-        col4.metric("Valori invalide șterse", n_cleared)
-        col5.metric("Necesită review manual", n_manual)
+        from pages.ui_helpers import kpi_row as _kpi_row
+        _kpi_row([
+            {"value": n_cat_assigned,  "label": "Categorii atribuite",    "color": "#6366f1"},
+            {"value": n_cat_corrected, "label": "Categorii corectate",    "color": "#a5b4fc"},
+            {"value": n_chars_added,   "label": "Caracteristici adăugate","color": "#22c55e"},
+            {"value": n_cleared,       "label": "Valori invalide șterse", "color": "#f59e0b"},
+            {"value": n_manual,        "label": "Necesită review manual", "color": "#ef4444"},
+        ])
 
         # ── Needs Review section ──────────────────────────────────────────────
         review_products = [
@@ -992,7 +1065,8 @@ def render():
             _save_path = _exports_dir / f"{_ts}_{_mp_slug}_{_auto_fname}"
             _save_path.write_bytes(_auto_bytes)
 
-            st.markdown("---")
+            from pages.ui_helpers import section_header as _sh
+            _sh("⬇️ Export rapid", "Fișierul a fost generat automat", color="#22c55e")
             st.download_button(
                 f"⬇️ Descarcă {_auto_fname}",
                 data=_auto_bytes,
@@ -1001,7 +1075,7 @@ def render():
                 width="stretch",
                 type="primary",
             )
-            st.caption(f"💾 Salvat automat în: `{_save_path}`")
+            st.caption(f"💾 Salvat automat local: `{_save_path}`")
         except Exception as _e:
             st.warning(f"⚠️ Auto-save eșuat: {_e}")
             st.info("Mergi la **📊 Results** pentru a descărca fișierul.")

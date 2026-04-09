@@ -4,11 +4,74 @@ Scrie un fisier JSON per rulare in data/logs/.
 Log-urile mai vechi de 7 zile se sterg automat.
 """
 import json
+import hashlib
 from datetime import datetime, timedelta
 from pathlib import Path
 
 LOGS_DIR = Path(__file__).parent.parent / "data" / "logs"
+CHECKPOINT_DIR = Path(__file__).parent.parent / "data" / "checkpoints"
 MAX_AGE_DAYS = 7
+CHECKPOINT_EVERY = 25  # scrie checkpoint la fiecare N produse completate
+
+
+# ── Checkpoint ─────────────────────────────────────────────────────────────────
+
+def _checkpoint_key(marketplace: str, filename: str) -> str:
+    """Cheie unică pentru o rulare: marketplace + filename."""
+    raw = f"{marketplace.lower().strip()}|{filename.lower().strip()}"
+    return hashlib.md5(raw.encode()).hexdigest()[:12]
+
+
+def save_checkpoint(
+    marketplace: str,
+    filename: str,
+    results_so_far: list,
+    total: int,
+    processed_ids: set,
+) -> None:
+    """Scrie checkpoint după fiecare CHECKPOINT_EVERY produse."""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    key = _checkpoint_key(marketplace, filename)
+    path = CHECKPOINT_DIR / f"{key}_{marketplace.replace(' ', '_')}.json"
+    payload = {
+        "marketplace":   marketplace,
+        "filename":      filename,
+        "total":         total,
+        "processed_cnt": len(results_so_far),
+        "processed_ids": list(processed_ids),
+        "saved_at":      datetime.now().strftime("%d.%m.%Y %H:%M:%S"),
+        "results":       results_so_far,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_checkpoint(marketplace: str, filename: str) -> "dict | None":
+    """
+    Încearcă să încarce un checkpoint pentru marketplace + filename.
+    Returnează dict-ul sau None dacă nu există.
+    """
+    key = _checkpoint_key(marketplace, filename)
+    path = CHECKPOINT_DIR / f"{key}_{marketplace.replace(' ', '_')}.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        # Validare minimă
+        if data.get("marketplace") == marketplace and data.get("filename") == filename:
+            return data
+    except Exception:
+        pass
+    return None
+
+
+def clear_checkpoint(marketplace: str, filename: str) -> None:
+    """Șterge checkpointul după o rulare completă cu succes."""
+    key = _checkpoint_key(marketplace, filename)
+    path = CHECKPOINT_DIR / f"{key}_{marketplace.replace(' ', '_')}.json"
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 # ── Cleanup ────────────────────────────────────────────────────────────────────

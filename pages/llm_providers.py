@@ -13,6 +13,20 @@ ENV_PATH = Path(__file__).parent.parent / ".env"
 # ── Metadata per provider ──────────────────────────────────────────────────────
 
 PROVIDER_INFO = {
+    "openai": {
+        "label":         "OpenAI",
+        "icon":          "🤖",
+        "env_key":       "OPENAI_API_KEY",
+        "env_model":     "OPENAI_MODEL",
+        "default_model": "gpt-4o-mini",
+        "models":        ["gpt-4o-mini", "gpt-4o", "gpt-4-turbo", "gpt-3.5-turbo"],
+        "key_label":     "API Key",
+        "key_placeholder": "sk-...",
+        "key_type":      "password",
+        "docs_url":      "https://platform.openai.com",
+        "docs_label":    "platform.openai.com",
+        "type":          "api",
+    },
     "anthropic": {
         "label":         "Anthropic Claude",
         "icon":          "🧠",
@@ -137,9 +151,8 @@ def _is_key_set(info: dict) -> bool:
 # ── Render ─────────────────────────────────────────────────────────────────────
 
 def render():
-    st.title("🤖 LLM Providers")
-    st.markdown("Gestionează și configurează toți providerii AI disponibili. Schimbările se salvează în fișierul `.env` și se aplică imediat.")
-    st.markdown("---")
+    from pages.ui_helpers import hero_header, section_header
+    hero_header("🤖 LLM Providers", "Gestionează și configurează toți providerii AI. Schimbările se aplică imediat.")
 
     active = _active_provider()
 
@@ -232,7 +245,7 @@ def render():
             col_save, col_activate, col_test = st.columns([2, 2, 2])
 
             with col_save:
-                if st.button("💾 Salvează", key=f"save_{pname}", use_container_width=True):
+                if st.button("💾 Salvează", key=f"save_{pname}", width="stretch"):
                     if new_val.strip():
                         _write_env_key(info["env_key"], new_val.strip())
                         os.environ[info["env_key"]] = new_val.strip()
@@ -245,7 +258,7 @@ def render():
 
             with col_activate:
                 if not is_active:
-                    if st.button(f"🔄 Activează", key=f"activate_{pname}", use_container_width=True,
+                    if st.button(f"🔄 Activează", key=f"activate_{pname}", width="stretch",
                                  type="primary"):
                         if not key_set and not new_val.strip():
                             st.error(f"Configurează {info['key_label']} mai întâi.")
@@ -263,7 +276,7 @@ def render():
                                 unsafe_allow_html=True)
 
             with col_test:
-                if st.button("🧪 Testează", key=f"test_{pname}", use_container_width=True):
+                if st.button("🧪 Testează", key=f"test_{pname}", width="stretch"):
                     # Aplică temporar valorile dacă sunt neschimbate în env
                     if new_val.strip():
                         os.environ[info["env_key"]] = new_val.strip()
@@ -287,7 +300,7 @@ def render():
         st.markdown("")  # spacer
 
     # ── Structured AI Output ───────────────────────────────────────────────────
-    st.markdown("---")
+    section_header("🧩 Structured AI Output", "Configurare output structurat JSON", color="#6366f1")
     _s_cfg = st.session_state.get("structured_output_config", {
         "mode": "off", "sample": 0.10, "provider_only": True,
     })
@@ -371,7 +384,7 @@ def render():
 
         col_save_s, col_reset_s = st.columns([3, 1])
         with col_save_s:
-            if st.button("✅ Aplică setările", key="struct_apply", use_container_width=True):
+            if st.button("✅ Aplică setările", key="struct_apply", width="stretch"):
                 st.session_state["structured_output_config"] = {
                     "mode":          new_mode,
                     "sample":        new_sample,
@@ -380,7 +393,7 @@ def render():
                 st.success(f"Structured Output setat: **{new_mode.upper()}** · {int(new_sample*100)}% sampling")
                 st.rerun()
         with col_reset_s:
-            if st.button("↩ Reset", key="struct_reset", use_container_width=True):
+            if st.button("↩ Reset", key="struct_reset", width="stretch"):
                 st.session_state["structured_output_config"] = {
                     "mode": "off", "sample": 0.10, "provider_only": True,
                 }
