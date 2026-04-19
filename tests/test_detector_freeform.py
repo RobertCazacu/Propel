@@ -18,6 +18,7 @@ def test_detect_material_freeform_returns_hardcoded():
     data = _make_data(valid_values=set(), find_valid_return=None)
     result = detect_material("Nike Cotton T-Shirt", "", data, cat_id=99)
     assert result == "Bumbac"
+    data.find_valid.assert_called_with("Bumbac", 99, "Material:")
 
 
 def test_detect_material_freeform_no_keyword_returns_none():
@@ -56,6 +57,7 @@ def test_detect_sport_freeform_returns_hardcoded():
     data = _make_data(valid_values=set(), find_valid_return=None)
     result = detect_sport("Nike Football Boots", "", data, cat_id=99)
     assert result == "Fotbal"
+    data.find_valid.assert_called_with("Fotbal", 99, "Sport:")
 
 
 def test_detect_sport_freeform_no_keyword_returns_none():
@@ -74,6 +76,14 @@ def test_detect_sport_with_vs_populated_find_valid_none_returns_none():
     assert result is None
 
 
+def test_detect_sport_with_vs_populated_find_valid_hit():
+    """detect_sport returns mapped value when vs is populated and find_valid succeeds."""
+    from core.processor import detect_sport
+    data = _make_data(valid_values={"Fotbal", "Baschet"}, find_valid_return="Fotbal")
+    result = detect_sport("Football Boots", "", data, cat_id=99)
+    assert result == "Fotbal"
+
+
 # ─── detect_sistem_inchidere ─────────────────────────────────────────────────
 
 def test_detect_sistem_inchidere_freeform_returns_hardcoded():
@@ -82,6 +92,7 @@ def test_detect_sistem_inchidere_freeform_returns_hardcoded():
     data = _make_data(valid_values=set(), find_valid_return=None)
     result = detect_sistem_inchidere("Adidas Running Shoe with Laces", "", data, cat_id=99)
     assert result == "Siret"
+    data.find_valid.assert_called_with("Siret", 99, "Sistem inchidere:")
 
 
 def test_detect_sistem_inchidere_freeform_no_keyword_returns_none():
