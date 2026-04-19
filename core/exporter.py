@@ -11,12 +11,12 @@ from openpyxl.styles import Font, PatternFill
 from collections import defaultdict
 
 
-# Colour palette
-C_GREEN_BG  = "C6EFCE"; C_GREEN_FG  = "276221"
-C_BLUE_BG   = "DDEBF7"; C_BLUE_FG   = "1F4E79"
-C_ORANGE_BG = "FCE4D6"; C_ORANGE_FG = "843C0C"
-C_RED_BG    = "FFC7CE"; C_RED_FG    = "9C0006"
-C_YELLOW_BG = "FFEB9C"; C_YELLOW_FG = "9C6500"
+# Colour palette (8-char ARGB so openpyxl round-trips correctly)
+C_GREEN_BG  = "FFC6EFCE"; C_GREEN_FG  = "FF276221"
+C_BLUE_BG   = "FFDDEBF7"; C_BLUE_FG   = "FF1F4E79"
+C_ORANGE_BG = "FFFCE4D6"; C_ORANGE_FG = "FF843C0C"
+C_RED_BG    = "FFFFC7CE"; C_RED_FG    = "FF9C0006"
+C_YELLOW_BG = "FFFFEB9C"; C_YELLOW_FG = "FF9C6500"
 
 def _fill(bg): return PatternFill("solid", start_color=bg, end_color=bg)
 def _font(fg, bold=False): return Font(color=fg, name="Calibri", bold=bold)
@@ -37,7 +37,9 @@ def export_model_format(
     """
     # Determine max number of characteristic pairs needed
     max_chars = max(
-        (len({**p.get("existing_chars", {}), **r.get("new_chars", {})})
+        (len({**p.get("existing_chars", {}), **r.get("new_chars", {}),
+              **{ch: "" for ch in r.get("missing_mandatory", [])
+                 if ch not in {**p.get("existing_chars", {}), **r.get("new_chars", {})}}})
          for p, r in zip(products, results)),
         default=1
     )
@@ -69,6 +71,10 @@ def export_model_format(
         # Merge existing (minus cleared) + new
         all_chars = {k: v for k, v in existing.items() if k not in cleared and v}
         all_chars.update(new_chars)
+        # Inject missing_mandatory as empty entries (for red coloring)
+        for ch in result.get("missing_mandatory", []):
+            if ch not in all_chars:
+                all_chars[ch] = ""
 
         # Base fields
         ws.cell(row=row_num, column=1, value=prod.get("id"))
@@ -86,14 +92,16 @@ def export_model_format(
             cat_cell.font = _font(C_ORANGE_FG)
 
         # Characteristic pairs
+        missing_mandatory = result.get("missing_mandatory", [])
         for i, (char_name, char_val) in enumerate(all_chars.items()):
             col_name = 6 + i * 2
             col_val  = 7 + i * 2
             is_new   = char_name in new_chars
             is_cleared = char_name in cleared
+            is_missing_mandatory = char_name in missing_mandatory and not char_val
 
             name_cell = ws.cell(row=row_num, column=col_name, value=char_name)
-            val_cell  = ws.cell(row=row_num, column=col_val,  value=char_val)
+            val_cell  = ws.cell(row=row_num, column=col_val,  value=char_val if char_val else None)
 
             if is_new:
                 for c in (name_cell, val_cell):
@@ -103,6 +111,10 @@ def export_model_format(
                 val_cell.value = None
                 val_cell.fill  = _fill(C_RED_BG)
                 val_cell.font  = _font(C_RED_FG)
+            elif is_missing_mandatory:
+                for c in (name_cell, val_cell):
+                    c.fill = _fill(C_RED_BG)
+                    c.font = _font(C_RED_FG)
 
         # Mark manual review row
         if needs_manual:
@@ -187,6 +199,22 @@ def export_excel(
                     ws.cell(row=row_num, column=val_c).value  = char_val
                     ws.cell(row=row_num, column=val_c).fill   = _fill(C_GREEN_BG)
                     ws.cell(row=row_num, column=val_c).font   = _font(C_GREEN_FG)
+                    break
+
+        # ── Add missing mandatory chars (red) into first free slot ───────────
+        for char_name in result.get("missing_mandatory", []):
+            if char_name in new_chars:
+                continue  # already written green above
+            for name_col, val_col in char_pairs:
+                name_c = col_idx.get(name_col)
+                val_c  = col_idx.get(val_col)
+                if name_c and ws.cell(row=row_num, column=name_c).value is None:
+                    ws.cell(row=row_num, column=name_c).value = char_name
+                    ws.cell(row=row_num, column=name_c).fill  = _fill(C_RED_BG)
+                    ws.cell(row=row_num, column=name_c).font  = _font(C_RED_FG)
+                    ws.cell(row=row_num, column=val_c).value  = ""
+                    ws.cell(row=row_num, column=val_c).fill   = _fill(C_RED_BG)
+                    ws.cell(row=row_num, column=val_c).font   = _font(C_RED_FG)
                     break
 
         # ── Mark rows still needing manual review ────────────────────────────
