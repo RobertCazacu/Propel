@@ -216,14 +216,19 @@ def detect_material(title: str, desc: str, data: MarketplaceData, cat_id,
         (["mesh", "plasa"],                                    "Mesh"),
         (["textil", "textile", "fabric"],                      "Textil"),
     ]
-    if not vs:
-        return None  # fara lista valida nu putem sti ce valoare e corecta
     for keywords, mat in checks:
         if any(_wb(kw, text) for kw in keywords):
             found = data.find_valid(mat, cat_id, char_name)
             if found:
                 log.debug("detect_material: %r → %r", keywords, found)
                 return found
+            if not vs:
+                log.warning(
+                    "detect_material: câmp '%s' restrictiv/freeform fără valori, "
+                    "returnez '%s' pentru validator",
+                    char_name, mat,
+                )
+                return mat
     return None
 
 
@@ -287,14 +292,19 @@ def detect_sport(title: str, desc: str, data: MarketplaceData, cat_id,
         ("Rugby",     ["rugby"]),
         ("Handbal",   ["handbal", "handball"]),
     ]
-    if not vs:
-        return None  # fara lista valida nu putem sti ce valoare e corecta
     for sport, keywords in sports:
         if any(_wb(kw, text) for kw in keywords):
             found = data.find_valid(sport, cat_id, char_name)
             if found:
                 log.debug("detect_sport: %r → %r", keywords, found)
                 return found
+            if not vs:
+                log.warning(
+                    "detect_sport: câmp '%s' restrictiv/freeform fără valori, "
+                    "returnez '%s' pentru validator",
+                    char_name, sport,
+                )
+                return sport
     return None
 
 
@@ -363,8 +373,6 @@ def detect_sistem_inchidere(title: str, desc: str, data: MarketplaceData, cat_id
                              char_name: str = "Sistem inchidere:") -> Optional[str]:
     text = (title + " " + desc).lower()
     vs = data.valid_values(cat_id, char_name)
-    if not vs:
-        return None
     checks = [
         (["velcro", "arici", "scratch"],         "Velcro"),
         (["siret", "lace", "sireturi", "laces"], "Siret"),
@@ -378,6 +386,13 @@ def detect_sistem_inchidere(title: str, desc: str, data: MarketplaceData, cat_id
             found = data.find_valid(val, cat_id, char_name)
             if found:
                 return found
+            if not vs:
+                log.warning(
+                    "detect_sistem_inchidere: câmp '%s' restrictiv/freeform fără valori, "
+                    "returnez '%s' pentru validator",
+                    char_name, val,
+                )
+                return val
     return None
 
 
