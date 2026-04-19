@@ -872,6 +872,16 @@ def enrich_with_ai(
         for ch_display, ch_val in suggested.items():
             # Remapeaza cheia inapoi la numele original (cu ":" daca era)
             ch_name = stripped_to_orig.get(ch_display, ch_display)
+            if isinstance(ch_val, list):
+                _arr_len = len(ch_val)
+                ch_val = next(
+                    (v for v in ch_val if data and data.find_valid(str(v), _ai_cat_id, ch_name)),
+                    ch_val[0] if ch_val else ""
+                )
+                log.warning(
+                    "AI char array detectat [%s] — ales '%s' din %d candidați",
+                    ch_name, ch_val, _arr_len,
+                )
             val_str = str(ch_val).strip()
             if not val_str:
                 continue
