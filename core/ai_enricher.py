@@ -271,8 +271,9 @@ def _build_char_system_prompt(marketplace: str) -> str:
 
         "RULES (priority order — higher rule always wins):\n"
         "P1. [MANDATORY] fields → complete with maximum priority.\n"
-        "P2. Fields with value list → copy EXACTLY one value from the list provided. "
-        "NEVER translate. NEVER invent. NEVER use values from outside the list.\n"
+        "P2. Fields with value list → copy EXACTLY one value (string, NOT array/list). "
+        "NEVER return a JSON array. If multiple values seem applicable, pick the MOST "
+        "relevant one only. NEVER translate. NEVER invent. NEVER use values outside the list.\n"
         "P3. Freeform fields (no list) → value in output language, concise.\n"
         "P4. Brand signals (concept inference only — do NOT use as final value):\n"
         "    Dri-FIT/Climalite/Climacool → polyester-type material\n"
@@ -627,7 +628,14 @@ def _build_prompt(title: str, description: str, category: str,
         else:
             optional_lines.append(line)
 
-    all_lines = mandatory_lines[:12] + optional_lines[:8]
+    # Proportional cap: 20 fields total.
+    # AI-first mode has no mandatory_set → all chars land in optional_lines.
+    # Without this fix, only 8 fields would be sent. Use full 20 slots instead.
+    _MAX_FIELDS = 20
+    _mand_cap = min(len(mandatory_lines), 12)
+    _opt_cap = _MAX_FIELDS - _mand_cap
+    all_lines = mandatory_lines[:_mand_cap] + optional_lines[:_opt_cap]
+    # TODO: multi-batch for categories with >20 characteristics (not implemented)
 
     # Construiește prompt-ul
     parts = [f"PRODUS: {title}"]
@@ -725,18 +733,23 @@ def enrich_with_ai(
     # Filtreaza doar cele lipsa
     missing_options = {k: v for k, v in char_options.items() if not existing.get(k)}
 
-    # Adauga caracteristicile obligatorii fara lista de valori (campuri freeform)
-    if mandatory_chars:
-        for ch in mandatory_chars:
-            if not existing.get(ch) and ch not in missing_options:
-                # Camp freeform — AI poate pune orice valoare
-                missing_options[ch] = set()
+    # Adauga caracteristicile obligatorii fara lista de valori (campuri freeform).
+    # In AI-first mode (mandatory_chars=None) derivam freeform mandatory din data.
+    _freeform_source = mandatory_chars if mandatory_chars is not None else (
+        list(data.mandatory_chars(data.category_id(category))) if data is not None else []
+    )
+    for ch in (_freeform_source or []):
+        if not existing.get(ch) and ch not in missing_options:
+            # Camp freeform — AI poate pune orice valoare
+            missing_options[ch] = set()
 
     if not missing_options:
+        log.debug("enrich_with_ai skip — missing_options gol dupa filtrare (titlu: %r, cat: %s)", title[:60], category)
         return {}, {}
 
-    # Daca avem lista de mandatory, prioritizeaza-le
-    if mandatory_chars:
+    # Mandatory-only gate: activ DOAR când apelantul trimite lista explicita.
+    # In AI-first mode (mandatory_chars=None), se sar aceste filtre — AI umple tot.
+    if mandatory_chars is not None:
         mandatory_missing = {k: v for k, v in missing_options.items() if k in mandatory_chars}
         # Daca nu lipseste niciun mandatory, skip AI
         if not mandatory_missing:
@@ -749,11 +762,18 @@ def enrich_with_ai(
     # ── Knowledge store lookup ──────────────────────────────────────────────────
     _norm_title = _normalize_title(title)
     _mp_id = marketplace_id_slug(marketplace) if marketplace else ""
-    _known = get_product_knowledge(ean=ean, brand=brand, normalized_title=_norm_title, marketplace_id=_mp_id) if (ean or brand) and _mp_id else None
+    _ks_triggered = bool((ean or brand) and _mp_id)
+    if not _ks_triggered:
+        log.debug("Knowledge store skip — EAN/brand sau marketplace_id lipsesc (ean=%r, brand=%r, mp=%r)", ean, brand, _mp_id)
+    _known = get_product_knowledge(ean=ean, brand=brand, normalized_title=_norm_title, marketplace_id=_mp_id) if _ks_triggered else None
     _known_attrs = _known["final_attributes"] if _known else {}
 
     if _known_attrs:
-        log.debug("Knowledge store hit: %d atribute cunoscute pentru '%s'", len(_known_attrs), title[:50])
+        log.info(
+            "Knowledge store HIT: %d atribute preluate pentru %r (cat=%r, conf=%.2f)",
+            len(_known_attrs), title[:50], _known.get("category"), _known.get("confidence", 0),
+        )
+        log.debug("Knowledge store attrs: %s", list(_known_attrs.keys()))
 
     # Verifica cache
     cache = _load_cache()
@@ -769,13 +789,26 @@ def enrich_with_ai(
     if h in cache["char_map"]:
         cached = cache["char_map"][h]
         validated_cached = {}
+        invalidated = []
         for k, v in cached.items():
             if k in missing_options:
                 vs = valid_values_for_cat.get(k, set())
                 if not vs or str(v).strip() in vs:
                     validated_cached[k] = v
+                else:
+                    invalidated.append(k)
         if validated_cached:
+            log.debug(
+                "Cache HIT char_map pentru %r — returnam %d valori cached%s",
+                title[:60], len(validated_cached),
+                f" (invalide ignorate: {invalidated})" if invalidated else "",
+            )
             return validated_cached, {}
+        else:
+            log.debug(
+                "Cache HIT char_map pentru %r — toate %d valori invalide, continuam cu AI",
+                title[:60], len(cached),
+            )
 
     # Strip trailing ":" din char names inainte de trimitere la AI (EasySales pattern).
     # AI-ul va raspunde cu chei fara ":" — le remapam inapoi dupa parsare.
@@ -801,17 +834,29 @@ def enrich_with_ai(
         log.debug("AI char enrichment — meta context: %s | titlu: %s", list(meta_present.keys()), title[:60])
 
     log.info("AI char enrichment pentru %r — missing: %s", title[:60], list(missing_options.keys()))
-    # Reset repair budget per product (2 Ollama repair calls max)
-    enrich_with_ai._repair_budget = {"remaining": 2, "used": 0}
+    # Reset repair budget per product.
+    # AI-first sends more chars → more chances of invalid values → higher budget needed.
+    _repair_budget_size = 5 if mandatory_chars is None else 2
+    enrich_with_ai._repair_budget = {"remaining": _repair_budget_size, "used": 0}
+
+    # Resolve category id early — needed for both prompt building and validation
+    _ai_cat_id = data.category_id(category) if data is not None else None
 
     max_tok = 300
     raw = ""
     suggested = {}
     validated = {}
+    _rejection_reasons: dict = {}
     t_start = time.perf_counter()
     try:
-        # Setul de display-names obligatorii (cu ":" deja stripuit) pentru marcare în prompt
-        mandatory_display_set = {k.rstrip(":") for k in (mandatory_chars or [])}
+        # Setul de display-names obligatorii pentru marcare în prompt.
+        # In AI-first mode (mandatory_chars=None) derivam din data pentru [OBLIGATORIU] tag.
+        if mandatory_chars is not None:
+            mandatory_display_set = {k.rstrip(":") for k in mandatory_chars}
+        elif data is not None and _ai_cat_id is not None:
+            mandatory_display_set = {k.rstrip(":") for k in data.mandatory_chars(_ai_cat_id)}
+        else:
+            mandatory_display_set = set()
         prompt = _build_prompt(title, description, category, existing, missing_options_display, marketplace, mandatory_display_set, product_meta)
         if _known_attrs:
             known_context = "\n".join(f"  {k}: {v}" for k, v in _known_attrs.items())
@@ -822,8 +867,7 @@ def enrich_with_ai(
         log.debug("AI char raw response: %s", raw[:300])
         suggested = _parse_json(raw)
 
-        # Resolve category id once for strict path
-        _ai_cat_id = data.category_id(category) if data is not None else None
+        # _ai_cat_id already resolved above
 
         for ch_display, ch_val in suggested.items():
             # Remapeaza cheia inapoi la numele original (cu ":" daca era)
@@ -860,6 +904,11 @@ def enrich_with_ai(
                                     "AI char respins [%s] = %r — fara match in fallback (%d vals)",
                                     ch_name, ch_val, len(fb),
                                 )
+                                _rejection_reasons[ch_name] = {
+                                    "llm_value": val_str,
+                                    "reason": "no_fallback_match_restrictive",
+                                    "fallback_candidates_count": len(fb),
+                                }
                         elif not restrictive:
                             # Non-restrictive and no values defined: accept as freeform
                             validated[ch_name] = val_str
@@ -869,6 +918,10 @@ def enrich_with_ai(
                                 "AI char respins [%s] = %r — nicio valoare definita, niciun fallback",
                                 ch_name, ch_val,
                             )
+                            _rejection_reasons[ch_name] = {
+                                "llm_value": val_str,
+                                "reason": "no_values_defined_restrictive",
+                            }
                     elif not restrictive:
                         # Non-restrictive: accept AI value even if not in the table
                         validated[ch_name] = val_str
@@ -878,7 +931,11 @@ def enrich_with_ai(
                         from core.characteristic_resolver import CharacteristicResolver
                         _budget = getattr(enrich_with_ai, "_repair_budget", {"remaining": 2, "used": 0})
                         _resolver = CharacteristicResolver(marketplace_id=marketplace)
-                        _is_mand = ch_name in (mandatory_chars or [])
+                        # In AI-first mode (mandatory_chars=None) derive mandatory set from data.
+                        _mand_set = (set(mandatory_chars) if mandatory_chars is not None else
+                                     (set(data.mandatory_chars(_ai_cat_id))
+                                      if data is not None and _ai_cat_id is not None else set()))
+                        _is_mand = ch_name in _mand_set
                         log.warning(
                             "[LLM->Resolver] LLM returned invalid value for [%s].\n"
                             "  LLM value  : %r\n"
@@ -931,6 +988,12 @@ def enrich_with_ai(
                                 "top_k": res.top_k_candidates,
                                 "reason": res.reason,
                             }
+                            _rejection_reasons[ch_name] = {
+                                "llm_value": val_str,
+                                "reason": res.reason,
+                                "method": "resolver_failed",
+                                "top_k": [(v, round(s, 3)) for v, s in res.top_k_candidates[:5]],
+                            }
             else:
                 # ── Legacy path (no data object): direct set lookup ──────────
                 valid_set = valid_values_for_cat.get(ch_name, set())
@@ -964,6 +1027,11 @@ def enrich_with_ai(
             # ── Save to knowledge store (doar atribute validate) ─────────────
             if ean or brand:
                 import uuid as _uuid
+                _conf = round(len(validated) / max(len(missing_options), 1), 2)
+                log.debug(
+                    "Knowledge store SAVE: %d atribute validate, conf=%.2f, ean=%r, brand=%r, mp=%r",
+                    len(validated), _conf, ean, brand, _mp_id,
+                )
                 try:
                     upsert_product_knowledge(
                         ean=ean,
@@ -973,11 +1041,11 @@ def enrich_with_ai(
                         offer_id=str(existing.get("_offer_id", "")),
                         category=str(category),
                         final_attributes=validated,
-                        confidence=round(len(validated) / max(len(missing_options), 1), 2),
+                        confidence=_conf,
                         run_id=str(_uuid.uuid4()),
                     )
                 except Exception as e:
-                    log.warning("Nu s-a putut salva în knowledge store: %s", e)
+                    log.warning("Nu s-a putut salva în knowledge store: %s (ean=%r, brand=%r)", e, ean, brand)
         else:
             log.warning("AI char enrichment — niciun camp validat pentru %r (raw: %s)", title[:60], raw[:200])
 
@@ -988,6 +1056,7 @@ def enrich_with_ai(
     # ── AI request/response log ────────────────────────────────────────────────
     try:
         router = get_router()
+        _log_review_flags = validated.get("_review_flags", {}) if validated else {}
         log_char_enrichment(
             marketplace=marketplace,
             provider=router.provider_name,
@@ -1003,6 +1072,8 @@ def enrich_with_ai(
             validated=validated,
             duration_ms=duration_ms,
             max_tokens=max_tok,
+            rejection_details=_rejection_reasons if _rejection_reasons else None,
+            review_flags=_log_review_flags if _log_review_flags else None,
         )
     except Exception:
         pass
