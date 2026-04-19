@@ -152,3 +152,6 @@ def test_export_excel_red_for_missing_mandatory():
     name_cell = ws_out.cell(row=2, column=2)
     assert name_cell.value == "Marime:"
     assert name_cell.fill.fgColor.rgb.upper() == C_RED_BG.upper()
+
+    val_cell = ws_out.cell(row=2, column=3)
+    assert val_cell.fill.fgColor.rgb.upper() == C_RED_BG.upper()

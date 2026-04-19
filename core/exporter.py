@@ -98,7 +98,7 @@ def export_model_format(
             col_val  = 7 + i * 2
             is_new   = char_name in new_chars
             is_cleared = char_name in cleared
-            is_missing_mandatory = char_name in missing_mandatory and not char_val
+            is_missing_mandatory = char_name in missing_mandatory
 
             name_cell = ws.cell(row=row_num, column=col_name, value=char_name)
             val_cell  = ws.cell(row=row_num, column=col_val,  value=char_val if char_val else None)
@@ -212,7 +212,7 @@ def export_excel(
                     ws.cell(row=row_num, column=name_c).value = char_name
                     ws.cell(row=row_num, column=name_c).fill  = _fill(C_RED_BG)
                     ws.cell(row=row_num, column=name_c).font  = _font(C_RED_FG)
-                    ws.cell(row=row_num, column=val_c).value  = ""
+                    ws.cell(row=row_num, column=val_c).value  = None
                     ws.cell(row=row_num, column=val_c).fill   = _fill(C_RED_BG)
                     ws.cell(row=row_num, column=val_c).font   = _font(C_RED_FG)
                     break
