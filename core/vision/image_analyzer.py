@@ -26,7 +26,7 @@ from core.vision.color_analyzer import (
     analyze_colors, ColorResult, find_multicolor_value, pick_best_accepted_color,
     _rgb_to_family,
 )
-from core.vision.visual_rules import get_category_rules, load_rules, ensure_rules_file, is_vision_eligible
+from core.vision.visual_rules import get_category_rules, load_rules, ensure_rules_file, is_vision_eligible, DEFAULT_RULES
 
 log = get_logger("marketplace.vision.analyzer")
 
@@ -228,6 +228,8 @@ def analyze_product_image(
 
     color_chars          = cat_rules.get("color_mandatory_chars", [])
     min_color_conf       = cat_rules.get("min_color_confidence", 0.60)
+    _default_color_conf  = DEFAULT_RULES["default"].get("min_color_confidence", 0.60)
+    _color_conf_source   = f"{category} override" if min_color_conf != _default_color_conf else "default"
     prefer_text_color    = cat_rules.get("prefer_text_color_over_image", True)
     fallback_review      = cat_rules.get("fallback_to_review_if_conflict", True)
     multicolor_threshold = cat_rules.get("multicolor_threshold", 0.80)
@@ -380,6 +382,7 @@ def analyze_product_image(
                     valid_values_for_cat, min_color_conf, multicolor_threshold,
                     fallback_review, effective_suggestion,
                     run_logger, offer_id, image_url,
+                    conf_source=_color_conf_source,
                 )
 
         except Exception as e:
@@ -603,6 +606,7 @@ def _apply_color_to_result(
     fallback_review: bool,
     suggestion_only: bool,
     run_logger, offer_id: str, image_url: str,
+    conf_source: str = "default",
 ) -> None:
     valid_set = valid_values_for_cat.get(missing_char, set())
 
@@ -699,10 +703,11 @@ def _apply_color_to_result(
         result.needs_review  = True
         result.review_reason = (
             f"Color detected ({color_res.dominant_color_normalized}) "
-            f"but confidence too low ({color_res.confidence:.2f} < {min_color_conf})"
+            f"but confidence too low ({color_res.confidence:.2f} < {min_color_conf} [{conf_source}])"
         )
-        log.warning("[Vision] Confidence prea mica color=%r conf=%.2f < %.2f offer=%s",
-                    color_res.dominant_color_normalized, color_res.confidence, min_color_conf, offer_id)
+        log.warning("[Vision] Confidence prea mica color=%r conf=%.2f < %.2f [%s] offer=%s",
+                    color_res.dominant_color_normalized, color_res.confidence, min_color_conf,
+                    conf_source, offer_id)
         if run_logger:
             run_logger.log("fill", "color_low_confidence", offer_id=offer_id, image_url=image_url,
                            status="review", level="WARNING",

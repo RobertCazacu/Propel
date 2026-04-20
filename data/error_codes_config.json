@@ -29,5 +29,22 @@
       "107",
       "3210"
     ]
+  },
+  "Trendyol BG": {
+    "processable_codes": [
+      "3111"
+    ]
+  },
+  "Trendyol GR": {
+    "processable_codes": [
+      "3111"
+    ]
+  },
+  "TemuRO": {
+    "processable_codes": [
+      "7127",
+      "7124",
+      "7119"
+    ]
   }
 }

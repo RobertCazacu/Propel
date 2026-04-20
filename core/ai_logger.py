@@ -159,7 +159,13 @@ def log_char_enrichment(
     validated: dict,
     duration_ms: int,
     max_tokens: int,
+    rejection_details: dict | None = None,  # {char_name: {reason, llm_value, top_k, ...}}
+    review_flags: dict | None = None,       # {char_name: {value, score, top_k, ...}} for accepted-but-flagged
 ):
+    # Strip internal keys from validated before logging as accepted
+    accepted_clean = {k: v for k, v in validated.items() if not k.startswith("_")}
+    rejected_clean = {k: v for k, v in parsed.items() if not k.startswith("_") and k not in accepted_clean}
+
     entry = {
         "timestamp":   datetime.now().isoformat(timespec="milliseconds"),
         "type":        "char_enrichment",
@@ -184,13 +190,12 @@ def log_char_enrichment(
             "parsed": parsed,
         },
         "results": {
-            "accepted": validated,
-            "rejected": {
-                k: v for k, v in parsed.items()
-                if k not in validated
-            },
-            "accepted_count": len(validated),
-            "rejected_count": len([k for k in parsed if k not in validated]),
+            "accepted": accepted_clean,
+            "rejected": rejected_clean,
+            "accepted_count": len(accepted_clean),
+            "rejected_count": len(rejected_clean),
+            "rejection_details": rejection_details or {},
+            "review_flags": review_flags or {},
         },
     }
     try:

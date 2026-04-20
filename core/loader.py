@@ -82,14 +82,14 @@ def _read_excel_all_sheets(source) -> pd.DataFrame:
     except ImportError:
         xl = pd.ExcelFile(source)
     if len(xl.sheet_names) == 1:
-        return xl.parse(xl.sheet_names[0])
+        return xl.parse(xl.sheet_names[0]).dropna(how="all")
 
     dfs: list[pd.DataFrame] = []
     ref_cols: Optional[list] = None
 
     for sheet in xl.sheet_names:
         try:
-            df = xl.parse(sheet)
+            df = xl.parse(sheet).dropna(how="all")
         except Exception:
             continue
         if df.empty:
@@ -139,7 +139,7 @@ VAL_COL_ALIASES = {
     "category_id":        ["category_id", "cat_id"],
     "characteristic_id":  ["characteristic_id", "char_id", "emag_characteristic_id"],
     "characteristic_name":["characteristic_name", "name", "char_name", "name_ro", "denumire"],
-    "value":              ["value", "value_ro", "valoare", "val", "val_ro"],
+    "value":              ["label", "value", "value_ro", "valoare", "val", "val_ro"],
 }
 
 
@@ -157,6 +157,24 @@ def _map_cols(df: pd.DataFrame, alias_dict: dict) -> dict:
     return {field: _find_col(df, aliases) for field, aliases in alias_dict.items()}
 
 
+def _autodetect_external_id_col(df: pd.DataFrame, already_mapped: dict) -> Optional[str]:
+    """Auto-detect the marketplace external ID column.
+
+    Looks for any column whose name ends with '_id' (case-insensitive) that has
+    not already been mapped to 'id' or 'parent_id'. Works for any marketplace:
+    trendyol_id, emag_id, allegro_id, trendyolbg_id, etc.
+    """
+    reserved = {v.lower() for v in already_mapped.values() if v}
+    lower_map = {c.lower(): c for c in df.columns}
+    for col_lower, col_orig in lower_map.items():
+        if col_lower.endswith("_id") and col_lower not in reserved:
+            log.info(
+                "load_categories: coloana emag_id auto-detectată: '%s'", col_orig
+            )
+            return col_orig
+    return None
+
+
 def load_categories(file) -> pd.DataFrame:
     """Load categories file. Returns DataFrame with standardised columns."""
     df = _read_tabular(file)
@@ -167,6 +185,12 @@ def load_categories(file) -> pd.DataFrame:
                 "load_categories: coloana critică '%s' nu a fost găsită. Aliasuri încercate: %s",
                 col, CAT_COL_ALIASES[col],
             )
+    # If no explicit emag_id alias matched, auto-detect from any remaining *_id column.
+    # This handles trendyol_id, allegro_id, trendyolbg_id, etc. without hardcoding.
+    if not mapping["emag_id"]:
+        mapping["emag_id"] = _autodetect_external_id_col(df, {
+            "id": mapping["id"], "parent_id": mapping["parent_id"]
+        })
     result = pd.DataFrame()
     result["id"]        = df[mapping["id"]]        if mapping["id"]        else None
     result["emag_id"]   = df[mapping["emag_id"]]   if mapping["emag_id"]   else result["id"]
@@ -315,8 +339,30 @@ class MarketplaceData:
             join_ids = cats["emag_id"].where(has_emag, cats["id"])
         else:
             join_ids = cats["id"]
-        self._cat_name_to_id = dict(zip(cats["name"], join_ids))
-        self._cat_id_to_name = dict(zip(join_ids, cats["name"]))
+        # For Trendyol marketplaces: when two categories share the same name,
+        # keep only the one with the most characteristics (more complete data).
+        if "trendyol" in self.name.lower():
+            chars_tmp = self.characteristics.copy() if not self.characteristics.empty else pd.DataFrame(columns=["category_id"])
+            char_count = chars_tmp.groupby("category_id").size().to_dict() if not chars_tmp.empty else {}
+            cats["_join_id"] = join_ids
+            cats["_char_count"] = cats["id"].map(lambda x: char_count.get(x, 0))
+            cats_sorted = cats.sort_values("_char_count", ascending=False)
+            # drop_duplicates on name keeps first occurrence = highest char count
+            cats_dedup = cats_sorted.drop_duplicates(subset="name", keep="first")
+            duplicates = len(cats) - len(cats_dedup)
+            if duplicates > 0:
+                log.warning(
+                    "[%s] _build_indexes: %d categorii cu nume duplicate — se pastreaza cea cu mai multe caracteristici",
+                    self.name, duplicates,
+                )
+            _name_to_join = dict(zip(cats_dedup["name"], cats_dedup["_join_id"]))
+            _join_to_name = dict(zip(cats_dedup["_join_id"], cats_dedup["name"]))
+        else:
+            _name_to_join = dict(zip(cats["name"], join_ids))
+            _join_to_name = dict(zip(join_ids, cats["name"]))
+
+        self._cat_name_to_id = _name_to_join
+        self._cat_id_to_name = _join_to_name
         # Map internal category_id → join_id so char-based indexes use the same key
         _internal_to_join = dict(zip(cats["id"], join_ids))
 
