@@ -1,6 +1,6 @@
 # Marketplace Offer Processor
 
-A Streamlit-based internal tool for automatically correcting product offer errors across multiple marketplaces — eMAG Romania, eMAG HU, eMAG BG, Trendyol, Allegro, Decathlon, Pepita, FashionDays and more.
+A Streamlit-based internal tool for automatically correcting product offer errors across multiple marketplaces — eMAG Romania, eMAG HU, eMAG BG, Trendyol, Trendyol BG, Trendyol GR, Allegro, Decathlon, Pepita, FashionDays, FashionDays BG, TemuRO and more.
 
 ---
 
@@ -8,11 +8,16 @@ A Streamlit-based internal tool for automatically correcting product offer error
 
 Takes an offer export file from a marketplace platform and automatically fixes:
 
-| Error code | Meaning | Action |
-|---|---|---|
-| **1007** | Missing or incorrect category | Resolved via keyword rules or AI batch classification |
-| **1009** | Missing mandatory characteristics | Filled via rules + AI enrichment |
-| **1010** | Invalid characteristic values | Removed and re-populated |
+| Error code | Marketplace | Meaning | Action |
+|---|---|---|---|
+| **1007** | eMAG RO/HU/BG | Missing or incorrect category | Resolved via keyword rules or AI batch classification |
+| **1009** | eMAG RO/HU/BG | Missing mandatory characteristics | Filled via rules + AI enrichment |
+| **1010** | eMAG RO/HU/BG | Invalid characteristic values | Removed and re-populated |
+| **107** | eMAG HU/BG, FashionDays BG | Characteristic error variant | Same as 1009/1010 |
+| **empty** | eMAG HU | Offer without error code | Processed as standard enrichment |
+| **3111** | Trendyol / Trendyol BG / Trendyol GR | Missing characteristics | Filled via rules + AI enrichment |
+| **3210** | FashionDays BG | Category / characteristic error | Resolved via rules + AI |
+| **7119 / 7124 / 7127** | TemuRO | Missing or invalid characteristics | Filled via rules + AI enrichment |
 
 ---
 
@@ -36,7 +41,8 @@ Takes an offer export file from a marketplace platform and automatically fixes:
 - **Characteristic resolver V2.1** — 3-pass fallback for AI-suggested values that fail strict validation: Pass 1 fuzzy match on allowed values, Pass 2 Ollama local repair (budgeted at 2 calls/product), Pass 3 adaptive floor rescue; locale-aware prompts via `config/locale_registry.json`
 - **UI "Needs Review" expander** — low-confidence fills surfaced with top-3 suggestions for manual selection
 - **Per-attribute vision fusion** — `fusion_attrs.py` engine applies text+vision fusion per attribute with 5 decision cases and `find_valid()` as gate; controlled per-attribute via `visual_rules.json` `attribute_fusion_policy` table
-- **Color-coded Excel export** — each type of change has a distinct color; non-mandatory color chars filled when category supports them
+- **Color-coded Excel export** — each type of change has a distinct color; non-mandatory color chars filled when category supports them; missing mandatory characteristics highlighted in red
+- **Mandatory-no-values warning** — surfaces a dedicated warning when a mandatory characteristic has no valid values defined in reference data (data import issue), instead of silently skipping
 - **Thread safety** — merge lock on learned rule deduplication, double-checked locking in LLM singleton, write lock on marketplace import
 - **SSRF protection** — image fetcher blocks RFC1918 / loopback IPs before any download
 - **DuckDB telemetry** — every AI run logged to `ai_run_log` table with token counts, latency, structured output metrics, vision signal and fusion action columns
@@ -184,7 +190,7 @@ Go to **📊 Results** for detailed review, filtering, and alternative export fo
 | Green | New characteristic added automatically |
 | Blue | Category assigned (error 1007) |
 | Orange | Category corrected |
-| Red | Invalid value removed |
+| Red | Invalid value removed **or** mandatory characteristic still missing after processing |
 | Yellow | Requires manual completion |
 
 ---
@@ -229,7 +235,10 @@ The AI prompt automatically includes the correct language context per marketplac
 | eMAG HU | Hungarian |
 | eMAG BG | Bulgarian |
 | Allegro | Polish |
-| Trendyol / Decathlon / Pepita / FashionDays | neutral |
+| Trendyol / Trendyol BG / Trendyol GR | neutral |
+| Decathlon / Pepita / FashionDays | Romanian |
+| FashionDays BG | Bulgarian |
+| TemuRO | Romanian |
 
 ### Structured output (Anthropic only)
 
@@ -415,6 +424,17 @@ python scripts/migrate_parquet_to_duckdb.py
 ---
 
 ## Changelog
+
+### v10 — 2026-04-21
+
+- **Red highlight for missing mandatory chars** — after processing, any mandatory characteristic still unresolved is highlighted in red in the Excel export (previously only yellow for "needs manual"); makes mandatory gaps immediately visible without opening the results page
+- **Mandatory-no-values warning** — when a mandatory characteristic has an empty valid-values list in reference data, a dedicated warning is logged and surfaced in the UI instead of silently failing; helps diagnose incomplete marketplace imports before assuming the product is unfillable
+- **Detector fix: empty valid-values guard** — `detect_material`, `detect_sport`, and `detect_sistem_inchidere` now return `None` (skip) when the allowed-values set is empty rather than returning a hardcoded value that would fail validation; prevents false positives on marketplaces where those characteristics exist but have no values defined yet
+- **AI array coercion** — when the AI returns a JSON array instead of a scalar string for a characteristic value (e.g. `["Piele", "Textil"]`), the system now coerces it to the best single value: finds the array element that matches an allowed value, or takes the first element; prevents silent rejection of otherwise correct AI responses
+- **AI P2 prompt hardening** — system prompt rule P2 now explicitly instructs the model to return a single string value and `NEVER` return a JSON array; reduces frequency of array responses before coercion is needed
+- **`_ai_cat_id` guard** — `_ai_cat_id` is verified non-None before being used in array coercion and value resolution logic; prevents `AttributeError` when category lookup fails mid-enrichment
+- **New marketplaces in error code config** — `Trendyol BG`, `Trendyol GR`, `FashionDays BG`, `TemuRO` added to `error_codes_config.json` with their specific processable error codes
+- **Exporter quality** — `None` cell values handled cleanly in Excel writer; `is_missing_mandatory` logic simplified; test coverage gap closed
 
 ### v9 — 2026-04-09
 
