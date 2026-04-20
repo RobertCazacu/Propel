@@ -49,6 +49,7 @@ def parse_offers_file(file) -> tuple[pd.DataFrame, list[str]]:
     xl = pd.ExcelFile(file)
     sheet = next((s for s in xl.sheet_names if "export" in s.lower()), xl.sheet_names[0])
     df = pd.read_excel(file, sheet_name=sheet, dtype=str)
+    df = df.dropna(how="all")
     df = df.where(pd.notnull(df), None)
 
     # Detect characteristic columns (pairs: "Offer ch. N name" / "Offer ch. N val.")

@@ -82,8 +82,9 @@ def validate_new_chars_strict(
                 if fb:
                     mapped = data._find_in_set(val_str, fb)
                 if mapped is None:
-                    if not restrictive:
-                        # Non-restrictive char: accept freeform value as-is
+                    if not restrictive or not vs:
+                        # Non-restrictive char OR restrictive with no values defined:
+                        # accept freeform value as-is (empty list = nothing to restrict to)
                         mapped = val_str
                     reason = (
                         "no_values_defined_for_char"

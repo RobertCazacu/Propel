@@ -8,6 +8,7 @@ Marketplace-uri active: eMAG HU, Allegro.
 """
 import json
 import re
+import time
 import uuid
 import threading
 from pathlib import Path
@@ -211,7 +212,7 @@ def init_db(db_path: Path = DB_PATH) -> None:
     înregistrările tuturor marketplace-urilor DuckDB (upsert idempotent).
     """
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with duckdb.connect(str(db_path)) as con:
+    with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
         for ddl in _DDL_STATEMENTS:
             con.execute(ddl)
         _run_migrations(con)  # P28: idempotent migrations with RENAME COLUMN guard
@@ -232,18 +233,19 @@ def is_available(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> b
     if not db_path.exists():
         return False
     try:
-        with duckdb.connect(str(db_path), read_only=True) as con:
-            run_count = con.execute(
-                "SELECT COUNT(*) FROM import_runs WHERE marketplace_id=? AND status='completed'",
-                [marketplace_id],
-            ).fetchone()[0]
-            if run_count == 0:
-                return False
-            cat_count = con.execute(
-                "SELECT COUNT(*) FROM categories WHERE marketplace_id=?",
-                [marketplace_id],
-            ).fetchone()[0]
-            return cat_count > 0
+        with _WRITE_LOCK:
+            with duckdb.connect(str(db_path)) as con:
+                run_count = con.execute(
+                    "SELECT COUNT(*) FROM import_runs WHERE marketplace_id=? AND status='completed'",
+                    [marketplace_id],
+                ).fetchone()[0]
+                if run_count == 0:
+                    return False
+                cat_count = con.execute(
+                    "SELECT COUNT(*) FROM categories WHERE marketplace_id=?",
+                    [marketplace_id],
+                ).fetchone()[0]
+                return cat_count > 0
     except Exception as exc:
         log.warning("is_available check failed for %s: %s", marketplace_id, exc)
         return False
@@ -279,7 +281,7 @@ def ensure_marketplace(db_path: Path, marketplace_id: str, marketplace_name: str
     Safe to call multiple times (idempotent).
     Requires the DB to be initialised first (call init_db once).
     """
-    with duckdb.connect(str(db_path)) as con:
+    with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
         con.execute(_UPSERT_MARKETPLACE, [marketplace_id, marketplace_name])
     return marketplace_id
 
@@ -700,7 +702,7 @@ def import_emag_hu(
 
 def get_import_summary(import_run_id: str, db_path: Path = DB_PATH) -> dict:
     """Returnează statistici pentru un import_run."""
-    with duckdb.connect(str(db_path), read_only=True) as con:
+    with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
         run = con.execute(
             "SELECT status, notes FROM import_runs WHERE import_run_id=?",
             [import_run_id],
@@ -735,7 +737,7 @@ def get_import_summary(import_run_id: str, db_path: Path = DB_PATH) -> dict:
 
 def get_issues(import_run_id: str, db_path: Path = DB_PATH) -> list[dict]:
     """Returnează lista de issues pentru un import_run."""
-    with duckdb.connect(str(db_path), read_only=True) as con:
+    with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
         rows = con.execute(
             """
             SELECT issue_id, severity, issue_type, entity_type, entity_id, message
@@ -771,7 +773,7 @@ def load_marketplace_data(
       characteristics: characteristic_id→id, characteristic_name→name
       characteristic_values: coloane neschimbate
     """
-    with duckdb.connect(str(db_path), read_only=True) as con:
+    with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
         cats = con.execute(
             """
             SELECT
@@ -824,7 +826,7 @@ def clear_marketplace_data(marketplace_id: str, db_path: Path = DB_PATH) -> None
     """Șterge toate datele pentru un marketplace din DuckDB (categories, characteristics, values, import_runs)."""
     if not db_path.exists():
         return
-    with duckdb.connect(str(db_path)) as con:
+    with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
         con.execute("DELETE FROM characteristic_values WHERE marketplace_id=?", [marketplace_id])
         con.execute("DELETE FROM characteristics WHERE marketplace_id=?", [marketplace_id])
         con.execute("DELETE FROM categories WHERE marketplace_id=?", [marketplace_id])
@@ -840,7 +842,7 @@ def get_db_status(marketplace_id: str = EMAG_HU_ID, db_path: Path = DB_PATH) -> 
     if not db_path.exists():
         return {"available": False, "reason": "Fișierul DB nu există încă."}
     try:
-        with duckdb.connect(str(db_path), read_only=True) as con:
+        with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
             run = con.execute(
                 """
                 SELECT import_run_id, created_at, completed_at, status
@@ -910,7 +912,7 @@ def ensure_schema(db_path: Path | None = None) -> None:
     if db_path is None:
         db_path = DB_PATH
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    with duckdb.connect(str(db_path)) as con:
+    with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
         for ddl in _DDL_STATEMENTS:
             con.execute(ddl)
         _run_migrations(con)
@@ -936,6 +938,11 @@ def upsert_product_knowledge(
     DOAR valorile validate (care au trecut char_validator) trebuie salvate.
     """
     attrs_json = json.dumps(final_attributes, ensure_ascii=False)
+    key_mode = "ean" if ean else "brand+title"
+    log.debug(
+        "Knowledge store UPSERT [%s]: ean=%r brand=%r mp=%r offer=%r cat=%r conf=%.2f attrs=%d",
+        key_mode, ean, brand, marketplace_id, offer_id, category, confidence, len(final_attributes),
+    )
     with _WRITE_LOCK:
         con = duckdb.connect(str(DB_PATH))
         try:
@@ -973,6 +980,7 @@ def upsert_product_knowledge(
                       category, attrs_json, confidence, run_id])
         finally:
             con.close()
+    log.debug("Knowledge store UPSERT OK [%s]: ean=%r brand=%r mp=%r", key_mode, ean, brand, marketplace_id)
 
 
 def get_product_knowledge(
@@ -987,35 +995,64 @@ def get_product_knowledge(
     Returnează dict cu toate câmpurile sau None dacă nu există.
     final_attributes este deja decodat ca dict.
     """
-    con = duckdb.connect(str(DB_PATH), read_only=True)
-    try:
-        if ean and marketplace_id:
-            row = con.execute("""
-                SELECT ean, brand, normalized_title, marketplace_id, offer_id,
-                       category, final_attributes, confidence, run_id, updated_at
-                FROM product_knowledge WHERE ean = ? AND marketplace_id = ? LIMIT 1
-            """, [ean, marketplace_id]).fetchone()
-        elif brand and normalized_title and marketplace_id:
-            row = con.execute("""
-                SELECT ean, brand, normalized_title, marketplace_id, offer_id,
-                       category, final_attributes, confidence, run_id, updated_at
-                FROM product_knowledge
-                WHERE ean IS NULL AND brand = ? AND normalized_title = ? AND marketplace_id = ?
-                LIMIT 1
-            """, [brand, normalized_title, marketplace_id]).fetchone()
-        else:
-            return None
+    lookup_mode = "ean+mp" if (ean and marketplace_id) else "brand+title+mp" if (brand and normalized_title and marketplace_id) else "skip"
+    log.debug(
+        "Knowledge store lookup [%s]: ean=%r brand=%r title=%r mp=%r",
+        lookup_mode, ean, brand, (normalized_title or "")[:50], marketplace_id,
+    )
+    if lookup_mode == "skip":
+        log.debug("Knowledge store lookup skipped — date insuficiente (ean=%r, brand=%r, mp=%r)", ean, brand, marketplace_id)
+        return None
 
-        if row is None:
-            return None
+    t0 = time.perf_counter()
+    with _WRITE_LOCK:
+        t_locked = time.perf_counter()
+        lock_wait_ms = round((t_locked - t0) * 1000)
+        if lock_wait_ms > 50:
+            log.warning("Knowledge store _WRITE_LOCK wait: %d ms (concurenta ridicata)", lock_wait_ms)
+        con = duckdb.connect(str(DB_PATH))
+        try:
+            if ean and marketplace_id:
+                row = con.execute("""
+                    SELECT ean, brand, normalized_title, marketplace_id, offer_id,
+                           category, final_attributes, confidence, run_id, updated_at
+                    FROM product_knowledge WHERE ean = ? AND marketplace_id = ? LIMIT 1
+                """, [ean, marketplace_id]).fetchone()
+            elif brand and normalized_title and marketplace_id:
+                row = con.execute("""
+                    SELECT ean, brand, normalized_title, marketplace_id, offer_id,
+                           category, final_attributes, confidence, run_id, updated_at
+                    FROM product_knowledge
+                    WHERE ean IS NULL AND brand = ? AND normalized_title = ? AND marketplace_id = ?
+                    LIMIT 1
+                """, [brand, normalized_title, marketplace_id]).fetchone()
+            else:
+                return None
 
-        cols = ["ean", "brand", "normalized_title", "marketplace_id", "offer_id",
-                "category", "final_attributes", "confidence", "run_id", "updated_at"]
-        result = dict(zip(cols, row))
-        result["final_attributes"] = json.loads(result["final_attributes"])
-        return result
-    finally:
-        con.close()
+            duration_ms = round((time.perf_counter() - t_locked) * 1000)
+            if row is None:
+                log.debug(
+                    "Knowledge store MISS [%s]: ean=%r brand=%r mp=%r — %d ms",
+                    lookup_mode, ean, brand, marketplace_id, duration_ms,
+                )
+                return None
+
+            cols = ["ean", "brand", "normalized_title", "marketplace_id", "offer_id",
+                    "category", "final_attributes", "confidence", "run_id", "updated_at"]
+            result = dict(zip(cols, row))
+            result["final_attributes"] = json.loads(result["final_attributes"])
+            n_attrs = len(result["final_attributes"])
+            log.info(
+                "Knowledge store HIT [%s]: ean=%r brand=%r mp=%r cat=%r conf=%.2f attrs=%d — %d ms",
+                lookup_mode, result.get("ean"), result.get("brand"), result.get("marketplace_id"),
+                result.get("category"), result.get("confidence", 0), n_attrs, duration_ms,
+            )
+            return result
+        except Exception as exc:
+            log.error("Knowledge store lookup eroare: %s (ean=%r, brand=%r, mp=%r)", exc, ean, brand, marketplace_id)
+            return None
+        finally:
+            con.close()
 
 
 # ── ai_run_log write ───────────────────────────────────────────────────────────
@@ -1047,28 +1084,35 @@ def write_ai_run_log(
     shadow_diff: dict | None = None,
 ) -> None:
     """Scrie o intrare de telemetry în ai_run_log."""
-    con = duckdb.connect(str(DB_PATH))
-    try:
-        con.execute("""
-            INSERT INTO ai_run_log
-                (run_id, ean, offer_id, marketplace, model_used,
-                 tokens_input, tokens_output, cost_usd,
-                 fields_requested, fields_accepted, fields_rejected,
-                 retry_count, fallback_used, duration_ms,
-                 structured_mode, structured_attempted, structured_success,
-                 structured_fallback_used, structured_latency_ms,
-                 structured_model_used, schema_fields_count, shadow_diff)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, [run_id, ean, offer_id, marketplace, model_used,
-              tokens_input, tokens_output, cost_usd,
-              fields_requested, fields_accepted, fields_rejected,
-              retry_count, fallback_used, duration_ms,
-              structured_mode, structured_attempted, structured_success,
-              structured_fallback_used, structured_latency_ms,
-              structured_model_used, schema_fields_count,
-              json.dumps(shadow_diff, default=str) if shadow_diff else None])
-    finally:
-        con.close()
+    log.debug(
+        "AI run log: offer=%r mp=%r model=%r req=%d acc=%d rej=%d retry=%d cost=$%.5f dur=%dms",
+        offer_id, marketplace, model_used,
+        fields_requested, fields_accepted, fields_rejected,
+        retry_count, cost_usd, duration_ms,
+    )
+    with _WRITE_LOCK:
+        con = duckdb.connect(str(DB_PATH))
+        try:
+            con.execute("""
+                INSERT INTO ai_run_log
+                    (run_id, ean, offer_id, marketplace, model_used,
+                     tokens_input, tokens_output, cost_usd,
+                     fields_requested, fields_accepted, fields_rejected,
+                     retry_count, fallback_used, duration_ms,
+                     structured_mode, structured_attempted, structured_success,
+                     structured_fallback_used, structured_latency_ms,
+                     structured_model_used, schema_fields_count, shadow_diff)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, [run_id, ean, offer_id, marketplace, model_used,
+                  tokens_input, tokens_output, cost_usd,
+                  fields_requested, fields_accepted, fields_rejected,
+                  retry_count, fallback_used, duration_ms,
+                  structured_mode, structured_attempted, structured_success,
+                  structured_fallback_used, structured_latency_ms,
+                  structured_model_used, schema_fields_count,
+                  json.dumps(shadow_diff, default=str) if shadow_diff else None])
+        finally:
+            con.close()
 
 
 # ── Process run persistence ─────────────────────────────────────────────────────
@@ -1077,7 +1121,7 @@ def save_process_run(results: list, marketplace: str, db_path: Path = DB_PATH) -
     """Persistă rezultatele procesării în DuckDB pentru recuperare la reload."""
     run_id = str(uuid.uuid4())
     try:
-        with duckdb.connect(str(db_path)) as con:
+        with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
             con.execute(
                 "INSERT INTO process_runs (run_id, marketplace, results) VALUES (?, ?, ?)",
                 [run_id, marketplace, json.dumps(results, ensure_ascii=False, default=str)]
@@ -1090,7 +1134,7 @@ def save_process_run(results: list, marketplace: str, db_path: Path = DB_PATH) -
 def load_last_process_run(marketplace: str, db_path: Path = DB_PATH) -> list:
     """Încarcă cel mai recent run de procesare pentru un marketplace."""
     try:
-        with duckdb.connect(str(db_path), read_only=True) as con:
+        with _WRITE_LOCK, duckdb.connect(str(db_path)) as con:
             row = con.execute(
                 "SELECT results FROM process_runs WHERE marketplace = ? ORDER BY run_ts DESC LIMIT 1",
                 [marketplace]

@@ -5,6 +5,11 @@ import re
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    from streamlit.runtime.scriptrunner import add_script_run_ctx, get_script_run_ctx
+    _HAS_ST_CTX = True
+except ImportError:
+    _HAS_ST_CTX = False
 from core.state import all_marketplace_names, get_marketplace, get_error_codes, get_all_processable_codes, is_marketplace_available, load_marketplace_on_select
 from core.offers_parser import extract_products, get_error_code
 from core.processor import process_product, validate_existing, explain_missing_chars
@@ -152,7 +157,8 @@ def _prevent_sleep():
 
 
 def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketplace="", image_options=None,
-                 resume_results=None, resume_ids=None, checkpoint_filename=""):
+                 resume_results=None, resume_ids=None, checkpoint_filename="",
+                 filter_category=None, filter_char=None):
     from core.ai_logger import start_run as _ai_start_run
     _ai_start_run(marketplace)
 
@@ -309,6 +315,13 @@ def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketpl
         if err_code not in processable_codes:
             return i, result
 
+        # ── Filter category (advanced filter) ────────────────────────────────
+        if filter_category:
+            prod_cat = str(prod.get("category") or "")
+            if prod_cat.strip().lower() != filter_category.strip().lower():
+                result["action"] = "skip"
+                return i, result
+
         # ── Fix category ──────────────────────────────────────────────────────
         final_cat, cat_action = _resolve_category(title, cat, mp)
 
@@ -370,7 +383,7 @@ def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketpl
         result["cleared"] = cleared
 
         # ── Auto-fill characteristics ─────────────────────────────────────────
-        new_chars = process_product(title, desc, final_cat, existing, mp, use_ai=use_ai, marketplace=marketplace, offer_id=str(prod.get("id", "")), product_meta={k: prod.get(k) for k in ("ean", "brand", "sku", "weight", "warranty")})
+        new_chars = process_product(title, desc, final_cat, existing, mp, use_ai=use_ai, marketplace=marketplace, offer_id=str(prod.get("id", "")), product_meta={k: prod.get(k) for k in ("ean", "brand", "sku", "weight", "warranty")}, target_chars=[filter_char] if filter_char else None)
         result["new_chars"] = new_chars
 
         # ── Image analysis hook (optional, backward-compatible) ───────────────
@@ -549,8 +562,15 @@ def _process_all(products, mp, progress_bar, status_text, use_ai=False, marketpl
     total_display = total  # total real (inclusiv cele deja procesate)
     status_text.text(f"⏳ Faza 2/2 — Procesare caracteristici: {completed_count}/{total_display} produse...")
 
+    _st_ctx = get_script_run_ctx() if _HAS_ST_CTX else None
+
+    def _process_one_with_ctx(i_prod):
+        if _st_ctx and _HAS_ST_CTX:
+            add_script_run_ctx(threading.current_thread(), _st_ctx)
+        return _process_one(i_prod)
+
     with ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_process_one, (i, prod)): i for i, prod in pending_products}
+        futures = {executor.submit(_process_one_with_ctx, (i, prod)): i for i, prod in pending_products}
         for future in as_completed(futures):
             idx, res = future.result()
             results_ordered[idx] = res
@@ -914,6 +934,63 @@ def render():
             "save_debug": save_debug,
         }
 
+    # ── Filtre avansate ────────────────────────────────────────────────────────
+    _filter_category = None
+    _filter_char = None
+    with st.expander("🔍 Filtre avansate (opțional)", expanded=False):
+        _filters_enabled = st.checkbox(
+            "Activează filtre",
+            value=False,
+            key=f"filters_enabled_{selected_mp}",
+            help="Când dezactivat, filtrele de mai jos sunt ignorate complet.",
+        )
+        if _filters_enabled:
+            _col_fc, _col_fch = st.columns(2)
+            with _col_fc:
+                _all_cats = sorted({str(p.get("category") or "") for p in products if p.get("category")})
+                _cat_opts = ["— toate categoriile —"] + _all_cats
+                _cat_sel = st.selectbox(
+                    "Filtrează după categorie",
+                    _cat_opts,
+                    index=0,
+                    key=f"filter_category_sel_{selected_mp}",
+                    help="Procesează doar produsele din această categorie. Gol = toate categoriile.",
+                )
+                _filter_category = _cat_sel if _cat_sel != "— toate categoriile —" else None
+
+            with _col_fch:
+                _ref_cat = _filter_category or (str(products[0].get("category") or "") if products else "")
+                _ref_cat_id = mp.category_id(_ref_cat) if _ref_cat else None
+                if _ref_cat_id:
+                    _char_opts_raw = sorted(mp._cat_chars.get(_ref_cat_id, set()))
+                else:
+                    _all_char_names: set = set()
+                    for _p in products:
+                        _pc = str(_p.get("category") or "")
+                        _pid = mp.category_id(_pc) if _pc else None
+                        if _pid:
+                            _all_char_names.update(mp._cat_chars.get(_pid, set()))
+                    _char_opts_raw = sorted(_all_char_names)
+                _char_opts = ["— toate caracteristicile —"] + _char_opts_raw
+                _char_sel = st.selectbox(
+                    "Completează doar caracteristica",
+                    _char_opts,
+                    index=0,
+                    key=f"filter_char_sel_{selected_mp}",
+                    help="Trimite la AI doar această caracteristică. Gol = toate câmpurile lipsă.",
+                )
+                _filter_char = _char_sel if _char_sel != "— toate caracteristicile —" else None
+
+            if _filter_category or _filter_char:
+                _summary_parts = []
+                if _filter_category:
+                    _summary_parts.append(f"categorie **{_filter_category}**")
+                if _filter_char:
+                    _summary_parts.append(f"caracteristică **{_filter_char}**")
+                st.info(f"Filtru activ: {' + '.join(_summary_parts)}")
+        else:
+            st.caption("Activează bifa pentru a configura filtre.")
+
     # ── Checkpoint resume UI ───────────────────────────────────────────────────
     from core.logger import load_checkpoint
     _file_name_ui = st.session_state.get("offers_file_name", "")
@@ -949,6 +1026,7 @@ def render():
             use_ai=use_ai, marketplace=selected_mp, image_options=image_options,
             resume_results=_resume_results, resume_ids=_resume_ids,
             checkpoint_filename=_file_name_ui,
+            filter_category=_filter_category, filter_char=_filter_char,
         )
 
         elapsed = time.time() - start

@@ -670,13 +670,18 @@ def process_product(
                 # Fields pre-filled by rule-based are excluded via combined_existing.
                 # If target_chars is set, restrict to only those characteristics.
                 all_cat_chars = data._valid_values.get(cat_id, {})
+                # Color fields are allowed through even when >80 values (capped at 50)
+                # so AI can still pick a color even in categories with large value lists.
+                # DETECTOR_CONCEPTS[1][0] = the color concept synonyms list.
+                _color_synonyms = {n.casefold() for n in DETECTOR_CONCEPTS[1][0]}
                 char_options = {
                     ch: sorted(vals)[:50] if len(vals) > 50 else vals
                     for ch, vals in all_cat_chars.items()
-                    if not combined_existing.get(ch) and len(vals) <= 80
+                    if not combined_existing.get(ch)
+                    and (len(vals) <= 80 or ch.casefold() in _color_synonyms)
                     and (target_chars is None or ch in target_chars)
                 }
-                _skipped_over80 = [ch for ch, vals in all_cat_chars.items() if len(vals) > 80 and not combined_existing.get(ch)]
+                _skipped_over80 = [ch for ch, vals in all_cat_chars.items() if len(vals) > 80 and not combined_existing.get(ch) and ch.casefold() not in _color_synonyms]
                 _prefilled = [ch for ch in all_cat_chars if combined_existing.get(ch)]
                 log.debug(
                     "char_options build [%s] cat=%r: total=%d trimitere=%d prefilled=%d excluse(>80vals)=%s",
@@ -784,6 +789,37 @@ def process_product(
                 title=title,
                 category=cat_name,
                 char_entries=_char_log,
+            )
+        except Exception:
+            pass
+
+    # ── Per-product summary (INFO) ─────────────────────────────────────────────
+    if offer_id and cat_id:
+        try:
+            mandatory = data.mandatory_chars(cat_id)
+            all_filled = {**existing_chars, **results}
+            filled_parts = []
+            for e in _char_log:
+                if e.get("validation_pass") and (e.get("value_mapped") or e.get("value_input")):
+                    val = e.get("value_mapped") or e.get("value_input", "")
+                    filled_parts.append(f"{e['char_name']}={val!r}[{e.get('source', '?')}]")
+            missing_parts = []
+            for ch in mandatory:
+                if all_filled.get(ch):
+                    continue
+                vs = data.valid_values(cat_id, ch)
+                if not vs:
+                    reason = "no_values"
+                elif use_ai:
+                    reason = "AI+rule_no_match"
+                else:
+                    reason = "rule_no_match"
+                missing_parts.append(f"{ch}:{reason}")
+            log.info(
+                "[SUMAR] offer=%s cat=%r | filled(%d): %s | mandatory_lipsă(%d): %s",
+                offer_id, cat_name,
+                len(filled_parts), ", ".join(filled_parts) or "none",
+                len(missing_parts), ", ".join(missing_parts) or "none",
             )
         except Exception:
             pass

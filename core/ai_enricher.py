@@ -906,33 +906,16 @@ def enrich_with_ai(
                                 validated[ch_name] = fb_mapped
                                 log.debug("AI char fallback-acceptat [%s] = %r → %r",
                                           ch_name, ch_val, fb_mapped)
-                            elif not restrictive:
-                                # Non-restrictive: accept AI value as freeform
-                                validated[ch_name] = val_str
-                                log.debug("AI char freeform-acceptat [%s] = %r", ch_name, ch_val)
                             else:
-                                log.warning(
-                                    "AI char respins [%s] = %r — fara match in fallback (%d vals)",
-                                    ch_name, ch_val, len(fb),
-                                )
-                                _rejection_reasons[ch_name] = {
-                                    "llm_value": val_str,
-                                    "reason": "no_fallback_match_restrictive",
-                                    "fallback_candidates_count": len(fb),
-                                }
-                        elif not restrictive:
-                            # Non-restrictive and no values defined: accept as freeform
+                                # No local values + fallback didn't match → accept raw AI value.
+                                # restrictive flag is moot when no valid values exist locally.
+                                validated[ch_name] = val_str
+                                log.debug("AI char freeform-acceptat [%s] = %r (no local vals, fallback mismatch)",
+                                          ch_name, ch_val)
+                        else:
+                            # No local values, no fallback → accept raw AI value as freeform.
                             validated[ch_name] = val_str
                             log.debug("AI char freeform-acceptat [%s] = %r (no values defined)", ch_name, ch_val)
-                        else:
-                            log.warning(
-                                "AI char respins [%s] = %r — nicio valoare definita, niciun fallback",
-                                ch_name, ch_val,
-                            )
-                            _rejection_reasons[ch_name] = {
-                                "llm_value": val_str,
-                                "reason": "no_values_defined_restrictive",
-                            }
                     elif not restrictive:
                         # Non-restrictive: accept AI value even if not in the table
                         validated[ch_name] = val_str

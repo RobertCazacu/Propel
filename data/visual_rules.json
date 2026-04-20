@@ -4,7 +4,19 @@
       "Culoare de baza",
       "Culoare:",
       "Szín:",
-      "Цвят:"
+      "Цвят:",
+      "Color",
+      "Case Color",
+      "Strap Color",
+      "Web Color",
+      "Dial Color",
+      "Band Color",
+      "Lens Color",
+      "Kolor",
+      "Farba",
+      "Barva",
+      "Colore",
+      "Couleur"
     ],
     "min_color_confidence": 0.60,
     "prefer_text_color_over_image": true,
@@ -12,5 +24,12 @@
     "multicolor_threshold": 0.80,
     "min_product_confidence": 0.65
   },
-  "categories": {}
+  "categories": {
+    "Smartwatches": {
+      "min_color_confidence": 0.40
+    },
+    "Watches": {
+      "min_color_confidence": 0.40
+    }
+  }
 }
